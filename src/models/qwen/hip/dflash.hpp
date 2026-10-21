@@ -152,6 +152,17 @@ public:
 
   void Reset() noexcept;
 
+  /// Advances the injected context over rows that would fall outside the
+  /// attention window anyway, without their features.
+  bool SkipTargetContext(std::uint32_t position, std::uint32_t num_tokens);
+
+  /// InjectTargetContext from device memory: `device_features` holds
+  /// num_tokens rows of GetTargetFeaturesSize() floats, written by a stream
+  /// that has completed.
+  bool InjectTargetContextDevice(const float* device_features,
+                                 std::uint32_t position,
+                                 std::uint32_t num_tokens);
+
   /// Ingests target multi-layer hidden states and injects K/V into the draft
   /// cache.
   bool InjectTargetContext(std::span<const float> target_features,
@@ -217,7 +228,8 @@ private:
   bool InjectTargetContextChunk(std::span<const float> target_features,
                                 std::uint32_t position,
                                 std::uint32_t num_tokens,
-                                const DFlashTrace& trace);
+                                const DFlashTrace& trace,
+                                bool device_source = false);
   void Allocate();
   void Free() noexcept;
   [[nodiscard]] static std::size_t BatchScratchBytes(
