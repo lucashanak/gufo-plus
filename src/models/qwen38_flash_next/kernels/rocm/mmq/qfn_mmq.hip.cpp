@@ -542,6 +542,30 @@ extern "C" int qfn_mmq_dense_kq_vec(int weight_type, const void* W,
   return 0;
 }
 
+extern "C" int qfn_mmq_dense_kq_vec_preq(int weight_type, const void* W,
+                                         const void* X_q8, float* out_f32,
+                                         int M, int K, int n_tokens,
+                                         hipStream_t stream) {
+  const auto type = static_cast<ggml_type>(weight_type);
+  if (!mmvq_dense_kq_format(type) ||
+      !W || !X_q8 || !out_f32 || M <= 0 || K <= 0 ||
+      K % ggml_blck_size(type) != 0 || n_tokens <= 0 ||
+      n_tokens > MMVQ_DENSE_KQ_MAX_BATCH) {
+    fprintf(stderr,
+            "qfn_mmq_dense_kq_vec_preq: unsupported type %d or shape M=%d "
+            "K=%d ntok=%d\n",
+            weight_type, M, K, n_tokens);
+    return -1;
+  }
+  // The rows qfn_mmq_quantize_q8_1 writes: ne10_padded elements per token.
+  const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+  mul_mat_vec_dense_kq_dispatch(W, type,
+                                reinterpret_cast<const block_q8_1*>(X_q8),
+                                out_f32, K, M, n_tokens, ne10_padded / QK8_1,
+                                stream);
+  return hipGetLastError() == hipSuccess ? 0 : -2;
+}
+
 extern "C" int qfn_mmq_moe_gated_vec(int weight_type, const void* gate,
                                      const void* up, const float* x,
                                      const int32_t* ids, float* out, int m,
