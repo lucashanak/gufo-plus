@@ -162,6 +162,69 @@ Experts MakeQ5K(std::size_t e, std::size_t m, std::size_t k,
   return w;
 }
 
+/// Random Q3_K blocks: 32 high-bit bytes, 64 bytes of 2-bit codes, sixteen
+/// packed 6-bit scales and d, dequantized as ggml's dequantize_row_q3_K.
+Experts MakeQ3K(std::size_t e, std::size_t m, std::size_t k,
+                std::uint32_t seed) {
+  Experts w;
+  const std::size_t blocks = e * m * (k / 256);
+  w.packed.resize(blocks * 110);
+  w.values.resize(e * m * k);
+  for (std::size_t b = 0; b < blocks; ++b) {
+    std::uint8_t* blk = w.packed.data() + b * 110;
+    for (int i = 0; i < 96; ++i)
+      blk[i] = static_cast<std::uint8_t>(NextRandom(&seed) & 0xFF);
+    int sc[16];
+    for (int& s : sc)
+      s = static_cast<int>(NextRandom(&seed) % 64);
+    std::uint8_t* scales = blk + 96;
+    for (int i = 0; i < 12; ++i)
+      scales[i] = 0;
+    for (int is = 0; is < 16; ++is) {
+      scales[is % 8] |=
+          static_cast<std::uint8_t>((sc[is] & 0xF) << (4 * (is / 8)));
+      scales[8 + is % 4] |=
+          static_cast<std::uint8_t>((sc[is] >> 4) << (2 * (is / 4)));
+    }
+    const __half d = __float2half(Uniform(&seed, 0.02F) + 0.03F);
+    std::memcpy(blk + 108, &d, 2);
+    const float df = __half2float(d);
+    const std::uint8_t* hm = blk;
+    const std::uint8_t* qs = blk + 32;
+    for (int j = 0; j < 256; ++j) {
+      const int sb32 = j / 32;
+      const int l = j % 32;
+      const int low = (qs[32 * (sb32 / 4) + l] >> (2 * (sb32 % 4))) & 3;
+      const int q = low - (((hm[l] >> sb32) & 1) != 0 ? 0 : 4);
+    }
+  }
+  return w;
+}
+
+/// Random IQ4_NL blocks: d and 16 bytes of indices into ggml's table.
+Experts MakeIQ4NL(std::size_t e, std::size_t m, std::size_t k,
+                  std::uint32_t seed) {
+  static constexpr int kTable[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
+                                     1,    13,   25,  38,  53,  69,  89,  113};
+  Experts w;
+  const std::size_t blocks = e * m * (k / 32);
+  w.packed.resize(blocks * 18);
+  w.values.resize(e * m * k);
+  for (std::size_t b = 0; b < blocks; ++b) {
+    std::uint8_t* blk = w.packed.data() + b * 18;
+    const __half d = __float2half(Uniform(&seed, 0.0005F) + 0.0008F);
+    std::memcpy(blk, &d, 2);
+    const float df = __half2float(d);
+    for (int i = 0; i < 16; ++i)
+      blk[2 + i] = static_cast<std::uint8_t>(NextRandom(&seed) & 0xFF);
+    for (int j = 0; j < 32; ++j) {
+      const int code = j < 16 ? (blk[2 + j] & 0xF) : (blk[2 + j - 16] >> 4);
+      w.values[b * 32 + j] = df * static_cast<float>(kTable[code]);
+    }
+  }
+  return w;
+}
+
 /// Random Q5_1 blocks: d, m, 32 high bits, 16 packed low nibbles.
 Experts MakeQ5_1(std::size_t e, std::size_t m, std::size_t k,
                  std::uint32_t seed) {
@@ -436,11 +499,15 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
 
   // Prefill pairs gate/up for buckets the separate 16- and 48-row tiles take.
   if ((tile_rows == 16 || tile_rows == 48) &&
-      (type == q::WeightType::kQ4_K || type == q::WeightType::kQ5_K)) {
+      (type == q::WeightType::kQ3_K || type == q::WeightType::kQ4_K ||
+       type == q::WeightType::kQ5_K)) {
     // Different gate/up weights, with the up scale small enough that these
     // deliberately large synthetic weights do not overflow the F16 output.
     auto up = w.packed;
-    const std::size_t block_bytes = type == q::WeightType::kQ4_K ? 144 : 176;
+    const bool q3 = type == q::WeightType::kQ3_K;
+    const std::size_t block_bytes = q3                             ? 110
+                                    : type == q::WeightType::kQ4_K ? 144
+                                                                   : 176;
     for (std::size_t b = 0; b < up.size(); b += block_bytes) {
       for (std::size_t offset : {0U, 2U}) {
         __half scale;
@@ -681,9 +748,11 @@ void CheckVectorGrouping(bool down = false) {
   constexpr std::size_t guard = 16;
   constexpr float poison = -1234567.0F;
   const std::vector<q::WeightType> formats =
-      down ? std::vector{q::WeightType::kQ5_1, q::WeightType::kQ8_0}
-           : std::vector{q::WeightType::kQ4_K, q::WeightType::kQ5_K,
-                         q::WeightType::kQ5_1, q::WeightType::kQ8_0};
+      down ? std::vector{q::WeightType::kQ5_1, q::WeightType::kIQ4_NL,
+                         q::WeightType::kQ8_0}
+           : std::vector{q::WeightType::kQ3_K, q::WeightType::kQ4_K,
+                         q::WeightType::kQ5_K, q::WeightType::kQ5_1,
+                         q::WeightType::kQ8_0, q::WeightType::kIQ4_XS};
   std::vector<float> x(tokens * cols);
   std::uint32_t seed = 37;
   // Mix ordinary and small activations: saturated SwiGLU alone misses
@@ -707,8 +776,10 @@ void CheckVectorGrouping(bool down = false) {
     std::vector<Experts> weights, paired_weights;
     if (down) {
       weights = {MakeQ5_1(experts, rows, cols, 17),
+                 MakeIQ4NL(experts, rows, cols, 19),
                  MakeQ8_0(experts, rows, cols, 23)};
       paired_weights = {MakeQ5_1(experts, rows, cols, 79),
+                        MakeIQ4NL(experts, rows, cols, 81),
                         MakeQ8_0(experts, rows, cols, 83)};
     } else {
       weights = {
@@ -742,12 +813,14 @@ void CheckVectorGrouping(bool down = false) {
       return output;
     };
     for (std::size_t f = 0; f < weights.size(); ++f) {
-      // Every format starts with an F16 scale. A nonfinite projection must
-      // still produce zero, just as an inactive expert does.
+      // Every format but Q3_K starts with an F16 scale (Q3_K ends with it).
+      // A nonfinite projection must still produce zero, just as an inactive
+      // expert does.
       const __half infinite_scale = __float2half(INFINITY);
-      std::memcpy(weights[f].packed.data(), &infinite_scale,
+      const std::size_t scale_at = formats[f] == q::WeightType::kQ3_K ? 108 : 0;
+      std::memcpy(weights[f].packed.data() + scale_at, &infinite_scale,
                   sizeof(infinite_scale));
-      std::memcpy(paired_weights[f].packed.data(), &infinite_scale,
+      std::memcpy(paired_weights[f].packed.data() + scale_at, &infinite_scale,
                   sizeof(infinite_scale));
       auto* wb = Upload(paired_weights[f].packed);
       auto* w = Upload(weights[f].packed);
@@ -806,7 +879,8 @@ void CheckVectorGrouping(bool down = false) {
           throw std::runtime_error(
               "paired vector differs from separate projections");
       }
-      if (formats[f] == q::WeightType::kQ4_K ||
+      if (formats[f] == q::WeightType::kQ3_K ||
+          formats[f] == q::WeightType::kQ4_K ||
           formats[f] == q::WeightType::kQ5_K ||
           formats[f] == q::WeightType::kQ8_0) {
         // Compare the fused vector path with the original GPU SwiGLU too:
@@ -1255,6 +1329,17 @@ int main() {
          ok;
     ok = Ok(Run(q::WeightType::kQ5_1, 97, 1, 8, 129, 640, 0x51516464U, 128)) &&
          ok;
+    // Q3_K gate/up view, and its paired tiles on ragged groups.
+    ok = Ok(Run(q::WeightType::kQ3_K, 300, 10, 64, 640, 2560, 0x3A3A0001U)) &&
+         ok;
+    ok = Ok(Run(q::WeightType::kQ3_K, 300, 10, 64, 640, 2560, 0x3A3A0002U,
+                16)) &&
+         ok;
+    for (std::size_t rows : {1U, 9U, 33U, 129U}) {
+      ok = Ok(Run(q::WeightType::kQ3_K, rows, 1, 1, 65, 256, 0x3A1711U, 48,
+                  0.002F)) &&
+           ok;
+    }
     // Q5_K gate/up view (one layer).
     ok = Ok(Run(q::WeightType::kQ5_K, 300, 10, 64, 640, 2560, 0x5A5A0001U)) &&
          ok;

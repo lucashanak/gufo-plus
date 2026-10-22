@@ -2899,8 +2899,10 @@ bool Executor::JoinSide(std::string* error_msg) const {
 bool Executor::WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const {
   const Config& c = config();
   return ExpertMatrixRows(n_tokens) &&
-         (l.ffn_gate_exps.type == GgmlType::kQ4_K ||
-          l.ffn_gate_exps.type == GgmlType::kQ5_K) &&
+         (l.ffn_gate_exps.type == GgmlType::kQ3_K ||
+          l.ffn_gate_exps.type == GgmlType::kQ4_K ||
+          l.ffn_gate_exps.type == GgmlType::kQ5_K ||
+          l.ffn_gate_exps.type == GgmlType::kIQ4_XS ||
          l.ffn_up_exps.type == l.ffn_gate_exps.type &&
          (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
           l.ffn_down_exps.type == GgmlType::kQ8_0) &&

@@ -5314,6 +5314,48 @@ constexpr std::uint32_t kHalfMagic = 0x64646464U;  // 1024.0 high bytes
 /// fifth bit of element j of K block s), then the Q4_K nibble layout.
 constexpr std::size_t kQ5KBlockBytes = 176;
 
+/// block_q3_K: 32 high-bit bytes (bit s of byte l: element l of K block s),
+/// 64 bytes of 2-bit codes (byte 32n + l: elements l of K blocks 4n..4n+3),
+/// twelve bytes of sixteen 6-bit scales, then d. Blocks are 2-byte aligned.
+constexpr std::size_t kQ3KBlockBytes = 110;
+
+/// The 3-bit codes of K blocks s and s + 1 (s even) for 16 elements, packed
+/// as Q4_K nibbles: block s low, block s + 1 high.
+__device__ __forceinline__ uint4 Q3KNibbles(uint4 qs, uint4 hm, int s) {
+  const unsigned j = 2U * (static_cast<unsigned>(s) & 3U);
+  const std::uint32_t q[4] = {qs.x, qs.y, qs.z, qs.w};
+  const std::uint32_t h[4] = {hm.x, hm.y, hm.z, hm.w};
+  std::uint32_t o[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const std::uint32_t c0 =
+        ((q[i] >> j) & 0x03030303U) | (((h[i] >> s) & 0x01010101U) << 2U);
+    const std::uint32_t c1 = ((q[i] >> (j + 2U)) & 0x03030303U) |
+                             (((h[i] >> (s + 1)) & 0x01010101U) << 2U);
+    o[i] = c0 | (c1 << 4U);
+  }
+  return make_uint4(o[0], o[1], o[2], o[3]);
+}
+
+/// Q3_K scale `is` (0-15) times d, from the twelve scale bytes and d packed
+/// as in the block (x, y, z, then d in the low half of w).
+__device__ __forceinline__ float Q3KScale(uint4 h, int is) {
+  const int b = is & 7;
+  const std::uint32_t lo_word = b < 4 ? h.x : h.y;
+  const std::uint32_t lo = (lo_word >> (8U * (b & 3) + 4U * (is >> 3))) & 0x0FU;
+  const std::uint32_t hi = (h.z >> (8U * (is & 3) + 2U * (is >> 2))) & 0x03U;
+  const float d = __half2float(
+      __builtin_bit_cast(__half, static_cast<std::uint16_t>(h.w & 0xFFFFU)));
+  return d * static_cast<float>(static_cast<int>(lo | (hi << 4U)) - 32);
+}
+
+/// (scale, 0) as packed F16: Q3_K codes enter WMMA as c - 4 (see magic).
+__device__ __forceinline__ std::uint32_t Q3KScaleBias(uint4 h, int is,
+                                                      bool live) {
+  return __builtin_bit_cast(
+      std::uint32_t, __floats2half2_rn(live ? Q3KScale(h, is) : 0.0F, 0.0F));
+}
+
 template<WeightType kType>
 __device__ __forceinline__ std::size_t RoutedF16RowBytes(std::size_t k) {
   return kType == WeightType::kQ4_K   ? (k / 256) * sizeof(Q4KBlock)
@@ -5396,7 +5438,8 @@ __launch_bounds__(256) __global__
   constexpr int kQ5Bytes = BK * 24;  // one row's blocks per stage
   constexpr int kCodeBytes = kQ5 ? BM * kQ5Bytes : BM * kChunks * 16;
   constexpr int kHighBytes = kQ5K ? BK * BM * 4 : 0;
-  constexpr int kScaleBytes = kQ5 ? 0 : BK * BM * 4;
+  // Q3_K keeps two scales per K block: elements 0-15, then 16-31.
+  constexpr int kScaleBytes = kQ5 ? 0 : BK * BM * 4 * (kTwoScales ? 2 : 1);
   // One slot of padding per activation quarter plane: the eight chunks of
   // a token then land on eight bank groups when they are written.
   constexpr int kActStride = BN + 1;
@@ -5524,6 +5567,13 @@ __launch_bounds__(256) __global__
         f_dm[u] = *reinterpret_cast<const std::uint16_t*>(blk);
         __builtin_memcpy(&f_codes[u], blk + 2, 16);
         __builtin_memcpy(&f_codes_hi[u], blk + 18, 16);
+      } else if constexpr (kQ3K) {
+        const auto* blk = f_ptr[u] + ((kb0 / 8) * kQ3KBlockBytes);
+        if (kb0 % 8 == 0) {
+          f_header[u] = make_uint4(0u, 0u, 0u, 0u);
+          __builtin_memcpy(&f_header[u], blk + 96, 14);
+          __builtin_memcpy(&f_qh[u][0], blk + (16 * f_c), 16);
+        }
       } else {
         constexpr int kBlockChunks = kQ5K ? 11 : 9;
         constexpr int kCodeChunk = kQ5K ? 3 : 1;
@@ -5632,8 +5682,8 @@ __launch_bounds__(256) __global__
     }
   }
 
-  const __half2 magic =
-      __floats2half2_rn(kQ8 ? -1152.0F : -1024.0F, kQ8 ? -1152.0F : -1024.0F);
+  constexpr float kMagic = kQ8 ? -1152.0F : kQ3K ? -1028.0F : -1024.0F;
+  const __half2 magic = __floats2half2_rn(kMagic, kMagic);
   const auto compute_stage = [&]() {
     uint4 raw[kWaveRowTiles][BK];
     if constexpr (!kQ8 && !kQ5) {
@@ -7482,7 +7532,12 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                    const float* swiglu_gate, float* out, __half* out_half,
                    std::size_t m, std::size_t k, hipStream_t stream) {
   const std::size_t block_elems =
-      (type == WeightType::kQ4_K || type == WeightType::kQ5_K) ? 256 : 64;
+      (type == WeightType::kQ3_K || type == WeightType::kQ4_K ||
+       type == WeightType::kQ5_K || type == WeightType::kIQ4_XS ||
+       type == WeightType::kIQ3_S || type == WeightType::kIQ3_XXS ||
+       type == WeightType::kIQ2_XS)
+          ? 256
+          : 64;
   if (m == 0 || k == 0 || k % block_elems != 0 || n_tiles == 0 ||
       (out_half == nullptr) == (out == nullptr)) {
     return false;
