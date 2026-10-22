@@ -296,9 +296,10 @@ struct Uploader {
   /// Uploads matrices of one type stacked along rows; every input shares
   /// `cols`. An F32 stack (router logits, GDN alpha/beta: the only
   /// unquantized projections) is narrowed to F16, which the wide-batch GEMM
-  /// tier runs at speed. A Q8_0 stack merges projections of one input into
-  /// a single decode GEMV, unless `expand_q8` asks for the F32 stack's F16
-  /// route over its dequantized values.
+  /// tier runs at speed; a BF16 router joins its F32 shared-expert gate row
+  /// there, widened exactly on the host. A Q8_0 stack merges projections of
+  /// one input into a single decode GEMV, unless `expand_q8` asks for the F32
+  /// stack's F16 route over its dequantized values.
   DeviceTensor Stack(std::initializer_list<const TensorRef*> parts,
                      bool expand_q8 = false) {
     DeviceTensor d;
@@ -311,14 +312,19 @@ struct Uploader {
     if (DecodeKQuant(type)) {
       return KQuantProjection(parts);
     }
+    const auto wide = [](core::GgmlType t) {
+      return t == core::GgmlType::kF32 || t == core::GgmlType::kBF16;
+    };
     for (const TensorRef* t : parts) {
-      if (t->empty() || t->type != type || t->cols != (*parts.begin())->cols ||
-          (type != core::GgmlType::kF32 && type != core::GgmlType::kQ8_0)) {
-        Fail("stacked upload needs F32 or Q8_0 tensors of one shape");
+      if (t->empty() || t->cols != (*parts.begin())->cols ||
+          (type == core::GgmlType::kQ8_0 ? t->type != type
+                                         : !wide(type) || !wide(t->type))) {
+        Fail("stacked upload needs F32/BF16 or Q8_0 tensors of one shape");
         return d;
       }
       rows += t->rows;
-      size += t->SizeBytes();
+      size += type == core::GgmlType::kQ8_0 ? t->SizeBytes()
+                                            : t->ElementCount() * sizeof(float);
     }
     void* ptr = nullptr;
     if (Allocate(&ptr, size + kTailMargin) != hipSuccess) {
@@ -330,8 +336,24 @@ struct Uploader {
       bytes += size + kTailMargin;
       std::size_t offset = 0;
       for (const TensorRef* t : parts) {
+        auto* dst = static_cast<std::uint8_t*>(ptr) + offset;
+        if (t->type == core::GgmlType::kBF16) {
+          std::vector<float> wide_rows(t->ElementCount());
+          const auto* src = static_cast<const std::uint16_t*>(t->data);
+          for (std::size_t i = 0; i < wide_rows.size(); ++i) {
+            const std::uint32_t bits = static_cast<std::uint32_t>(src[i]) << 16;
+            std::memcpy(&wide_rows[i], &bits, sizeof(float));
+          }
+          if (hipMemcpy(dst, wide_rows.data(), wide_rows.size() * sizeof(float),
+                        hipMemcpyHostToDevice) != hipSuccess) {
+            Fail("upload failed for " + std::string(t->name));
+            return d;
+          }
+          offset += wide_rows.size() * sizeof(float);
+          continue;
+        }
         if (!stager.Copy(shard_base + t->shard, t->file_offset, t->SizeBytes(),
-                         static_cast<std::uint8_t*>(ptr) + offset, error)) {
+                         dst, error)) {
           Fail("upload failed for " + std::string(t->name));
           return d;
         }
