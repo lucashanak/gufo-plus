@@ -195,6 +195,9 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     const auto& out = m->device_->output();
     // A K-quant head keeps its file rows beside the Q8_0 copy; the draft's
     // GEMM reads Q4_K/Q6_K rows directly, about half the bytes per block.
+    const bool raw =
+        out.decode != nullptr && (out.decode_type == core::GgmlType::kQ4_K ||
+                                  out.decode_type == core::GgmlType::kQ6_K);
     core::ModelConfig tc;
     tc.num_layers = c.num_layers;
     tc.hidden_size = c.hidden_size;
@@ -918,7 +921,13 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
                       capture.get(), next)) {
       return false;
     }
-    const auto kept = capture && capture->tokens < n ? n - capture->tokens : n;
+    NoteForward();
+    features_fresh_ = taps;
+    InjectFeatures(
+        static_cast<std::uint32_t>(tokens_.size()),
+        static_cast<std::uint32_t>(n),
+        static_cast<std::uint32_t>(tokens_.size() + tokens.size() - off));
+    features_fresh_ = false;
     hidden_base_ = static_cast<std::uint32_t>(
         tokens_.size() + n -
         std::min<std::size_t>(kept, exec.max_speculative()));
