@@ -930,7 +930,7 @@ struct Session::PendingDecode {
   bool gpu_greedy{false};
   bool gpu_verification{false};
   std::size_t width{0};
-  /// The chain stops after a proposal below its gate (GateStops).
+  /// Greedy chains stop after a proposal below kMtpGateProbability.
   bool gated{false};
   float draft_confidence{1.0F};
   std::optional<sampling::SamplerState> draft_sampler;
@@ -1110,7 +1110,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   pending->chain = {anchor};
   pending->draft = draft_token_;
   pending->width = width;
-  pending->gated = true;
+  pending->gated = gated;
   pending->base = base;
   pending->speculative = true;
   pending->sampled = sampled;
