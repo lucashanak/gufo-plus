@@ -191,14 +191,6 @@ int main(int argc, char** argv) {
         fused_rounds.push_back(
             MedianMicros(fused_exec, stream, replays, mixers));
       }
-      std::sort(old_rounds.begin(), old_rounds.end());
-      std::sort(fused_rounds.begin(), fused_rounds.end());
-      const double old_us = old_rounds[old_rounds.size() / 2];
-      const double fused_us = fused_rounds[fused_rounds.size() / 2];
-      std::printf("%6u  %14.2f  %8.2f  %7.3f\n", n, old_us, fused_us,
-                  old_us / fused_us);
-      (void)hipGraphExecDestroy(old_exec);
-      (void)hipGraphExecDestroy(fused_exec);
     }
     return 0;
   } catch (const std::exception& error) {

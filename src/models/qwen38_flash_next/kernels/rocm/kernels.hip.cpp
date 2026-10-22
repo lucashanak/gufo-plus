@@ -6721,7 +6721,6 @@ __launch_bounds__(kThreads) __global__
   for (unsigned tile;
        (tile = FusedTake(&st->taken[1], &item)) < kFusedDownTiles;) {
     FusedWait(&st->done[0], kRows);
-    constexpr int kPrefetch = 2;
     const unsigned row = tile * kFusedWaves + wave;
     const auto* input = static_cast<const Q8_1Block*>(a.xn_q8);
     const int part = (lane & 3) * 2;
