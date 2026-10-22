@@ -238,6 +238,12 @@ inline json::Value GenerationTimings(
     timings["lookup_n"] = result.lookup_tokens;
     timings["lookup_n_accepted"] = result.lookup_accepted_tokens;
   }
+  if (result.dflash_rounds > 0 || result.dflash_mtp_rounds > 0) {
+    timings["dflash_rounds"] = result.dflash_rounds;
+    timings["dflash_n"] = result.dflash_tokens;
+    timings["dflash_n_accepted"] = result.dflash_accepted_tokens;
+    timings["dflash_mtp_rounds"] = result.dflash_mtp_rounds;
+  }
   return timings;
 }
 

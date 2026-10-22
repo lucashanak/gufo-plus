@@ -318,6 +318,16 @@ public:
                               std::string* error_msg,
                               float* logits = nullptr) const;
 
+  [[nodiscard]] std::uint32_t FeatureWidth() const noexcept {
+    return feat_width_;
+  }
+  /// Queues a device copy of rows [first, first + rows) of the latest
+  /// Forward's features on the executor stream.
+  bool CopyFeatures(std::uint32_t first, std::uint32_t rows, float* dst,
+                    std::string* error_msg = nullptr) const;
+  /// Waits for the executor stream (queued feature copies included).
+  bool SyncStream(std::string* error_msg = nullptr) const;
+
   /// Runs the draft block over `tokens` (at most max_batch) at the session's
   /// MTP position. The hidden input of token i is the trunk residual of row
   /// `hidden_row + i` of the last Forward batch, or, with hidden_row < 0
@@ -713,6 +723,15 @@ private:
     float* mtp_scores;
   };
   mutable Scratch s_{};
+  /// DFlash feature taps (ConfigureFeatureTaps): tap index per layer or -1,
+  /// and max_batch rows of [tap * hidden] stream means.
+  mutable std::vector<std::int32_t> feat_tap_of_layer_;
+  mutable float* feat_dev_{nullptr};
+  mutable std::uint32_t feat_width_{0};
+  mutable bool taps_enabled_{false};
+  /// Writes layer `il`'s feature slice from `res` when it is tapped.
+  void TapFeatures(std::uint32_t il, const float* res,
+                   std::uint32_t rows) const;
   [[nodiscard]] Scratch RowScratch(const Scratch& base,
                                    std::uint32_t offset) const;
   void UseScratch(const Scratch& scratch) const;

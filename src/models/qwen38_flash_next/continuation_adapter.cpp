@@ -431,6 +431,7 @@ void ContinuationAdapter::BeginRestore(
   state.session->lookup_.Clear();
   state.session->tokens_.resize(target);
   state.session->ForgetDraftVocab();
+  state.session->ForgetDFlashContext(target);
   state.session->logits_.resize(model_->VocabSize());
 }
 
