@@ -572,6 +572,15 @@ extern "C" int qfn_mmq_q8_0_moe_raw(const void* W, const float* X,
       n_expert_used, stream, nullptr, nullptr);
 }
 
+extern "C" int qfn_mmq_q3_K_moe_raw(const void* W, const float* X,
+                                    const int32_t* ids, float* out, int M,
+                                    int K, int n_tokens, int n_experts,
+                                    int n_expert_used, hipStream_t stream) {
+  return qfn_mmq_moe_impl<GGML_TYPE_Q3_K>(
+      "qfn_mmq_q3_K_moe_raw", W, X, ids, out, M, K, n_tokens, n_experts,
+      n_expert_used, stream, nullptr, nullptr);
+}
+
 extern "C" int qfn_mmq_q4_K_moe_raw(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,

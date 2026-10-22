@@ -1458,6 +1458,7 @@ bool Executor::ClearDraftRows(Session& session, std::uint32_t first,
 DeviceTensor Executor::DraftTable(const Session& session) const noexcept {
   DeviceTensor table = model_->output();
   table.data = session.mtp_.draft_rows;
+  table.decode = nullptr;  // the session's rows are Q8_0 copies
   table.rows = speculative::kDraftVocabExtraRows;
   return table;
 }
@@ -2135,8 +2136,9 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
   const bool same_shape = a.type == b.type && a.rows == b.rows &&
                           a.cols == b.cols && a.experts == b.experts;
   if (!MatrixRows(n_tokens) && n_used <= 32 && same_shape &&
-      (a.type == GgmlType::kQ4_K || a.type == GgmlType::kQ5_K ||
-       a.type == GgmlType::kQ8_0)) {
+      (a.type == GgmlType::kQ3_K || a.type == GgmlType::kQ4_K ||
+       a.type == GgmlType::kQ5_K || a.type == GgmlType::kQ8_0 ||
+       a.type == GgmlType::kIQ4_XS)) {
     // The shared expert quantized the same rows (or their producer did).
     const void* ready = ReadyQ8(x, n_tokens, a.cols);
     if ((ready != nullptr
