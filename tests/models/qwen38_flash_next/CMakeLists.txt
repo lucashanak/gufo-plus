@@ -80,6 +80,10 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen38_flash_next_dense_gemm_bench PRIVATE
     qwen38_flash_next_test_hip)
 
+  add_executable(qwen38_flash_next_head_bench EXCLUDE_FROM_ALL head_bench.cpp)
+  target_link_libraries(qwen38_flash_next_head_bench PRIVATE
+    qwen38_flash_next_test_hip)
+
   add_executable(qwen38_flash_next_hc_mix_bench EXCLUDE_FROM_ALL
     hc_mix_bench.cpp)
   target_link_libraries(qwen38_flash_next_hc_mix_bench PRIVATE
