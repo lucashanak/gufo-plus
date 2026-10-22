@@ -1229,6 +1229,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   // sampled: host-side q). An unplanned cycle drafts to its budget; a jointly
   // planned greedy batch keeps the planned width as its cap. The controller
   // still backs off to AR.
+  const bool gated = MtpEnabled();
   std::uint32_t drafts = 0;
   if (MtpEnabled() && cap > 1) {
     drafts = batch_drafts ? std::min<std::uint32_t>(*batch_drafts, cap - 1)
@@ -1236,7 +1237,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
                                 static_cast<std::uint32_t>(cap - 1),
                                 static_cast<std::uint32_t>(tokens_.size()),
                                 pending->policy_concurrency);
-    if (!batch_drafts && drafts != 0)
+    if (gated && !batch_drafts && drafts != 0)
       drafts = std::min<std::uint32_t>(static_cast<std::uint32_t>(cap - 1),
                                        model_->options_.max_draft_tokens);
   }
