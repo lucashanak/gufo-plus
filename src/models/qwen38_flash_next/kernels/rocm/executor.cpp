@@ -3543,7 +3543,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
                             (static_cast<std::uint64_t>(n_logits) << 16) |
                             (static_cast<std::uint64_t>(speculative) << 32) |
                             (static_cast<std::uint64_t>(sparse) << 33) |
-                            (std::uint64_t{logits != nullptr} << 34);
+                            (std::uint64_t{logits != nullptr} << 34) |
+                            (std::uint64_t{taps_enabled_} << 36);
   // PLE first consumes the disk rows at its injection layer. Queue the
   // preceding layers before waiting, including on captured graph replay.
   // Both pieces use the same stream and arithmetic as the unsplit graph.

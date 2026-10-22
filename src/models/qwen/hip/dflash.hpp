@@ -205,7 +205,10 @@ public:
       std::vector<float>* out_candidate_probabilities = nullptr,
       const DFlashTrace& trace = {},
       const sampling::SamplerState* sampler = nullptr,
-      bool draft_subset = false);
+      bool draft_subset = false,
+      std::vector<float>* out_token_probabilities = nullptr);
+  // out_token_probabilities (greedy only): the draft head's full-vocabulary
+  // softmax probability of each returned token.
 
   /// Clears the draft table from slot `first`: the slots score -inf.
   void ClearDraftRows(std::uint32_t first);

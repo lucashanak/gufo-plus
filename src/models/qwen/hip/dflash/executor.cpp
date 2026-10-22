@@ -1311,6 +1311,21 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
       sequences, vocab_size, df_cfg.selector_rank, df_cfg.selector_top_k,
       stream_, prefix);
 
+  if (out_token_probabilities != nullptr) {
+    if (temperature > 0.0F)
+      throw std::invalid_argument(
+          "DFlash token probabilities describe greedy proposals");
+    // Greedy blocks leave the sampling uniforms unused.
+    kernels::LaunchDFlashTokenProbabilities(
+        d_logits_, d_out_token_ + 1U, d_selector_uniforms_, draft_count,
+        static_cast<std::uint32_t>(vocab_size), stream_);
+    out_token_probabilities->resize(draft_count);
+    if (hipMemcpyAsync(out_token_probabilities->data(), d_selector_uniforms_,
+                       draft_count * sizeof(float), hipMemcpyDeviceToHost,
+                       stream_) != hipSuccess) {
+      throw std::runtime_error("DFlash GPU probability download failed");
+    }
+  }
   const auto token_copy =
       hipMemcpyAsync(tokens.data(), d_out_token_ + 1U,
                      draft_count * sizeof(tokenization::TokenId),
