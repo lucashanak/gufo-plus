@@ -4,6 +4,8 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <gufo/ext/gguf_reader.hpp>
 #include <limits>
@@ -11,6 +13,7 @@
 #include <type_traits>
 
 #include "src/families/qwen/draft_vocab/draft_vocab.hpp"
+#include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen38_flash_next/continuation_hooks.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
@@ -184,6 +187,40 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (!m->executor_) {
     return nullptr;
   }
+  // The DFlash2 draft keeps MTP in sync for the cycles it does not draft.
+  if (const char* path = std::getenv("GUFO_FN_DFLASH");
+      path != nullptr && *path != '\0' && m->mtp_weights_ != nullptr) {
+    std::string dferr;
+    std::shared_ptr<const core::GgufReader> reader(
+        core::GgufReader::OpenFile(path, &dferr));
+    const auto& emb = m->device_->token_embd();
+    const auto& out = m->device_->output();
+    // A K-quant head keeps its file rows beside the Q8_0 copy; the draft's
+    // GEMM reads Q4_K/Q6_K rows directly, about half the bytes per block.
+    core::ModelConfig tc;
+    tc.num_layers = c.num_layers;
+    tc.hidden_size = c.hidden_size;
+    tc.vocab_size = c.vocab_size;
+    if (reader != nullptr) {
+      m->dflash_model_ = hip::QwenDFlashGpuModel::CreateForTarget(
+          std::move(reader), tc,
+          {.data = emb.data,
+           .type = emb.type,
+           .num_elements = std::size_t{emb.rows} * emb.cols},
+          {.data = raw ? out.decode : out.data,
+           .type = raw ? out.decode_type : out.type,
+           .num_elements = std::size_t{out.rows} * out.cols},
+          &dferr);
+    }
+    if (m->dflash_model_ != nullptr &&
+        !m->executor_->ConfigureFeatureTaps(
+            m->dflash_model_->GetDFlashConfig().target_layer_ids, &dferr)) {
+      m->dflash_model_ = nullptr;
+    }
+    std::fprintf(stderr, "[qwen38-flash-next] DFlash2 draft %s%s\n",
+                 m->dflash_model_ != nullptr ? "enabled: " : "DISABLED: ",
+                 m->dflash_model_ != nullptr ? path : dferr.c_str());
+  }
   return m;
 }
 
@@ -352,7 +389,124 @@ bool Session::SyncDraftVocab(std::string* error_msg) {
                               error_msg);
 }
 
-Session::~Session() = default;
+Session::~Session() {
+  if (ring_ != nullptr)
+    (void)hipFree(ring_);
+}
+
+bool Session::EnsureDFlashState() {
+  if (ring_ != nullptr)
+    return true;
+  if (model_->dflash_model_ == nullptr || !MtpEnabled() || dflash_failed_)
+    return false;
+  // Allocated with the first forward: restore-only cache slots stay free of
+  // the draft's caches and the feature ring.
+  std::string err;
+  auto executor = hip::QwenDFlashGpuExecutor::Create(
+      model_->dflash_model_, session_->max_context(), &err);
+  const auto rows = std::max<std::uint32_t>(
+      1, model_->dflash_model_->GetDFlashConfig().sliding_window);
+  float* ring = nullptr;
+  if (executor == nullptr ||
+      hipMalloc(reinterpret_cast<void**>(&ring),
+                std::size_t{rows} * model_->executor_->FeatureWidth() *
+                    sizeof(float)) != hipSuccess) {
+    std::fprintf(stderr, "[qwen38-flash-next] DFlash2 session state: %s\n",
+                 executor == nullptr ? err.c_str() : "ring allocation failed");
+    dflash_failed_ = true;
+    return false;
+  }
+  dflash_ = std::move(executor);
+  ring_ = ring;
+  ring_rows_ = rows;
+  ForgetDFlashContext(static_cast<std::uint32_t>(tokens_.size()));
+  return true;
+}
+
+void Session::ForgetDFlashContext(std::uint32_t position) noexcept {
+  if (dflash_)
+    dflash_->Reset();
+  ring_begin_ = position;
+  ring_end_ = position;
+}
+
+bool Session::DFlashAvailable() const noexcept {
+  return model_->dflash_model_ != nullptr && MtpEnabled() && !dflash_failed_;
+}
+
+bool Session::EnsureDFlashContext() {
+  const auto pos = static_cast<std::uint32_t>(tokens_.size());
+  if (ring_ == nullptr || ring_end_ != pos)
+    return false;
+  // The draft attends to the whole window; rows it never received would be
+  // stale cache slots, so the ring must cover all of them.
+  const std::uint32_t win_start = pos > ring_rows_ ? pos - ring_rows_ : 0;
+  if (ring_begin_ > win_start)
+    return false;
+  std::uint32_t from = dflash_->GetInjectedContextLength();
+  if (from > pos) {
+    dflash_->Reset();
+    from = 0;
+  }
+  if (from < win_start) {
+    if (!dflash_->SkipTargetContext(from, win_start - from))
+      return false;
+    from = win_start;
+  }
+  if (from == pos)
+    return true;
+  rocm::Executor& exec = *model_->executor_;
+  if (!exec.SyncStream())
+    return false;
+  const std::size_t width = exec.FeatureWidth();
+  while (from < pos) {
+    const std::uint32_t slot = from % ring_rows_;
+    const std::uint32_t n = std::min(pos - from, ring_rows_ - slot);
+    if (!dflash_->InjectTargetContextDevice(ring_ + std::size_t{slot} * width,
+                                            from, n)) {
+      dflash_->Reset();
+      return false;
+    }
+    from += n;
+  }
+  return true;
+}
+
+void Session::InjectFeatures(std::uint32_t position, std::uint32_t rows,
+                             std::uint32_t end) {
+  if (rows == 0)
+    return;
+  if (!features_fresh_) {
+    ForgetDFlashContext(position + rows);  // a gap: start over after these
+    return;
+  }
+  if (!EnsureDFlashState())
+    return;
+  const std::uint32_t win_start = end > ring_rows_ ? end - ring_rows_ : 0;
+  if (position + rows <= win_start) {
+    ring_begin_ = ring_end_ = position + rows;  // nothing survives the window
+    return;
+  }
+  const std::uint32_t first = win_start > position ? win_start - position : 0;
+  if (position + first != ring_end_)
+    ring_begin_ = ring_end_ = position + first;
+  rocm::Executor& exec = *model_->executor_;
+  const std::size_t width = exec.FeatureWidth();
+  for (std::uint32_t done = first; done < rows;) {
+    const std::uint32_t at = position + done;
+    const std::uint32_t slot = at % ring_rows_;
+    const std::uint32_t n = std::min(rows - done, ring_rows_ - slot);
+    if (!exec.CopyFeatures(feature_row_offset_ + done, n,
+                           ring_ + std::size_t{slot} * width)) {
+      ring_begin_ = ring_end_ = position + rows;
+      return;
+    }
+    done += n;
+  }
+  ring_end_ = position + rows;
+  if (ring_end_ - ring_begin_ > ring_rows_)
+    ring_begin_ = ring_end_ - ring_rows_;
+}
 
 void Session::ResetDraftPolicy() {
   if (continuation_hooks_)
@@ -383,6 +537,7 @@ void Session::ResetImpl(bool reuse_mtp) {
   session_->Reset(reuse_mtp);
   tokens_.clear();
   ForgetDraftVocab();
+  ForgetDFlashContext(0);
   lookup_.Clear();
   hidden_base_ = 0;
   draft_length_.Reset();
@@ -607,6 +762,8 @@ bool Session::RestoreSnapshotImpl(std::span<const std::uint8_t> payload,
   }
   tokens_ = std::move(tokens);
   ForgetDraftVocab();
+  // The snapshot carries no draft context or feature rows.
+  ForgetDFlashContext(static_cast<std::uint32_t>(tokens_.size()));
   lookup_.Restore(header.lookup);
   logits_ = std::move(logits);
   hidden_base_ = info.position - info.hidden_rows;
@@ -947,6 +1104,9 @@ struct Session::PendingDecode {
   /// request's first speculative step.
   std::size_t lookup_cap{0};
   std::uint32_t policy_concurrency{0};
+  bool dflash{false};  ///< the drafts after the anchor came from DFlash2
+  /// The draft-source chooser decided this cycle (DecodeStep records it).
+  bool dflash_eligible{false};
   /// A copy-only cycle here may verify more than max_speculative() rows.
   bool wide{false};
 };
@@ -1072,6 +1232,11 @@ bool Session::PrepareDecode(const DecodeRequest& request,
                                        model_->options_.max_draft_tokens);
   }
   const std::size_t width = MtpEnabled() && cap > 1 ? 1 + drafts : cap;
+  const std::size_t width =
+      MtpEnabled() && cap > 1
+          ? 1 + (use_dflash ? std::min<std::size_t>(cap - 1, kMaxMtpDraftTokens)
+                            : drafts)
+          : cap;
   if (width == 0) {
     result->stop = true;
     return true;
@@ -1155,6 +1320,17 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   }
   pending->lookup_cap = std::min(pending->lookup_cap, cap);
   if (allow_subset && !SyncDraftVocab(error_msg))
+        break;
+    }
+    if (pending->chain.size() > 1) {
+      prefetch();
+      pending->dflash = true;
+      pending->width = pending->chain.size();
+      // MTP keeps its context for the cycles it drafts.
+      return DraftCatchUp(anchor, false, error_msg);
+    }
+  }
+  if (!SyncDraftVocab(error_msg))
     return false;
   pending->draft_subset = allow_subset && model_->draft_subset_ &&
                           draft_vocab_.Fits(anchor, [&](std::int32_t token) {
@@ -1226,6 +1402,7 @@ bool Session::FinishDecode(const DecodeRequest& request,
   if (!pending.speculative) {
     draft_length_.ObserveArToken();
     hidden_base_ = base;
+    InjectFeatures(base, 1, base + 1);
     tokens_.push_back(anchor);
     sampler.Accept(static_cast<sampling::TokenId>(anchor));
     result->tokens.push_back(anchor);
@@ -1369,6 +1546,12 @@ bool Session::FinishDecode(const DecodeRequest& request,
   stats_.drafted += k - 1;
   stats_.accepted += keep - 1;
   stats_.small_head_cycles += pending.draft_subset;
+  InjectFeatures(base, keep, base + keep);
+  if (pending.dflash) {
+    stats_.dflash_cycles += 1;
+    stats_.dflash_drafted += k - 1;
+    stats_.dflash_accepted += keep - 1;
+  }
   // Copied proposals trail the MTP drafts. After a fully accepted MTP part,
   // the length controller also counts the accepted copied tokens as accepted
   // drafts: a copy that ended drafting early would otherwise make a perfect
@@ -1399,10 +1582,9 @@ bool Session::FinishDecode(const DecodeRequest& request,
   const bool mtp_all = mtp_accepted == mtp_drafts;
   const std::uint32_t observed = mtp_all ? keep - 1 : mtp_accepted;
   // A target stop ends the request; it does not classify the remaining
-  // proposals as failed predictions.
-  draft_length_.Observe(
-      observed, result->stop || mtp_all ? observed : mtp_drafts, base,
-      pending.policy_concurrency, pending.sampled_subset_cost);
+  // proposals as failed predictions. DFlash2 proposals say nothing about
+  // the MTP head.
+  if (!pending.dflash)
 
   // The next call knows the next sampled anchor. Defer draft catch-up until
   // then, retaining this session's target hidden rows across interleaving.
