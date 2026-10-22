@@ -349,10 +349,9 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
            std::uint32_t seed, std::uint32_t tile_rows = 48,
            float input_scale = 2.0F) {
   const Experts w =
-      type == q::WeightType::kQ4_K   ? MakeQ4K(experts, m, k, seed)
-      : type == q::WeightType::kQ5_K ? MakeQ5K(experts, m, k, seed)
-      : type == q::WeightType::kQ5_1 ? MakeQ5_1(experts, m, k, seed)
-                                     : MakeQ8_0(experts, m, k, seed);
+      type == q::WeightType::kQ3_K     ? MakeQ3K(experts, m, k, seed)
+      : type == q::WeightType::kIQ4_NL ? MakeIQ4NL(experts, m, k, seed)
+      : type == q::WeightType::kQ4_K   ? MakeQ4K(experts, m, k, seed)
   const std::size_t slots = n_tokens * used;
   // Skewed top-k without replacement: the low experts see most rows.
   std::vector<std::int32_t> ids(slots);
@@ -1342,6 +1341,10 @@ int main() {
     }
     // Q5_K gate/up view (one layer).
     ok = Ok(Run(q::WeightType::kQ5_K, 300, 10, 64, 640, 2560, 0x5A5A0001U)) &&
+         ok;
+    // IQ4_NL down view, full and ragged.
+    ok = Ok(Run(q::WeightType::kIQ4_NL, 3000, 1, 64, 2560, 640, 0x14A40001U,
+                128)) &&
          ok;
     // Q8_0 down view (five layers keep Q8_0 down projections).
     ok = Ok(Run(q::WeightType::kQ8_0, 3000, 1, 64, 2560, 640, 0x0C0FFEE0U,
