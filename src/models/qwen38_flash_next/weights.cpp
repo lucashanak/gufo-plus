@@ -150,7 +150,7 @@ struct Binder {
       l.ssm_qkv =
           Get(p + "attn_qkv.weight", hidden, c.SsmConvChannels(), 1, dense);
       l.ssm_gate =
-          Get(p + "attn_gate.weight", hidden, c.SsmValueDim(), 1, dense);
+          Get(p + "attn_gate.weight", hidden, c.SsmValueDim(), 1, projection);
       l.ssm_conv1d = Get(p + "ssm_conv1d.weight", c.ssm_conv_kernel,
                          c.SsmConvChannels(), 1, {GgmlType::kF32});
       l.ssm_alpha = Get(p + "ssm_alpha.weight", hidden, c.ssm_num_v_heads, 1,

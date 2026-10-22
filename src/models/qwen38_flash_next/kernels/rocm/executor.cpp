@@ -1851,6 +1851,13 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
                           std::string* error_msg) const {
   // Decode and verification use the same fused projections and activation.
   // A different SwiGLU rounding can change later activation quantization.
+      AssignError(error_msg, "gated K-quant GEMV failed");
+      return false;
+    }
+    return true;
+  }
+  // Compact decode rows without a gated kernel take the separate
+  // projections below, never their Q8_0 copies (as GatedDenseBatch does).
   if (!MatrixRows(n_tokens) && up.type == GgmlType::kQ8_0 &&
       gate.type == GgmlType::kQ8_0 && up.rows == gate.rows &&
       up.cols == gate.cols) {
@@ -1922,6 +1929,11 @@ bool Executor::DenseF16Route(const DeviceTensor& w,
 
 bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
                      std::uint32_t n_tokens, std::string* error_msg) const {
+      AssignError(error_msg, "K-quant GEMV failed");
+      return false;
+    }
+    return true;
+  }
   if (w.type == GgmlType::kQ8_0) {
     if (!MatrixRows(n_tokens)) {
       Q8Input q;
