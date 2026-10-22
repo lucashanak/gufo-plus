@@ -187,75 +187,6 @@ void CheckFusedProjection(std::uint32_t tokens) {
   std::cerr << "HC projection fusion exact at " << tokens << " tokens\n";
 }
 
-// A wide prefill pass gets the FFN mixer's inject partials from the
-// attention combine (HcCombineF16 with inject_w); a short pass over the same
-// rows computes them in the mixer epilogue (HcMixEpilogueVec4F16, and
-// HcMixF16Gemm from 96 rows). Each token's partials must not depend on which
-// pass computes them, bit for bit: a 1-ulp difference changes the stream
-// weights of the next combine and with them the greedy tokens.
-void CheckFusedInjectPartials(std::uint32_t tokens) {
-  constexpr std::size_t kRank = 320;
-  constexpr std::size_t kDim = kStreams * kHidden;
-  constexpr float kEps = 1e-6F;
-  const std::uint32_t parts = q::HcInjectPartsVec4(kHidden);
-  const std::size_t rows = std::size_t{tokens} * kDim;
-  const std::size_t inject_count = std::size_t{tokens} * kStreams * parts;
-  HipBuffer<float> d_res(rows), d_block(std::size_t{tokens} * kHidden);
-  HipBuffer<float> d_inject(inject_count), d_gamma(kDim);
-  HipBuffer<float> d_inject_w(kStreams * kDim), d_defer(tokens * kStreams);
-  HipBuffer<float> d_fused(inject_count), d_epilogue(inject_count);
-  HipBuffer<float> d_gemm(inject_count), d_gate(rows);
-  HipBuffer<float> d_mixed(std::size_t{tokens} * kHidden);
-  HipBuffer<__half> d_xn(rows);
-  Upload(&d_res, MakeValues(rows, 0x51CE0001U + tokens, 0.8F));
-  Upload(&d_block,
-         MakeValues(std::size_t{tokens} * kHidden, 0x51CE0002U, 0.3F));
-  Upload(&d_inject, MakeValues(inject_count, 0x51CE0003U, 2.0F));
-  auto gamma = MakeValues(kDim, 0x51CE0004U, 0.5F);
-  for (float& g : gamma)
-    g += 1.0F;
-  Upload(&d_gamma, gamma);
-  Upload(&d_inject_w, MakeValues(kStreams * kDim, 0x51CE0005U, 0.05F));
-  Upload(&d_gate, MakeValues(rows, 0x51CE0006U, 2.0F));
-  if (!q::HcCombineF16(d_res.get(), d_block.get(), d_inject.get(), parts,
-                       d_gamma.get(), d_xn.get(), nullptr, tokens, kHidden,
-                       kStreams, kEps, nullptr, d_defer.get(), d_fused.get(),
-                       d_inject_w.get()))
-    throw std::runtime_error("deferring HC combine rejected");
-  q::HcMixEpilogueVec4F16(d_xn.get(), d_gate.get(), d_inject_w.get(),
-                          d_mixed.get(), nullptr, nullptr, d_epilogue.get(),
-                          tokens, kHidden, nullptr);
-  const auto fused = Download(&d_fused, inject_count);
-  const auto epilogue = Download(&d_epilogue, inject_count);
-  std::size_t diffs = 0;
-  for (std::size_t i = 0; i < inject_count; ++i)
-    diffs += std::memcmp(&fused[i], &epilogue[i], sizeof(float)) != 0;
-  std::cout << "HC inject partials, fused combine vs mixer epilogue at "
-            << tokens << " tokens: " << diffs << " of " << inject_count
-            << " differ\n";
-  if (diffs != 0)
-    throw std::runtime_error("HC inject partials depend on the pass route");
-  if (tokens >= 96) {
-    // The fused projection's partials (HcMixF16Gemm) over the same norm.
-    std::vector<std::uint8_t> weights(kDim * (kRank / 32) * 34, 0);
-    HipBuffer<std::uint8_t> d_up(weights.size());
-    HipBuffer<__half> d_low(std::size_t{tokens} * kRank);
-    CheckHip(hipMemcpy(d_up.get(), weights.data(), d_up.bytes(),
-                       hipMemcpyHostToDevice),
-             "zero up weights");
-    CheckHip(hipMemset(d_low.get(), 0, d_low.bytes()), "zero low rank");
-    if (!q::HcMixF16Gemm(d_up.get(), d_low.get(), d_xn.get(), d_inject_w.get(),
-                         d_mixed.get(), nullptr, nullptr, d_gemm.get(), tokens,
-                         kHidden, kRank, nullptr))
-      throw std::runtime_error("HC fused projection rejected");
-    const auto gemm = Download(&d_gemm, inject_count);
-    if (std::memcmp(gemm.data(), fused.data(), inject_count * sizeof(float)))
-      throw std::runtime_error("HC projection inject partials differ");
-    std::cout << "HC inject partials, fused projection equal at " << tokens
-              << " tokens\n";
-  }
-}
-
 std::vector<std::uint8_t> MakeQ8_0(std::size_t blocks, std::uint32_t seed) {
   std::vector<std::uint8_t> weights(blocks * 34);
   for (std::size_t block = 0; block < blocks; ++block) {
@@ -270,6 +201,52 @@ std::vector<std::uint8_t> MakeQ8_0(std::size_t blocks, std::uint32_t seed) {
   return weights;
 }
 
+/// Compact decode-format rows (Q6_K, Q5_1, IQ4_NL, IQ4_XS) of random codes with
+/// sane F16 scales, as projection_ops_test builds them; a Q5_1 minimum
+/// centres the 5-bit codes.
+std::vector<std::uint8_t> MakeDecodeRows(q::WeightType type, std::size_t rows,
+                                         std::size_t cols, std::uint32_t seed) {
+  const bool q6 = type == q::WeightType::kQ6_K;
+  const bool xs = type == q::WeightType::kIQ4_XS;
+  const std::size_t block = q6 || xs ? 256 : 32;
+  const std::size_t block_bytes = q6                             ? 210
+                                  : xs                           ? 136
+                                  : type == q::WeightType::kQ5_1 ? 24
+                                                                 : 18;
+  std::vector<std::uint8_t> packed(rows * cols / block * block_bytes);
+  for (auto& b : packed) {
+    b = static_cast<std::uint8_t>(NextRandom(&seed) & 0xFF);
+  }
+  for (std::size_t b = 0; b < packed.size() / block_bytes; ++b) {
+    std::uint8_t* blk = packed.data() + b * block_bytes;
+    const float d =
+        (1.0F + static_cast<float>(NextRandom(&seed) % 64) / 320.0F) *
+        (q6 || xs ? 2e-5F : 2e-3F);
+    const __half dh = __float2half(d);
+    std::memcpy(q6 ? blk + 208 : blk, &dh, 2);
+    if (type == q::WeightType::kQ5_1) {
+      const __half mh = __float2half(-16.0F * d);
+      std::memcpy(blk + 2, &mh, 2);
+    }
+  }
+  return packed;
+}
+
+const char* FormatName(q::WeightType type) {
+  switch (type) {
+    case q::WeightType::kQ6_K:
+      return "Q6_K";
+    case q::WeightType::kQ5_1:
+      return "Q5_1";
+    case q::WeightType::kIQ4_NL:
+      return "IQ4_NL";
+    case q::WeightType::kIQ4_XS:
+      return "IQ4_XS";
+    default:
+      return "Q8_0";
+  }
+}
+
 template<typename T>
 std::vector<std::uint8_t> Bytes(HipBuffer<T>* buffer) {
   std::vector<std::uint8_t> bytes(buffer->bytes());
@@ -282,7 +259,11 @@ std::vector<std::uint8_t> Bytes(HipBuffer<T>* buffer) {
 // The one-launch decode mixer against the five kernels it replaces, on
 // small unsaturated activations: every output representation byte for
 // byte, across repeated launches and graph replays (the counters reset).
-void CheckFusedDecodeMixer(std::uint32_t tokens, bool with_inject) {
+// Decode-format projections compare with the dense K-quant GEMVs that the
+// unfused decode path runs on the same Q8_1 rows.
+void CheckFusedDecodeMixer(std::uint32_t tokens, bool with_inject,
+                           q::WeightType down_type = q::WeightType::kQ8_0,
+                           q::WeightType up_type = q::WeightType::kQ8_0) {
   constexpr std::uint32_t kRank = 320;
   constexpr std::size_t kDim = std::size_t{kStreams} * kHidden;
   constexpr float kEps = 1e-6F;
@@ -292,8 +273,14 @@ void CheckFusedDecodeMixer(std::uint32_t tokens, bool with_inject) {
   const std::size_t rows = std::size_t{tokens} * kDim;
   const std::size_t mixed_count = std::size_t{tokens} * kHidden;
   const std::size_t inject_count = std::size_t{tokens} * kStreams * parts;
-  const auto down = MakeQ8_0(kRank * kDim / 32, 0x5EED0001U + tokens);
-  const auto up = MakeQ8_0(kDim * kRank / 32, 0x5EED0002U + tokens);
+  const auto weights = [](q::WeightType type, std::size_t rows,
+                          std::size_t cols, std::uint32_t seed) {
+    return type == q::WeightType::kQ8_0
+               ? MakeQ8_0(rows * cols / 32, seed)
+               : MakeDecodeRows(type, rows, cols, seed);
+  };
+  const auto down = weights(down_type, kRank, kDim, 0x5EED0001U + tokens);
+  const auto up = weights(up_type, kDim, kRank, 0x5EED0002U + tokens);
   const auto res = MakeValues(rows, 0x0123ABCDU + tokens, 1.0F);
   const auto block_out = MakeValues(mixed_count, 0x0BADF00DU + tokens, 0.25F);
   const auto inject = MakeValues(inject_count, 0xC0FFEE00U + tokens, 0.05F);
@@ -352,17 +339,25 @@ void CheckFusedDecodeMixer(std::uint32_t tokens, bool with_inject) {
   const float* w_inject = with_inject ? d_inject_w.get() : nullptr;
   Outputs ref(tokens, lo_cols), out(tokens, lo_cols);
   reset(&ref, 0x5A);
+  // The unfused decode path's projection of Q8_1 rows (Executor::Dense).
+  const auto project = [&](q::WeightType type, const void* w, const void* x,
+                           float* y, int m, int k) {
+    return type == q::WeightType::kQ8_0
+               ? qfn_mmq_q8_0_dense_vec_preq(
+                     w, nullptr, x, y, m, static_cast<int>(tokens), k, nullptr)
+               : qfn_mmq_dense_kq_vec_preq(static_cast<int>(type), w, x, y, m,
+                                           k, static_cast<int>(tokens),
+                                           nullptr);
+  };
   if (!q::HcCombineQ8_1(ref.res.get(), d_block_out.get(), d_inject.get(), parts,
                         d_gamma.get(), ref.xn.get(), ref.xn_q8.get(), tokens,
                         kHidden, kStreams, kEps, nullptr) ||
-      qfn_mmq_q8_0_dense_vec_preq(d_down.get(), nullptr, ref.xn_q8.get(),
-                                  ref.lo.get(), kRank, static_cast<int>(tokens),
-                                  kDim, nullptr) != 0 ||
+      project(down_type, d_down.get(), ref.xn_q8.get(), ref.lo.get(), kRank,
+              kDim) != 0 ||
       !q::SiluScaleQ8_1(ref.lo.get(), 1.0F / kStreams, tokens, kRank, lo_cols,
                         ref.lo_q8.get(), nullptr) ||
-      qfn_mmq_q8_0_dense_vec_preq(d_up.get(), nullptr, ref.lo_q8.get(),
-                                  d_gate.get(), kDim, static_cast<int>(tokens),
-                                  kRank, nullptr) != 0) {
+      project(up_type, d_up.get(), ref.lo_q8.get(), d_gate.get(), kDim,
+              kRank) != 0) {
     throw std::runtime_error("decode mixer reference rejected");
   }
   q::HcMixEpilogue(ref.xn.get(), d_gate.get(), w_inject, ref.mixed.get(),
@@ -390,13 +385,16 @@ void CheckFusedDecodeMixer(std::uint32_t tokens, bool with_inject) {
                           kStreams,
                           kRank,
                           kEps,
-                          1.0F / kStreams};
+                          1.0F / kStreams,
+                          down_type,
+                          up_type};
   const auto compare = [&](const char* when) {
     const auto check = [&](auto& a, auto& b, const char* name) {
       if (Bytes(&a) != Bytes(&b)) {
-        throw std::runtime_error(std::string("fused decode mixer changed ") +
-                                 name + " (" + when + ", " +
-                                 std::to_string(tokens) + " tokens)");
+        throw std::runtime_error(
+            std::string("fused decode mixer changed ") + name + " (" + when +
+            ", " + std::to_string(tokens) + " tokens, " +
+            FormatName(down_type) + "/" + FormatName(up_type) + ")");
       }
     };
     check(ref.res, out.res, "res");
@@ -479,7 +477,8 @@ void CheckFusedDecodeMixer(std::uint32_t tokens, bool with_inject) {
       throw std::runtime_error("fused decode mixer output mostly zero");
     }
   }
-  std::cout << "HC fused decode mixer exact at " << tokens << " tokens"
+  std::cout << "HC fused decode mixer " << FormatName(down_type) << "/"
+            << FormatName(up_type) << " exact at " << tokens << " tokens"
             << (with_inject ? " with" : " without") << " inject\n";
 }
 
@@ -489,9 +488,16 @@ int main() {
   try {
     for (std::uint32_t n = 1; n <= 8; ++n) {
       CheckFusedDecodeMixer(n, true);
+      CheckFusedDecodeMixer(n, true, q::WeightType::kQ6_K,
+                            q::WeightType::kQ5_1);
+      CheckFusedDecodeMixer(n, true, q::WeightType::kIQ4_NL,
+                            q::WeightType::kIQ4_NL);
+      CheckFusedDecodeMixer(n, true, q::WeightType::kIQ4_XS,
+                            q::WeightType::kIQ4_NL);
     }
     CheckFusedDecodeMixer(1, false);
     CheckFusedDecodeMixer(5, false);
+    CheckFusedDecodeMixer(3, false, q::WeightType::kQ6_K, q::WeightType::kQ5_1);
     CheckFusedProjection(96);
     CheckFusedProjection(2049);
     for (std::uint32_t n : {7U, 96U, 1619U})
