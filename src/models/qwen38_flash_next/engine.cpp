@@ -503,6 +503,7 @@ void Session::ResetDraftPolicy() {
   if (continuation_hooks_)
     continuation_hooks_->BeforeExecution();
   draft_length_.Reset();
+  draft_source_.Reset();
   // A fully reused prompt can start decoding without SyncImpl. It still
   // starts a new request: do not inherit a copy cursor or widen its first step.
   lookup_.BeginRequest();
@@ -913,12 +914,18 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     }
     // The chunk this loop, or the following Sync, takes next.
     const auto rest = off + n < tokens.size() ? tokens.subspan(off + n) : after;
-    const auto next = rest.first(std::min<std::size_t>(
-        rest.size() <= exec.max_batch() ? exec.max_batch()
-                                        : model_->PrefillCapacity(),
-        rest.size()));
-    if (!exec.Forward(*session_, chunk, 1, logits_.data(), mode, error_msg,
-                      capture.get(), next)) {
+    const auto next = rest.first(
+        pass_tokens(rest.size(), off + n < tokens.size() ? ramp : 0));
+    // Only rows inside the draft's attention window at the end of this
+    // feed are ever read; earlier chunks skip the taps.
+    // A decode-mode feed also needs to run alone, as DecodeStep does.
+    const bool taps =
+        DFlashAvailable() && (prefill || RanLastForward()) &&
+        off + n + model_->dflash_model_->GetDFlashConfig().sliding_window >
+            tokens.size();
+    exec.EnableFeatureTaps(taps);
+    if (!exec.Forward(*session_, chunk_rows, 1, logits_.data(), mode, error_msg,
+                      views, next)) {
       return false;
     }
     NoteForward();
@@ -1202,7 +1209,16 @@ bool Session::PrepareDecode(const DecodeRequest& request,
       drafts = std::min<std::uint32_t>(static_cast<std::uint32_t>(cap - 1),
                                        model_->options_.max_draft_tokens);
   }
-  const std::size_t width = MtpEnabled() && cap > 1 ? 1 + drafts : cap;
+  // A greedy cycle of a session decoding alone may draft with DFlash2
+  // instead of MTP; the chooser decides from acceptance history. Sampled
+  // requests and every batch keep MTP, so their cost is unchanged.
+  pending->dflash_eligible =
+      dflash_ && !defer_head && !batch_drafts && MtpEnabled() && cap > 1 &&
+      !sampler.config().uses_random_sampling() && RanLastForward();
+  const bool use_dflash =
+      pending->dflash_eligible &&
+      draft_source_.PreferDFlash(static_cast<std::uint32_t>(tokens_.size())) &&
+      EnsureDFlashContext();
   const std::size_t width =
       MtpEnabled() && cap > 1
           ? 1 + (use_dflash ? std::min<std::size_t>(cap - 1, kMaxMtpDraftTokens)
@@ -1272,6 +1288,12 @@ bool Session::PrepareDecode(const DecodeRequest& request,
     return defer_head || DraftCatchUp(anchor, false, error_msg);
   }
   if (allow_subset && !SyncDraftVocab(error_msg))
+    // Like a gated MTP chain, the block ends after its first unlikely
+    // proposal: each verified row costs a fresh set of routed experts.
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+      pending->chain.push_back(static_cast<std::int32_t>(ids[i]));
+      if (is_stop(pending->chain.back()) ||
+          probabilities[i] < kDFlashGateProbability)
         break;
     }
     if (pending->chain.size() > 1) {
@@ -1558,14 +1580,29 @@ bool Session::DecodeStep(std::size_t max_tokens,
   float* logits = !pending.speculative       ? logits_.data()
                   : pending.gpu_verification ? nullptr
                                              : verify_logits_.data();
-  if (!model_->executor_->Forward(
-          *session_, pending.chain, pending.chain.size(), logits,
-          pending.speculative ? rocm::Executor::ForwardMode::kVerify
-                              : rocm::Executor::ForwardMode::kDecode,
-          error_msg)) {
+  // Feature rows only for a greedy session decoding alone: the only one that
+  // can draft with DFlash2. Everything else keeps the untapped graphs.
+  const bool taps = DFlashAvailable() &&
+                    !sampler.config().uses_random_sampling() &&
+                    RanLastForward();
+  auto& exec = *model_->executor_;
+  exec.EnableFeatureTaps(taps);
     return false;
   }
+  NoteForward();
+  features_fresh_ = taps;
+  feature_row_offset_ = 0;
   const bool ok = FinishDecode(request, pending, error_msg);
+  features_fresh_ = false;
+  // The chooser sees the neural cycles it decided; prompt-lookup copies
+  // say nothing about either source.
+  if (ok && pending.dflash_eligible && pending.lookup == 0 &&
+      !result->tokens.empty()) {
+    draft_source_.Observe(pending.dflash,
+                          static_cast<std::uint32_t>(result->tokens.size()),
+                          static_cast<std::uint32_t>(pending.chain.size()));
+    stats_.mtp_chosen += !pending.dflash;
+  }
   valid_ = ok;
   return ok;
 }
@@ -1841,6 +1878,8 @@ bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
   }
   if (!items.empty() && !exec.ForwardBatch(items, error_msg))
     return false;
+  requests.front().session->model_->last_forward_.store(
+      nullptr, std::memory_order_relaxed);
   std::uint32_t offset = 0;
   for (std::size_t i = 0; i < requests.size(); ++i) {
     const auto& p = pending[i];
@@ -1907,6 +1946,8 @@ bool Session::EvaluateBatchImpl(std::span<const AdvanceRequest> requests,
   if (!exec.ForwardBatch(items, error_msg)) {
     return false;
   }
+  requests.front().session->model_->last_forward_.store(
+      nullptr, std::memory_order_relaxed);
   for (std::size_t i = 0; i < requests.size(); ++i) {
     auto& session = *requests[i].session;
     auto& outcome = *requests[i].outcome;
@@ -1918,6 +1959,9 @@ bool Session::EvaluateBatchImpl(std::span<const AdvanceRequest> requests,
       if (!exec.SelectBatchLogits(i, 1, session.logits_.data(), &outcome.error))
         continue;
       session.hidden_base_ = static_cast<std::uint32_t>(session.tokens_.size());
+      // Batches write no feature rows: the draft context restarts later.
+      session.ForgetDFlashContext(
+          static_cast<std::uint32_t>(session.tokens_.size() + 1));
       session.tokens_.push_back(requests[i].token);
       outcome.completed = true;
     } catch (const std::exception& exception) {
