@@ -739,8 +739,9 @@ void ReportVectorAccuracy() {
   }
 }
 
-void CheckVectorGrouping(bool down = false) {
-  constexpr int experts = 8;
+// Eight experts make most rows share theirs; with more experts the gate/up
+// groups mix shared experts with single-row ones (their separate launch).
+void CheckVectorGrouping(bool down = false, int experts = 8) {
   const int cols = down ? 640 : 2560;
   const int tokens = down ? 640 : 64;
   const int used = down ? 1 : 3;
@@ -761,8 +762,9 @@ void CheckVectorGrouping(bool down = false) {
   std::vector<std::int32_t> ids(tokens * used);
   for (int t = 0; t < tokens; ++t)
     for (int j = 0; j < used; ++j)
-      ids[t * used + j] =
-          j == 1 || (down && t % 11 == 1) ? -1 : (t + j) % experts;
+      ids[t * used + j] = j == 1 || (down && t % 11 == 1) ? -1
+                          : experts == 8                  ? (t + j) % experts
+                                         : (t * 37 + j * 11) % experts;
   if (!down) {
     // Exercise both repeated experts across tokens and duplicate slots
     // within one token; each output must retain its original slot.
@@ -1316,6 +1318,7 @@ int main() {
       throw std::runtime_error("routed expert rows depend on the pass route");
     ReportVectorAccuracy();
     CheckVectorGrouping();
+    CheckVectorGrouping(false, 64);
     CheckVectorGrouping(true);
     CheckPairedMmq();
     bool ok = true;
