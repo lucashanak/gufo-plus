@@ -2,12 +2,14 @@
 // (HcCombineQ8_1, Q8_0 down projection, SiluScaleQ8_1, Q8_0 up projection,
 // HcMixEpilogue) against HcMixQ8Fused, both replayed from hipGraphs as decode
 // runs them. Each graph holds `mixers` consecutive mixers whose weights
-// rotate through `copies` sets (~7 MB each), well past the 32 MiB MALL.
+// rotate through `copies` sets (~7 MB each for Q8_0, ~5 MB for the v3
+// recipe's Q6_K down / Q5_1 up, ~3.7 MB for IQ4_NL), well past the 32 MiB
+// MALL.
 //
 // hc_mix_bench [mixers] [copies] [replays]
 //
 // Prints the median over alternating rounds of each graph's median
-// microseconds per mixer for 1, 2, 4 and 8 tokens.
+// microseconds per mixer for 1 to 8 tokens.
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -63,6 +65,29 @@ void* Q8Weights(std::size_t blocks, std::uint32_t seed) {
     for (std::size_t j = 0; j < 32; ++j)
       host[b * 34 + 2 + j] =
           static_cast<std::uint8_t>(static_cast<int>(Next(&seed) % 255) - 127);
+  }
+  void* p = Device(host.size());
+  CheckHip(hipMemcpy(p, host.data(), host.size(), hipMemcpyHostToDevice),
+           "weights");
+  return p;
+}
+
+/// Compact decode-format rows (Q6_K, Q5_1, IQ4_NL, IQ4_XS) of random codes,
+/// sane scales.
+void* DecodeWeights(q::WeightType type, std::size_t rows, std::size_t cols,
+                    std::uint32_t seed) {
+  const bool q6 = type == q::WeightType::kQ6_K;
+  const bool q5 = type == q::WeightType::kQ5_1;
+  for (auto& b : host)
+    b = static_cast<std::uint8_t>(Next(&seed) & 0xFF);
+  for (std::size_t b = 0; b < host.size() / block_bytes; ++b) {
+    const float d = q6 || xs ? 2e-5F : 2e-3F;
+    const __half dh = __float2half_rn(d);
+    std::memcpy(host.data() + b * block_bytes + (q6 ? 208 : 0), &dh, 2);
+    if (q5) {
+      const __half mh = __float2half_rn(-16.0F * d);
+      std::memcpy(host.data() + b * block_bytes + 2, &mh, 2);
+    }
   }
   void* p = Device(host.size());
   CheckHip(hipMemcpy(p, host.data(), host.size(), hipMemcpyHostToDevice),
@@ -130,11 +155,6 @@ int main(int argc, char** argv) {
     const int replays = argc > 3 ? std::atoi(argv[3]) : 21;
     hipStream_t stream = nullptr;
     CheckHip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
-    std::vector<void*> down(copies), up(copies);
-    for (int i = 0; i < copies; ++i) {
-      down[i] = Q8Weights(std::size_t{kRank} * kDim / 32, 0x1000U + i);
-      up[i] = Q8Weights(std::size_t{kDim} * kRank / 32, 0x2000U + i);
-    }
     const std::uint32_t parts = q::HcInjectParts(kHidden);
     const auto lo_cols =
         static_cast<std::uint32_t>(qfn_mmq_q8_1_bytes(1, kRank) / 36 * 32);
@@ -182,14 +202,75 @@ int main(int argc, char** argv) {
                                   1.0F / kStreams};
           if (!q::HcMixQ8Fused(state, mix, n, stream))
             throw std::runtime_error("fused mixer rejected");
+    for (const auto& format : formats) {
+      const q::WeightType down_type = format[0];
+      const q::WeightType up_type = format[1];
+      const bool q8 = down_type == q::WeightType::kQ8_0;
+      std::vector<void*> down(copies), up(copies);
+      for (int i = 0; i < copies; ++i) {
+        down[i] = q8 ? Q8Weights(std::size_t{kRank} * kDim / 32, 0x1000U + i)
+                     : DecodeWeights(down_type, kRank, kDim, 0x1000U + i);
+        up[i] = q8 ? Q8Weights(std::size_t{kDim} * kRank / 32, 0x2000U + i)
+                   : DecodeWeights(up_type, kDim, kRank, 0x2000U + i);
+      }
+      // The unfused decode path's projection (Executor::Dense).
+      const auto project = [&](q::WeightType type, const void* w, const void* x,
+                               float* y, int m, int k, std::uint32_t n) {
+        if (type == q::WeightType::kQ8_0)
+          qfn_mmq_q8_0_dense_vec_preq(w, nullptr, x, y, m, static_cast<int>(n),
+                                      k, stream);
+        else
+          qfn_mmq_dense_kq_vec_preq(static_cast<int>(type), w, x, y, m, k,
+                                    static_cast<int>(n), stream);
+      };
+      std::printf("%s\ntokens  five-launch_us  fused_us  speedup\n",
+                  q8                                  ? "Q8_0 down / Q8_0 up"
+                  : down_type == q::WeightType::kQ6_K ? "Q6_K down / Q5_1 up"
+                  : down_type == q::WeightType::kIQ4_XS
+                      ? "IQ4_XS down / IQ4_NL up"
+                      : "IQ4_NL down / IQ4_NL up");
+      for (std::uint32_t n = 1; n <= kMaxTokens; ++n) {
+        const auto old_exec = Capture(stream, [&] {
+          for (int m = 0; m < mixers; ++m) {
+            const int c = m % copies;
+            q::HcCombineQ8_1(res, block_out, inject, parts, gammas[c], xn,
+                             xn_q8, n, kHidden, kStreams, 1e-6F, stream);
+            project(down_type, down[c], xn_q8, lo, kRank, kDim, n);
+            q::SiluScaleQ8_1(lo, 1.0F / kStreams, n, kRank, lo_cols, lo_q8,
+                             stream);
+            project(up_type, up[c], lo_q8, gate, kDim, kRank, n);
+            q::HcMixEpilogue(xn, gate, inject_ws[c], mixed, inject, n, kHidden,
+                             kStreams, stream, mixed_q8);
+          }
+        });
+        const auto fused_exec = Capture(stream, [&] {
+          for (int m = 0; m < mixers; ++m) {
+            const int c = m % copies;
+            const q::HcFusedMix mix{
+                1.0F / kStreams, down_type, up_type};
+            if (!q::HcMixQ8Fused(state, mix, n, stream))
+              throw std::runtime_error("fused mixer rejected");
+          }
+        });
+        // Alternating rounds share whatever else loads the memory system.
+        std::vector<double> old_rounds, fused_rounds;
+        for (int round = 0; round < 7; ++round) {
+          old_rounds.push_back(MedianMicros(old_exec, stream, replays, mixers));
+          fused_rounds.push_back(
+              MedianMicros(fused_exec, stream, replays, mixers));
         }
-      });
-      // Alternating rounds share whatever else loads the memory system.
-      std::vector<double> old_rounds, fused_rounds;
-      for (int round = 0; round < 7; ++round) {
-        old_rounds.push_back(MedianMicros(old_exec, stream, replays, mixers));
-        fused_rounds.push_back(
-            MedianMicros(fused_exec, stream, replays, mixers));
+        std::sort(old_rounds.begin(), old_rounds.end());
+        std::sort(fused_rounds.begin(), fused_rounds.end());
+        const double old_us = old_rounds[old_rounds.size() / 2];
+        const double fused_us = fused_rounds[fused_rounds.size() / 2];
+        std::printf("%6u  %14.2f  %8.2f  %7.3f\n", n, old_us, fused_us,
+                    old_us / fused_us);
+        (void)hipGraphExecDestroy(old_exec);
+        (void)hipGraphExecDestroy(fused_exec);
+      }
+      for (int i = 0; i < copies; ++i) {
+        (void)hipFree(down[i]);
+        (void)hipFree(up[i]);
       }
     }
     return 0;
