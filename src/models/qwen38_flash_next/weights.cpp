@@ -198,8 +198,9 @@ struct Binder {
                          {GgmlType::kF32});
     }
 
+    // A BF16 router is widened and narrowed to F16 like the F32 one.
     l.router = Get(p + "ffn_gate_inp.weight", hidden, c.num_experts, 1,
-                   {GgmlType::kF32});
+                   {GgmlType::kF32, GgmlType::kBF16});
     l.ffn_gate_exps = Get(p + "ffn_gate_exps.weight", hidden, c.expert_ff,
                           c.num_experts, experts);
     l.ffn_up_exps = Get(p + "ffn_up_exps.weight", hidden, c.expert_ff,
