@@ -13,9 +13,9 @@
 namespace gufo::models::qwen38_flash_next {
 
 inline constexpr std::uint32_t kMaxMtpDraftTokens = 7;
-/// A chain ends after its first proposal below its gate: the head's
-/// probability of a greedy draft, or the proposal probability q of a sampled
-/// one.
+/// An unplanned chain drafts up to its budget and ends after the first
+/// proposal below its gate: the head's probability of a greedy draft, or the
+/// proposal probability q of a sampled one.
 inline constexpr float kMtpGateProbability = 0.85F;
 inline constexpr float kMtpSampledGateProbability = 0.95F;
 /// In a jointly planned greedy batch a final proposal below this
