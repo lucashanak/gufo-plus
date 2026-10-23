@@ -1248,6 +1248,83 @@ void CheckDenseKQuant(GgmlType type, int rows, int cols, std::uint32_t seed) {
 }
 
 // A batched decode step projects up to 64 rows of K-quant weights in one
+// launch; each row must equal the same token projected alone, as an
+// isolated request's decode step projects it.
+void CheckDenseKQuantWidths(GgmlType type, int rows, int cols,
+                            std::uint32_t seed) {
+  constexpr int kTokens = 64;
+  struct Layout {
+    std::size_t block, bytes, d_offset;
+    bool min;  ///< a second F16 (dmin / m) follows d
+  };
+  const Layout layout = type == GgmlType::kQ3_K   ? Layout{256, 110, 108, false}
+                        : type == GgmlType::kQ4_K ? Layout{256, 144, 0, true}
+                        : type == GgmlType::kQ5_K ? Layout{256, 176, 0, true}
+                        : type == GgmlType::kQ6_K ? Layout{256, 210, 208, false}
+                        : type == GgmlType::kQ5_1 ? Layout{32, 24, 0, true}
+                                                  : Layout{32, 18, 0, false};
+  const std::size_t row_bytes = cols / layout.block * layout.bytes;
+  std::vector<std::uint8_t> packed(rows * row_bytes);
+  for (auto& b : packed)
+    b = static_cast<std::uint8_t>(NextRandom(&seed) & 0xFF);
+  for (std::size_t b = 0; b < packed.size() / layout.bytes; ++b) {
+    std::uint8_t* blk = packed.data() + b * layout.bytes + layout.d_offset;
+    const float d =
+        (Uniform(&seed, 0.2F) + 1.0F) * (layout.block == 256 ? 2e-4F : 2e-3F);
+    const __half dh = __float2half(d);
+    std::memcpy(blk, &dh, 2);
+    if (layout.min) {
+      const __half mh =
+          __float2half(layout.block == 256 ? 4.0F * d : -16.0F * d);
+      std::memcpy(blk + 2, &mh, 2);
+    }
+  }
+  std::vector<float> x(static_cast<std::size_t>(kTokens) * cols);
+  for (auto& v : x)
+    v = Uniform(&seed, 2.0F);
+  void* dw = nullptr;
+  float* dx = nullptr;
+  float* out = nullptr;
+  const std::size_t out_count = std::size_t(rows) * kTokens;
+  CheckHip(hipMalloc(&dw, packed.size() + 4096), "K-quant width weights");
+  CheckHip(hipMalloc(&dx, x.size() * sizeof(float)), "K-quant width inputs");
+  CheckHip(hipMalloc(&out, out_count * sizeof(float)), "K-quant width output");
+  CheckHip(hipMemcpy(dw, packed.data(), packed.size(), hipMemcpyHostToDevice),
+           "K-quant width weights upload");
+  CheckHip(
+      hipMemcpy(dx, x.data(), x.size() * sizeof(float), hipMemcpyHostToDevice),
+      "K-quant width input upload");
+  const std::string shape = "type=" + std::to_string(static_cast<int>(type)) +
+                            " M=" + std::to_string(rows) +
+                            " K=" + std::to_string(cols);
+  const auto project = [&](int first, int n) {
+    if (qfn_mmq_dense_kq_vec(static_cast<int>(type), dw,
+                             dx + std::size_t(first) * cols, out, rows, cols, n,
+                             nullptr) != 0)
+      throw std::runtime_error("K-quant width launch failed: " + shape);
+    std::vector<float> y(std::size_t(rows) * n);
+    CheckHip(hipMemcpy(y.data(), out, y.size() * sizeof(float),
+                       hipMemcpyDeviceToHost),
+             "K-quant width output");
+    return y;
+  };
+  std::vector<float> alone(out_count);
+  for (int t = 0; t < kTokens; ++t) {
+    const auto y = project(t, 1);
+    std::copy(y.begin(), y.end(), alone.begin() + std::size_t(t) * rows);
+  }
+  for (int n = 2; n <= kTokens; ++n) {
+    const auto y = project(kTokens - n, n);
+    if (std::memcmp(y.data(), alone.data() + std::size_t(kTokens - n) * rows,
+                    y.size() * sizeof(float)) != 0)
+      throw std::runtime_error("K-quant GEMV rows depend on the width: " +
+                               shape + " N=" + std::to_string(n));
+  }
+  std::cout << "dense K-quant " << shape << " N=1..64: rows exact\n";
+  for (void* ptr : {dw, static_cast<void*>(dx), static_cast<void*>(out)})
+    CheckHip(hipFree(ptr), "K-quant width test free");
+}
+
 void CheckMtpOutputHead(float input_scale) {
   constexpr int rows = 65, cols = 2560, blocks = cols / 32;
   auto weights = MakeWeights(rows, cols, 73);
@@ -1462,6 +1539,14 @@ int main() {
     CheckDenseKQuant(GgmlType::kQ5_1, 10240, 320, 0x51A320U);
     CheckDenseKQuant(GgmlType::kQ5_1, 333, 320, 0x51A333U);
     CheckDenseKQuant(GgmlType::kIQ4_NL, 10241, 320, 0x14A320U);
+    for (const GgmlType type :
+         {GgmlType::kQ3_K, GgmlType::kQ4_K, GgmlType::kQ5_K, GgmlType::kQ6_K})
+      CheckDenseKQuantWidths(type, 640, 2560, 0x16A640U);
+    CheckDenseKQuantWidths(GgmlType::kQ4_K, 2560, 6144, 0x16A256U);
+    CheckDenseKQuantWidths(GgmlType::kQ4_K, 16384, 2560, 0x16A163U);
+    CheckDenseKQuantWidths(GgmlType::kQ6_K, 320, 10240, 0x16A610U);
+    CheckDenseKQuantWidths(GgmlType::kQ5_1, 10240, 320, 0x16A320U);
+    CheckDenseKQuantWidths(GgmlType::kIQ4_NL, 10240, 320, 0x16B320U);
     // The hc_*_inject [4][10240] and stacked ssm_alpha/beta [96][2560]
     // shapes.
     CheckExpandQ8_0(4, 10240, 0xE8A4D1U);
