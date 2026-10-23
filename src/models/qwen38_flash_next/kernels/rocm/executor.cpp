@@ -4986,6 +4986,18 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     drop_staged();
   const auto project = [&](const DeviceTensor& w, const float* x, float* out,
                            std::uint32_t rows) {
+    if (!cache_only)
+      return DenseBatch(w, x, out, rows, error_msg);
+    // Q8_0 and the 16-bit projections our own kernels cover keep the trunk's
+    // prefill route. Others (an F32 tensor would reach hipblasSgemm, whose
+    // plan follows the token count) take the row-independent small GEMM.
+    const bool bf16 = w.type == GgmlType::kBF16;
+    if (w.type == GgmlType::kQ8_0 ||
+        ((bf16 || w.type == GgmlType::kF16) &&
+      return Dense(w, x, out, rows, error_msg);
+    SmallGemm(w.data, SmallType(w.type), x, out, rows, w.rows, w.cols, stream_);
+    return true;
+  };
   const auto copy_trace = [&](const float* source,
                               std::span<float> destination) {
     return destination.empty() ||
