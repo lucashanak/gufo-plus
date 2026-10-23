@@ -389,6 +389,11 @@ int main(int argc, char** argv) try {
           std::printf("%s offset %d DIFF\n", name, offset);
         }
       }
+      int differ = 0;
+      for (int n = 1; n <= t; n += n < 160 ? 1 : 97) {
+        own(n);
+        CheckHip(hipDeviceSynchronize(), "hipDeviceSynchronize");
+        const auto b = host(y_own, std::size_t{static_cast<unsigned>(n)} * m);
       std::printf(
           "%s n %d: max |own - library| %.3g; rows changed with their "
           "batch offset at %d of 5 offsets\n",

@@ -8465,7 +8465,7 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
 #pragma unroll
           for (int i = 0; i < kWaveRowTiles; ++i) {
             if constexpr (kBf16) {
-              // One K16 chain in K order for every token.
+              // One K16 chain in K order for every output.
               acc[i][j] = WmmaBf16(a_lo[i], b_lo, acc[i][j]);
               acc[i][j] = WmmaBf16(a_hi[i], b_hi, acc[i][j]);
             } else if constexpr (kHalfWeights) {
@@ -8879,6 +8879,8 @@ bool DenseBf16Gemm(const void* w, const void* x, float* out, std::size_t batch,
                    std::size_t m, std::size_t k, hipStream_t stream) {
   if (m == 0 || batch == 0 || k == 0 || k % 32 != 0)
     return false;
+  // Every output is one K16 chain in K order, whatever the token's place in
+  // the launch or the batch width.
   hipLaunchKernelGGL((DenseF16GEMMKernel<64, 128, 2, 2, 4, 1, false, false,
                                          false, false, true>),
                      dim3((batch + 127) / 128, (m + 63) / 64), dim3(kThreads),

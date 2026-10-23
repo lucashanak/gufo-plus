@@ -300,8 +300,8 @@ bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
                   std::size_t m, std::size_t k, hipStream_t stream,
                   std::size_t input_stride = 0);
 /// BF16 weight rows [m][k] times BF16 activation rows [batch][k] with one
-/// F32 K16 chain per output, in K order for every token: a row's result does
-/// not depend on its position in the batch (BlasLt::Gemm). out is [batch][m].
+/// F32 K16 chain per output in K order, independent of the token's place in
+/// the launch and of the batch width (BlasLt::Gemm). out is [batch][m].
 bool DenseBf16Gemm(const void* w, const void* x, float* out, std::size_t batch,
                    std::size_t m, std::size_t k, hipStream_t stream);
 
