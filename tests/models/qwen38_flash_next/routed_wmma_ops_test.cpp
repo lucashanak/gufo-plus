@@ -6,6 +6,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -1155,9 +1157,23 @@ std::size_t CountDiffs(const std::vector<__half>& a, std::size_t a_offset,
   return diffs;
 }
 
+std::vector<std::uint8_t> ReadFile(const std::string& path) {
+  std::FILE* f = std::fopen(path.c_str(), "rb");
+  if (f == nullptr)
+    throw std::runtime_error("cannot open " + path);
+  std::fseek(f, 0, SEEK_END);
+  const long size = std::ftell(f);
+  std::fseek(f, 0, SEEK_SET);
+  std::vector<std::uint8_t> data(static_cast<std::size_t>(size));
+  if (std::fread(data.data(), 1, data.size(), f) != data.size())
+    throw std::runtime_error("short read " + path);
+  std::fclose(f);
+  return data;
+}
+
 /// Packed random blocks without the dequantized copy (model-sized shapes):
-/// every byte random, then sane F16 scales (Q4_K/Q5_K d and dmin; Q5_1 d and
-/// m; Q8_0 d).
+/// every byte random, then sane F16 scales (Q3_K d; Q4_K/Q5_K d and dmin;
+/// the 32-element formats d, Q5_1 m).
 std::vector<std::uint8_t> MakePacked(q::WeightType type, std::size_t e,
                                      std::size_t m, std::size_t k,
                                      std::uint32_t seed) {
@@ -1304,11 +1320,27 @@ bool CheckPassRoutes(q::WeightType gate_type, q::WeightType down_type,
   return ok;
 }
 
+/// The same check on a model layer's dumped gate/up experts
+/// (GUFO_ROUTED_EXPERTS_DIR with gate.bin / up.bin, [512][640][2560]).
+bool CheckModelExperts(const char* dir, q::WeightType type) {
+  const auto gate = ReadFile(std::string(dir) + "/gate.bin");
+  const auto up = ReadFile(std::string(dir) + "/up.bin");
+  return CheckPassRoutes(type, q::WeightType::kQ5_1, &gate, &up, 512);
+}
+
 }  // namespace
 
 int main() {
   try {
     CheckGatedDecodeShape();
+    if (const char* dir = std::getenv("GUFO_ROUTED_EXPERTS_DIR")) {
+      const char* t = std::getenv("GUFO_ROUTED_EXPERTS_TYPE");
+      return CheckModelExperts(dir, t != nullptr && std::string(t) == "q4_k"
+                                        ? q::WeightType::kQ4_K
+                                        : q::WeightType::kQ3_K)
+                 ? 0
+                 : 1;
+    }
     bool routes = true;
     for (const auto gate : {q::WeightType::kQ4_K, q::WeightType::kQ5_K})
       for (const auto down : {q::WeightType::kQ5_1, q::WeightType::kQ8_0})
