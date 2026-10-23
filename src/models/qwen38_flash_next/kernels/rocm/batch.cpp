@@ -866,6 +866,19 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
                           std::uint32_t rows, std::string* error) const {
   if (rows <= kDecodeRows)
     return Dense(w, x, out, rows, error);
+  if (w.decode != nullptr) {
+    // A K-quant projection's isolated decode reads its compact rows; the
+    // Q8_0 copy in w.data holds other weights (the prefill route's). Each
+    for (std::uint32_t r = 0; r < rows; r += chunk) {
+      if (qfn_mmq_dense_kq_vec(
+              static_cast<int>(w.decode_type), w.decode,
+              x + std::size_t{r} * w.cols, out + std::size_t{r} * w.rows,
+              static_cast<int>(w.rows), static_cast<int>(w.cols),
+              static_cast<int>(std::min(chunk, rows - r)), stream_) != 0)
+        return Fail(error, "batched K-quant projection failed");
+    }
+    return true;
+  }
   if (w.type != core::GgmlType::kQ8_0) {
     SmallGemm(w.data, EmbeddingType(w.type), x, out, rows, w.rows, w.cols,
               stream_);
@@ -908,8 +921,11 @@ bool Executor::GatedDenseBatch(const DeviceTensor& up, const DeviceTensor& gate,
                                const float* x, float* out, std::uint32_t rows,
                                std::string* error) const {
   const Scratch base = s_;
+  // K-quant weights (a Q8_0 copy plus compact decode rows) take
+  // GatedDense's decode route, as an isolated request does.
   const bool q8 = up.type == core::GgmlType::kQ8_0 &&
-                  gate.type == core::GgmlType::kQ8_0 && up.rows == gate.rows &&
+                  gate.type == core::GgmlType::kQ8_0 && up.decode == nullptr &&
+                  gate.decode == nullptr && up.rows == gate.rows &&
                   up.cols == gate.cols;
   if (q8 && !QuantizeBatch(x, rows, up.cols, error))
     return false;
