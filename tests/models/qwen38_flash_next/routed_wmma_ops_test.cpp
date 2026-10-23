@@ -983,10 +983,9 @@ void CheckGatedDecodeShape() {
   for (const auto type :
        {q::WeightType::kQ4_K, q::WeightType::kQ5_K, q::WeightType::kQ8_0}) {
     const auto make = [&](std::uint32_t seed) {
-      return type == q::WeightType::kQ4_K ? MakeQ4K(experts, rows, cols, seed)
-             : type == q::WeightType::kQ5_K
-                 ? MakeQ5K(experts, rows, cols, seed)
-                 : MakeQ8_0(experts, rows, cols, seed);
+      return type == q::WeightType::kQ3_K   ? MakeQ3K(experts, rows, cols, seed)
+             : type == q::WeightType::kQ4_K ? MakeQ4K(experts, rows, cols, seed)
+             : type == q::WeightType::kQ5_K ? MakeQ5K(experts, rows, cols, seed)
     };
     const auto a = make(101), b = make(202);
     std::vector<float> x(tokens * cols);
