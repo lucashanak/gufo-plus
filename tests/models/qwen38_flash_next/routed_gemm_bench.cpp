@@ -47,12 +47,23 @@ std::size_t BlockBytes(q::WeightType type) {
 std::size_t BlockElems(q::WeightType type) {
   return type == q::WeightType::kQ4_K || type == q::WeightType::kQ5_K ? 256
                                                                       : 32;
+             ? 256
+             : 32;
+}
+/// Gate/up formats without the paired kernel (separate 128-token tiles).
+bool Separate(q::WeightType type) {
+  return type == q::WeightType::kIQ3_S || type == q::WeightType::kIQ3_XXS ||
+         type == q::WeightType::kIQ2_XS;
 }
 q::WeightType ParseType(const std::string& name) {
+  if (name == "q3_k")
+    return q::WeightType::kQ3_K;
   if (name == "q4_k")
     return q::WeightType::kQ4_K;
   if (name == "q5_k")
     return q::WeightType::kQ5_K;
+  if (name == "iq4_nl")
+    return q::WeightType::kIQ4_NL;
   if (name == "q5_1")
     return q::WeightType::kQ5_1;
   if (name == "q8_0")
@@ -124,8 +135,9 @@ std::vector<std::uint8_t> MakeBlocks(q::WeightType type, std::size_t elems,
   for (std::size_t b = 0; b < blocks; ++b) {
     const float d = (k_quant ? 4e-4F : 1.5e-3F) *
                     (1.0F + 0.5F * static_cast<float>(Next(&seed) % 97) / 97);
-    const std::uint16_t dh = HalfBits(d);
-    std::memcpy(&w[b * bytes], &dh, 2);
+    const std::uint16_t dh = HalfBits(type == q::WeightType::kQ3_K ? -d : d);
+    std::memcpy(&w[b * bytes + (type == q::WeightType::kQ3_K ? 108 : 0)], &dh,
+                2);
     if (type == q::WeightType::kQ4_K || type == q::WeightType::kQ5_K ||
         type == q::WeightType::kQ5_1) {
       const std::uint16_t mh =
