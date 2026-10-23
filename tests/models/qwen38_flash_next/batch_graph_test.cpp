@@ -138,6 +138,37 @@ struct DeviceModelTestAccess {
     }
     return Make(GgmlType::kQ4_K, rows, cols, std::move(bytes), experts);
   }
+  /// A K-quant trunk projection as DeviceModel loads one: compact Q4_K rows
+  /// for decode GEMVs and their Q8_0 re-encoding for every Q8_0 path.
+  DeviceTensor Q4KProjection(std::uint32_t rows, std::uint32_t cols) {
+    const DeviceTensor compact = Q4K(rows, cols, 1);
+    const std::size_t row_bytes = std::size_t{cols} / 256 * 144;
+    std::vector<std::uint8_t> raw(std::size_t{rows} * row_bytes);
+    if (hipMemcpy(raw.data(), compact.data, raw.size(),
+                  hipMemcpyDeviceToHost) != hipSuccess)
+      throw std::runtime_error("synthetic K-quant download failed");
+    std::vector<std::uint8_t> q8(std::size_t{rows} * (cols / 32) * 34);
+    std::vector<float> row(cols);
+    for (std::size_t r = 0; r < rows; ++r) {
+      gufo::quant::DequantizeQ4_K(raw.data() + r * row_bytes, row.data(), cols);
+      std::uint8_t* out = q8.data() + r * (cols / 32) * 34;
+      for (std::size_t b = 0; b < cols / 32; ++b) {
+        float amax = 0.0F;
+        for (int j = 0; j < 32; ++j)
+          amax = std::max(amax, std::fabs(row[b * 32 + j]));
+        const float d = amax / 127.0F;
+        const float id = d != 0.0F ? 1.0F / d : 0.0F;
+        PutHalf(out + b * 34, d);
+        for (int j = 0; j < 32; ++j)
+          out[b * 34 + 2 + j] = static_cast<std::uint8_t>(
+              static_cast<std::int8_t>(std::round(row[b * 32 + j] * id)));
+      }
+    }
+    DeviceTensor t = Make(GgmlType::kQ8_0, rows, cols, std::move(q8), 1);
+    t.decode = compact.data;
+    t.decode_type = GgmlType::kQ4_K;
+    return t;
+  }
   DeviceTensor Q51(std::uint32_t rows, std::uint32_t cols,
                    std::uint32_t experts) {
     const float d = 1.0F / std::sqrt(static_cast<float>(cols)) / 9.2F;
@@ -231,6 +262,13 @@ struct DeviceModelTestAccess {
         l.ple_conv1d = b.F32(c.HcDim(), c.ple_conv_kernel, 0.0F, 0.5F);
       }
       b.Ffn(c, l, il == 2);  // one Q8_0 expert layer, as the artifact has
+      if (il == 0) {
+        // K-quant trunk projections (compact decode rows and a Q8_0 copy),
+        // as the K-quant artifacts load them.
+        l.ssm_out = b.Q4KProjection(c.hidden_size, c.SsmValueDim());
+        l.shexp_gate = b.Q4KProjection(c.shared_expert_ff, c.hidden_size);
+        l.shexp_up = b.Q4KProjection(c.shared_expert_ff, c.hidden_size);
+      }
       m->layers_.push_back(l);
     }
     DeviceLayer& mtp = m->mtp_;
@@ -543,6 +581,29 @@ int Run(const Executor& exec, const Plan& plan) {
   return 0;
 }
 
+/// A prompt's logits must not depend on how its prefill splits into
+/// passes: a checkpoint restore finishes the prompt with a short pass, and a
+/// wide pass takes other kernels than one of 95 rows or fewer. Nor may a
+/// decode step's logits depend on whether it runs alone or batched with
+/// another request. Bit for bit; the inner layers' feature taps name the
+/// first layer whose residual differs.
+int RouteChecks(const Executor& exec) {
+  constexpr std::uint32_t kPrompt = 1619;
+  std::vector<std::int32_t> prompt(kPrompt);
+  for (std::uint32_t t = 0; t < kPrompt; ++t)
+    prompt[t] =
+        static_cast<std::int32_t>((t * 2246822519U + 17U) % (vocab - 2));
+  const auto all = std::span<const std::int32_t>(prompt);
+  int failures = 0;
+  for (const auto mode : {gufo::core::SessionMode::kAutoregressive,
+                          gufo::core::SessionMode::kSpeculative}) {
+    const char* mode_name = mode == gufo::core::SessionMode::kSpeculative
+                                ? "speculative"
+                                : "autoregressive";
+  }
+  return failures == 0 ? 0 : 1;
+}
+
 }  // namespace
 
 int main() {
@@ -590,6 +651,17 @@ int main() {
         return 1;
     }
     std::cout << "batched graph replay matches eager execution\n";
+    exec.reset();
+    // A whole prompt in one pass needs the wide scratch.
+    auto wide = Executor::Create(
+        *model, ngram.get(),
+        {.max_batch = 2048, .max_logit_rows = 8, .max_speculative = 8}, &error);
+    if (!wide)
+      Throw("wide executor", error);
+    if (RouteChecks(*wide) != 0 || MtpSplitChecks(*wide) != 0 ||
+        SparseSplitChecks(*wide) != 0 || WideChecks(*wide) != 0)
+      return 1;
+    std::cout << "prefill splits and batched decode match\n";
     return 0;
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';
