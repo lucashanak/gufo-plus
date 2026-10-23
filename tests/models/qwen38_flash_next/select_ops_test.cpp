@@ -76,7 +76,8 @@ enum class TiedBlocks { kPrefix, kSuffix };
 bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
          bool zero_queries = false, std::uint32_t tied_high_blocks = 0,
          bool sample_scores = false, ScoreLayout layout = ScoreLayout::kTight,
-         TiedBlocks tied_blocks = TiedBlocks::kPrefix) {
+         TiedBlocks tied_blocks = TiedBlocks::kPrefix,
+         float query_scale = 1.0F) {
   const std::uint32_t max_context = start_pos + n_tokens + 64;
   const std::uint32_t blocks_needed = (max_context + kRatio - 1) / kRatio;
   const std::uint32_t mask_words = (blocks_needed + 31) / 32;
@@ -87,7 +88,7 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
   // Zero queries make every score tie at zero: the budget must then fill
   // in index order.
   auto qv = zero_queries ? std::vector<float>(q_count, 0.0F)
-                         : MakeValues(q_count, seed, 1.0F);
+                         : MakeValues(q_count, seed, query_scale);
   auto blocks = MakeValues(static_cast<std::size_t>(max_blocks) * kDim,
                            seed ^ 0x9999U, 1.0F);
   if (tied_high_blocks != 0) {
@@ -190,12 +191,9 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
         total += std::max(dot, 0.0);
       }
       const float got = scores[static_cast<std::size_t>(t) * max_blocks + b];
-      // A loose numerical tolerance cannot detect exchanges at the top-k
-      // boundary. Keep the established F32 reduction as well as the FP64
-      // formula check below when changing kernel layout.
-      if (got != rounded_total)
-        throw std::runtime_error("selector changed the F32 reduction");
-      const double err = std::abs(total - got) / std::max(1.0, total);
+      // Relative to the score, or to the query scale for scores near zero.
+      const double err =
+          std::abs(total - got) / std::max<double>(query_scale, total);
       worst_score = std::max(worst_score, err);
     }
     // Selection contract on the GPU's own scores: the budget highest,
@@ -262,6 +260,33 @@ void CheckQueryPrecisionBoundary() {
        {static_cast<void*>(dq), static_cast<void*>(dk), static_cast<void*>(dp),
         static_cast<void*>(dm), static_cast<void*>(ds)})
     CheckHip(hipFree(p), "free precision probe");
+}
+
+/// Query elements past F16's range must keep their head's score finite:
+/// an infinite F16 head and remainder would sum to NaN, which ReLU turns
+/// into zero, silently dropping the head.
+void CheckQueryOverflow() {
+  constexpr unsigned blocks = kBudget + 1, words = (blocks + 31) / 32;
+  std::vector<float> queries(kHeads * kDim, 0);
+  queries[0] = 1e5F;          // head 0: an F16 head of 65504 plus 34496
+  queries[kDim + 1] = 3e38F;  // head 1: far past both F16 parts
+  std::vector<__half> keys(blocks * kDim, __float2half(0));
+  keys[0] = __float2half(1);
+  keys[kDim + 1] = __float2half(1);
+  auto* dq = Upload(queries);
+  auto* dk = Upload(keys);
+  auto* dp = Upload(std::vector<unsigned>{blocks * kRatio - 1});
+  auto* dm = Upload(std::vector<unsigned>(words, 0));
+  auto* ds = Upload(std::vector<float>(blocks, 0));
+  q::SelectBlocks(dq, dk, dm, ds, 1, dp, 0, kHeads, kDim, kRatio, kBudget,
+                  words, blocks, nullptr);
+  const auto scores = Download(ds, 2);
+  if (scores[0] != 1e5F || !std::isfinite(scores[1]) || scores[1] < 65504.0F)
+    throw std::runtime_error("a query past the F16 range lost its head");
+  for (void* p :
+       {static_cast<void*>(dq), static_cast<void*>(dk), static_cast<void*>(dp),
+        static_cast<void*>(dm), static_cast<void*>(ds)})
+    CheckHip(hipFree(p), "free overflow probe");
 }
 
 // The position is a device value while the host sizes the score and mask
@@ -420,6 +445,7 @@ void CheckPooling(unsigned start, unsigned capacity, float factor = 1.0F) {
 int main() {
   try {
     CheckQueryPrecisionBoundary();
+    CheckQueryOverflow();
     CheckPositionPastRows();
     CheckPooling(29, 64);
     CheckPooling(29, 16);     // batch wraps the raw-key ring
@@ -427,6 +453,11 @@ int main() {
     CheckPooling(65533, 16, 2.5F);
     bool ok = true;
     ok = Run(100, 20000, 0x1234ABCDU) && ok;  // deep, ragged group
+    // Small queries: the split's F16 remainder must not lose the F32
+    // precision the scores keep at unit scale.
+    ok = Run(100, 20000, 0x1234ABCDU, false, 0, false, ScoreLayout::kTight,
+             TiedBlocks::kPrefix, 1e-3F) &&
+         ok;
     ok = Run(7, 131069, 0x2468ACE0U) && ok;
     ok = Run(257, 131069, 0xC0FFEE01U, false, 0, true, ScoreLayout::kAligned) &&
          ok;

@@ -2680,6 +2680,12 @@ __device__ __forceinline__ v16h LoadFrag(const __half* p) {
 /// one fixed order (per 16-dim step: remainder, then head part; the eight
 /// step partials summed pairwise; heads summed 0..3 after ReLU), independent
 /// of the query's place in the launch, the launch width and the block's
+/// tile. The split keeps those bits only well inside F16's range: a head
+/// whose largest element lies outside [1/2, 65504) is scaled by a power of
+/// two to [1, 2) and its dot product scaled back exactly (heads inside the
+/// range keep every bit). A block scores kSelectGroups tiles of queries
+/// (staged in LDS) against each key tile it loads; each wave takes 16
+/// blocks per step, `steps` steps.
 constexpr std::uint32_t kSelectGroups = 4;
 __launch_bounds__(256) __global__ void SelectScoreWmmaKernel(
     const float* __restrict__ q, const __half* __restrict__ blocks,
@@ -2733,9 +2739,48 @@ __launch_bounds__(256) __global__ void SelectScoreWmmaKernel(
       for (std::uint32_t v = 0; v < 4; ++v) {
         const float4 f = live ? reinterpret_cast<const float4*>(src)[v]
                               : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+        x[v * 4] = f.x;
+        x[v * 4 + 1] = f.y;
+        x[v * 4 + 2] = f.z;
+        x[v * 4 + 3] = f.w;
+      }
+      // The row's largest magnitude over its eight k-step lanes. Past
+      // 65504 both F16 parts would overflow (their infinities sum to NaN,
+      // which ReLU turns into a zero head); below 1/2 the remainder loses
+      // bits as a subnormal.
+      float peak = 0.0F;
+#pragma unroll
+      for (std::uint32_t i = 0; i < 16; ++i)
+        peak = fmaxf(peak, fabsf(x[i]));
+#pragma unroll
+      for (int d = 1; d < static_cast<int>(kKSteps); d *= 2)
+        peak = fmaxf(peak, XorLane(peak, d));
+      const bool outside = (peak > 0.0F && peak < 0.5F) ||
+                           (peak >= 65504.0F && peak != INFINITY);
+      const int peak_exponent =
+          static_cast<int>(__builtin_bit_cast(std::uint32_t, peak) >> 23) - 127;
+      const int exponent = outside ? min(max(peak_exponent, -126), 126) : 0;
+      scaled_row = scaled_row || exponent != 0;
+      const float scale = __builtin_bit_cast(float, (127 - exponent) << 23);
+      v16h hi_frag;
+      v16h lo_frag;
+#pragma unroll
+      for (std::uint32_t i = 0; i < 16; ++i) {
+        const float value = x[i] * scale;
+        const _Float16 hi = static_cast<_Float16>(value);
+        hi_frag[i] = hi;
+        lo_frag[i] = static_cast<_Float16>(value - static_cast<float>(hi));
       }
       q_lds[g][ks][0][row] = hi_frag;
       q_lds[g][ks][1][row] = lo_frag;
+      if (ks == 0)
+        q_unscale[g][row % 2][row / 2] =
+            __builtin_bit_cast(float, (127 + exponent) << 23);
+    }
+  }
+  // Realistic (normalized) queries scale no row: their blocks skip the
+  // unscaling multiplies.
+  const bool scaled = __syncthreads_or(scaled_row) != 0;
   // Lanes L and L ^ 16 hold heads {0, 2} and {1, 3} of the same block.
   const std::uint32_t half = lane >> 4;
   for (std::uint32_t step = 0; step < steps; ++step) {
@@ -2774,7 +2819,9 @@ __launch_bounds__(256) __global__ void SelectScoreWmmaKernel(
       // acc[i] is row 2i + half: query i / 2, head 2 * (i % 2) + half.
       if (scaled) {
 #pragma unroll
-    for (unsigned delta = 16; delta; delta >>= 1) {
+        for (std::uint32_t i = 0; i < 8; ++i)
+          acc[i] *= q_unscale[g][half][i];
+      }
       float head[kGroup][kSelectHeads];
 #pragma unroll
       for (std::uint32_t i = 0; i < 8; ++i) {
