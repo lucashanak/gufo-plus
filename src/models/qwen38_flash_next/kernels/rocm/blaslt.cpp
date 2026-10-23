@@ -21,10 +21,10 @@ bool OwnF16(hipDataType type, int k) {
   return type == HIP_R_16F && k == 2560;
 }
 
-bool OwnBf16(hipDataType type, int m, int k) {
-  // The indexer query and key projections, and a TP2 rank's halves.
-  return type == HIP_R_16BF && k == 2560 &&
-         (m == 512 || m == 256 || m == 128 || m == 64);
+bool OwnBf16(hipDataType type, int k) {
+  // The BF16 indexer projections, for the same reason: their keys and
+  // queries decide the sparse selection past the token budget.
+  return type == HIP_R_16BF && k == 2560;
 }
 
 }  // namespace
@@ -148,9 +148,8 @@ bool BlasLt::Gemm(const void* weights, const void* input, float* out,
   // at a block rotated by the tile's index in the batch, so a token's indexer
   // score depended on its position modulo 128 tokens within the prefill
   // chunk, and a top-k near-tie could select another key with the chunking.
-  if (OwnBf16(type, m, k)) {
+  if (OwnBf16(type, k))
     return DenseBf16Gemm(weights, input, out, n, m, k, stream_);
-  }
   Plan* p = FindPlan(type, m, n, k, error);
   return p != nullptr && Run(*p, weights, input, out, error);
 }
@@ -161,7 +160,7 @@ bool BlasLt::Prepare(hipDataType type, int m, int n, int k,
     AssignError(error, "hipBLASLt dimensions must be positive");
     return false;
   }
-  return OwnF16(type, k) || OwnBf16(type, m, k) ||
+  return OwnF16(type, k) || OwnBf16(type, k) ||
          FindPlan(type, m, n, k, error) != nullptr;
 }
 
@@ -174,10 +173,6 @@ BlasLt::Plan* BlasLt::FindPlan(hipDataType type, int m, int n, int k,
   if (!p)
     p = MakePlan(type, m, n, k, error);
   return p.get();
-}
-
-bool BlasLt::UsesOwnKernel(hipDataType type, int m, int k) {
-  return OwnF16(type, k) || OwnBf16(type, m, k);
 }
 
 bool BlasLt::LibraryGemm(const void* weights, const void* input, float* out,
