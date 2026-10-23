@@ -1380,6 +1380,11 @@ int main() {
     ok = Ok(Run(q::WeightType::kIQ4_NL, 3000, 1, 64, 2560, 640, 0x14A40001U,
                 128)) &&
          ok;
+    ok =
+        Ok(Run(q::WeightType::kIQ4_NL, 97, 1, 8, 129, 640, 0x14A40003U, 128)) &&
+        ok;
+    ok = Ok(Run(q::WeightType::kIQ4_NL, 97, 1, 8, 129, 640, 0x14A40002U, 16)) &&
+         ok;
     // Q8_0 down view (five layers keep Q8_0 down projections).
     ok = Ok(Run(q::WeightType::kQ8_0, 3000, 1, 64, 2560, 640, 0x0C0FFEE0U,
                 128)) &&

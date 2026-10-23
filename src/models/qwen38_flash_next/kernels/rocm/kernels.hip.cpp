@@ -5407,6 +5407,30 @@ __device__ __forceinline__ std::uint32_t IQ4NLBytes(std::uint32_t nib) {
                                0x03020100U | ((nib & 0x08080808U) >> 1U));
 }
 
+/// IQ4NLBytes(nib) ^ 0x80808080: the table values as q + 128, the form the
+/// Q8_0 route's 1152 magic takes (the bias folded into the table words).
+__device__ __forceinline__ std::uint32_t IQ4NLBiasedBytes(std::uint32_t nib) {
+  constexpr std::uint32_t kBias = 0x80808080U;
+  const std::uint32_t sel = nib & 0x07070707U;
+  const std::uint32_t lo =
+      __builtin_amdgcn_perm(IQ4NLWord(1) ^ kBias, IQ4NLWord(0) ^ kBias, sel);
+  const std::uint32_t hi =
+      __builtin_amdgcn_perm(IQ4NLWord(3) ^ kBias, IQ4NLWord(2) ^ kBias, sel);
+  return __builtin_amdgcn_perm(hi, lo,
+                               0x03020100U | ((nib & 0x08080808U) >> 1U));
+}
+
+/// Lane i receives lane i ^ 16's value (XorLane(v, 16)) without tying the
+/// result to v: every lane is active, so the instruction's old operand is
+/// never read and needs no copy of v.
+__device__ __forceinline__ std::uint32_t SwapHalves(std::uint32_t v) {
+  std::uint32_t old;
+  asm("" : "=v"(old));
+  return static_cast<std::uint32_t>(
+      __builtin_amdgcn_permlanex16(static_cast<int>(old), static_cast<int>(v),
+                                   0x76543210, 0xfedcba98, false, false));
+}
+
 /// (scale, 0) as packed F16: Q3_K codes enter WMMA as c - 4 (see magic).
 __device__ __forceinline__ std::uint32_t Q3KScaleBias(uint4 h, int is,
                                                       bool live) {
@@ -5637,6 +5661,11 @@ __launch_bounds__(256) __global__
           __builtin_memcpy(&f_header[u], blk + 96, 14);
           __builtin_memcpy(&f_qh[u][0], blk + (16 * f_c), 16);
         }
+        uint4 qs;
+        __builtin_memcpy(&qs, blk + 32 + (32 * ((kb0 % 8) / 4)) + (16 * f_c),
+                         16);
+        f_codes[u] = Q3KNibbles(qs, f_qh[u][0], kb0 % 8);
+        f_sb32[u] = (kb0 % 8) + f_c;
       } else {
         constexpr int kBlockChunks = kQ5K ? 11 : 9;
         constexpr int kCodeChunk = kQ5K ? 3 : 1;
@@ -5699,6 +5728,9 @@ __launch_bounds__(256) __global__
         s_high[(f_c * BM) + row] = f_high[u];
       }
       if constexpr (kQ8) {
+        scale_bias = Q3KScaleBias(f_header[u], 2 * sb32, f_live[u]);
+        s_scale[(BK * BM) + (f_c * BM) + row] =
+            Q3KScaleBias(f_header[u], (2 * sb32) + 1, f_live[u]);
       } else {
         const int sb32 = f_sb32[u];
         // The first four scale/min bytes live in y/z. Their remaining
@@ -5970,7 +6002,7 @@ __launch_bounds__(256) __global__
   }
 }
 
-// Wide routed down projection (Q5_1 / Q8_0 weights, F16 rows in
+// Wide routed down projection (Q5_1 / Q8_0 / IQ4_NL weights, F16 rows in
 // and out) over 128-token tiles: RoutedF16GEMMKernel's arithmetic, laid out
 // like the paired gate/up waves. Each wave owns sixteen rows and keeps their
 // codes in registers; activations are the only LDS stage.
@@ -6232,10 +6264,10 @@ __launch_bounds__(256) __global__
 // committed, so no stage waits on the loads it has just issued.
 //
 // Every output keeps the previous paired route's arithmetic: the same F16
-// weights (code * (d * sc) - dmin * mn, rounded once to F16 pairs), the same
-// chain of two K16 WMMAs per K32 block from zero in K order, and the same
-// SwiGLU rounding, so a row matches the separate gate and up projections at
-// every tile height.
+// weights (Q4_K/Q5_K: code * (d * sc) - dmin * mn, rounded once to F16
+// pairs; Q3_K: (code - 4) * d * (sc - 32)), the same chain of two K16 WMMAs
+// per K32 block from zero in K order, and the same SwiGLU rounding, so a row
+// matches the separate gate and up projections at every tile height.
 //
 // grid (ceil(m / 64), tiles): `tiles[y]` is expert | (128-token tile << 16).
 template<WeightType kType>
@@ -6331,9 +6363,24 @@ __launch_bounds__(256) __global__
         raw_qh[0] = chunks[1];
         raw_qh[1] = chunks[2];
       }
+        raw_header = make_uint4(0u, 0u, 0u, 0u);
+        __builtin_memcpy(&raw_header, blk + 96, 14);
+        __builtin_memcpy(&raw_codes[0], blk + 32 + (16 * f_c), 16);
+        __builtin_memcpy(&raw_codes[1], blk + 64 + (16 * f_c), 16);
+        __builtin_memcpy(&raw_codes[2], blk + (16 * f_c), 16);
+      } else {
+        const auto* chunks = reinterpret_cast<const uint4*>(blk);
+        constexpr int kCodeChunk = kQ5K ? 3 : 1;
+        raw_header = chunks[0];
+        if constexpr (kQ5K) {
+          raw_qh[0] = chunks[1];
+          raw_qh[1] = chunks[2];
+        }
 #pragma unroll
-      for (int g = 0; g < 4; ++g)
-        raw_codes[g] = chunks[kCodeChunk + (g * 2) + f_c];
+        for (int g = 0; g < 4; ++g)
+          raw_codes[g] = chunks[kCodeChunk + (g * 2) + f_c];
+      }
+    }
     }
     const int kb0 = (sb * 8) + (G * 2);
 #pragma unroll
@@ -6350,46 +6397,57 @@ __launch_bounds__(256) __global__
   const auto commit_stage = [&]<int G>() {
     if constexpr (G == 0) {
       header = raw_header;
+      if constexpr (kQ3K) {
 #pragma unroll
-      for (int g = 0; g < 4; ++g)
-        codes[g] = raw_codes[g];
-      if constexpr (kQ5K) {
-        qh[0] = raw_qh[0];
-        qh[1] = raw_qh[1];
+        for (int g = 0; g < 4; ++g)
+          codes[g] = Q3KNibbles(raw_codes[g / 2], raw_codes[2], 2 * g);
+      } else {
+#pragma unroll
+        for (int g = 0; g < 4; ++g)
+          codes[g] = raw_codes[g];
+        if constexpr (kQ5K) {
+          qh[0] = raw_qh[0];
+          qh[1] = raw_qh[1];
+        }
       }
     }
-    const int sb32 = (2 * G) + f_c;
-    // The first four scale/min bytes live in y/z; the others' low nibbles
-    // share w, their high two bits reuse those y/z bytes.
-    const unsigned shift = 8U * (static_cast<unsigned>(sb32) & 3U);
-    const std::uint32_t scale_byte = header.y >> shift;
-    const std::uint32_t min_byte = header.z >> shift;
-    std::uint32_t sc;
-    std::uint32_t mn;
-    if (sb32 < 4) {
-      sc = scale_byte & 0x3FU;
-      mn = min_byte & 0x3FU;
+      // This lane's element half of both K32 blocks of the group.
+      own_scale = Q3KScaleBias(header, (2 * (2 * G)) + f_c, row_live);
+      own_scale2 = Q3KScaleBias(header, (2 * (2 * G + 1)) + f_c, row_live);
     } else {
-      const std::uint32_t packed = header.w >> shift;
-      sc = (packed & 0x0FU) | ((scale_byte & 0xC0U) >> 2U);
-      mn = ((packed >> 4U) & 0x0FU) | ((min_byte & 0xC0U) >> 2U);
-    }
-    const __half2 dm = __builtin_bit_cast(__half2, header.x);
-    const float scale =
-        row_live ? __low2float(dm) * static_cast<float>(sc) : 0.0F;
-    const float offset =
-        row_live ? __high2float(dm) * static_cast<float>(mn) : 0.0F;
-    own_scale =
-        __builtin_bit_cast(std::uint32_t, __floats2half2_rn(scale, -offset));
-    if constexpr (kQ5K) {
-      // Bit sb32 of the 32 high-bit bytes, packed as the Q5_1 word.
-      const std::uint32_t q[8] = {qh[0].x, qh[0].y, qh[0].z, qh[0].w,
-                                  qh[1].x, qh[1].y, qh[1].z, qh[1].w};
-      std::uint32_t high = 0;
+      const int sb32 = (2 * G) + f_c;
+      // The first four scale/min bytes live in y/z; the others' low nibbles
+      // share w, their high two bits reuse those y/z bytes.
+      const unsigned shift = 8U * (static_cast<unsigned>(sb32) & 3U);
+      const std::uint32_t scale_byte = header.y >> shift;
+      const std::uint32_t min_byte = header.z >> shift;
+      std::uint32_t sc;
+      std::uint32_t mn;
+      if (sb32 < 4) {
+        sc = scale_byte & 0x3FU;
+        mn = min_byte & 0x3FU;
+      } else {
+        const std::uint32_t packed = header.w >> shift;
+        sc = (packed & 0x0FU) | ((scale_byte & 0xC0U) >> 2U);
+        mn = ((packed >> 4U) & 0x0FU) | ((min_byte & 0xC0U) >> 2U);
+      }
+      const __half2 dm = __builtin_bit_cast(__half2, header.x);
+      const float scale =
+          row_live ? __low2float(dm) * static_cast<float>(sc) : 0.0F;
+      const float offset =
+          row_live ? __high2float(dm) * static_cast<float>(mn) : 0.0F;
+      own_scale =
+          __builtin_bit_cast(std::uint32_t, __floats2half2_rn(scale, -offset));
+      if constexpr (kQ5K) {
+        // Bit sb32 of the 32 high-bit bytes, packed as the Q5_1 word.
+        const std::uint32_t q[8] = {qh[0].x, qh[0].y, qh[0].z, qh[0].w,
+                                    qh[1].x, qh[1].y, qh[1].z, qh[1].w};
+        std::uint32_t high = 0;
 #pragma unroll
-      for (int i = 0; i < 8; ++i)
-        high |= GatherBit(q[i], sb32) << (4 * i);
-      own_high = high;
+        for (int i = 0; i < 8; ++i)
+          high |= GatherBit(q[i], sb32) << (4 * i);
+        own_high = high;
+      }
     }
 #pragma unroll
     for (int i = 0; i < kActFetch; ++i)
@@ -7971,6 +8029,12 @@ bool LaunchRoutedF16(const void* w, WeightType type, const __half* x,
                          pad_bounds, rows_in, rows_out, swiglu_gate, out,
                          out_half, m, k);
       return true;
+    case WeightType::kQ3_K:
+      hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ3_K, kBM, BN, kBK>),
+                         grid, dim3(kThreads), 0, stream, w, x, tiles,
+                         pad_bounds, rows_in, rows_out, swiglu_gate, out,
+                         out_half, m, k);
+      return true;
     default:
       return false;
   }
@@ -8009,6 +8073,10 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
       const auto kernel =
           type == WeightType::kQ5_1   ? RoutedDownF16Kernel<WeightType::kQ5_1>
           : type == WeightType::kQ8_0 ? RoutedDownF16Kernel<WeightType::kQ8_0>
+          : type == WeightType::kIQ4_NL
+              ? RoutedDownF16Kernel<WeightType::kIQ4_NL>
+          : type == WeightType::kQ5_0 ? RoutedDownF16Kernel<WeightType::kQ5_0>
+          : type == WeightType::kQ4_0 ? RoutedDownF16Kernel<WeightType::kQ4_0>
                                       : nullptr;
       if (kernel == nullptr)
         return false;
