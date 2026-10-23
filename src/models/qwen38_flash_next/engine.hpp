@@ -324,10 +324,11 @@ private:
                            std::string* error_msg);
   /// Trunk rows the draft block may still read: [hidden_base_, size).
   [[nodiscard]] std::uint32_t KeptHiddenRows() const noexcept;
+  /// `kv_only` catches up prompt rows: draft K/V only, prefill arithmetic.
   bool DraftCatchUp(std::int32_t next_token, bool propose,
                     std::string* error_msg,
                     MtpCandidateLogits* candidates = nullptr,
-                    bool draft_subset = false);
+                    bool draft_subset = false, bool kv_only = false);
   bool DraftReplay(std::int32_t next_token, std::vector<std::int32_t>* replay,
                    std::int32_t* hidden_row, std::string* error_msg) const;
   static bool DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
