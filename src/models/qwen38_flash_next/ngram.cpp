@@ -22,6 +22,14 @@ constexpr std::size_t kWorkers = 128;
 constexpr std::size_t kReadBatch = 8;
 constexpr std::size_t kBatchJobs = 1024;
 constexpr std::size_t kCacheBytes = 128 * 1024 * 1024;
+// Random 4 KiB direct reads of the table from the gfx1151 host's ZFS NVMe
+// saturate at about 61K/s from 16 to 256 threads: ZFS keeps its default 10
+// synchronous reads in flight per device. Gathers that read at least
+// kRateReads rows replace this estimate with their own rate.
+constexpr double kDefaultDiskRowsPerSecond = 60000;
+constexpr std::size_t kRateReads = 4096;
+// Prefetched rows waiting for a reader; a decode cycle queues a few hundred.
+constexpr std::size_t kMaxPrefetch = 8192;
 
 }  // namespace
 
@@ -100,6 +108,7 @@ std::unique_ptr<NgramTable> NgramTable::Open(
   t->cache_rows_.resize(t->cache_count_ * t->row_bytes_);
   t->rows_ = rows;
   t->base_offset_ = file_offset;
+  t->disk_rows_per_second_ = kDefaultDiskRowsPerSecond;
   // Linux direct I/O avoids retaining every touched row in the page cache;
   // Windows uses cached concurrent reads of the otherwise mapped model.
   // When the platform cannot provide it, rows read buffered through a
@@ -145,7 +154,7 @@ bool NgramTable::ReadCached(std::uint32_t row, float* dst) {
     return false;
   }
   const bool hit = entry.valid && entry.row == row;
-  if (hit) {
+  if (hit && dst != nullptr) {
     DecodeRow(cache_rows_.data() + slot * row_bytes_, dst);
   }
   entry.busy.clear(std::memory_order_release);
@@ -238,6 +247,13 @@ void NgramTable::Worker() {
     failed_ = failed_ || !ok;
     pending_ -= count;
     if (pending_ == 0) {
+      // Readers block in `pread` for the whole gather, so its span is the
+      // disk's time for these rows.
+      const auto reads = gather_reads_.load(std::memory_order_relaxed);
+      const std::chrono::duration<double> span =
+          std::chrono::steady_clock::now() - started_;
+      if (reads >= kRateReads && span.count() > 0)
+        disk_rows_per_second_ = static_cast<double>(reads) / span.count();
       done_.notify_all();
     }
   }
@@ -339,6 +355,8 @@ bool NgramTable::StartRead(std::span<const std::uint32_t> rows,
   pending_ = jobs_.size();
   failed_ = false;
   active_ = true;
+  started_ = std::chrono::steady_clock::now();
+  gather_reads_.store(0, std::memory_order_relaxed);
   // A decode gather has a handful of reads: wake one reader per read, not
   // the whole pool. Readers keep taking jobs until the queue is empty.
   if (pending_ >= workers_.size()) {
@@ -365,6 +383,20 @@ bool NgramTable::WaitRead() {
   copies_.clear();
   active_ = false;
   return !failed_;
+}
+
+std::size_t NgramTable::CountUncached(std::span<const std::uint32_t> rows) {
+  std::vector<std::uint32_t> distinct(rows.begin(), rows.end());
+  std::ranges::sort(distinct);
+  const auto end = std::ranges::unique(distinct).begin();
+  return static_cast<std::size_t>(std::count_if(
+      distinct.begin(), end,
+      [this](std::uint32_t row) { return !ReadCached(row, nullptr); }));
+}
+
+double NgramTable::DiskRowsPerSecond() {
+  const std::lock_guard lock(mutex_);
+  return disk_rows_per_second_;
 }
 
 }  // namespace gufo::models::qwen38_flash_next
