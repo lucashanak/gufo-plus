@@ -507,11 +507,13 @@ InferenceBackend::Result InferenceBackend::chat(
   }
   const auto initial =
       state->scheduler->runner().InitialOutputState(effective_request);
-  if (request.reasoning.budget_tokens &&
+  if (const auto budget = ResolveReasoningBudget(
+          request.reasoning, state->reasoning_defaults, max_tokens);
+      budget &&
       initial == TextGenerationBackend::InitialOutputState::kReasoning)
     effective_sampling.reasoning_budget =
         state->scheduler->runner().BuildReasoningBudget(
-            *request.reasoning.budget_tokens, prompt->tokens);
+            budget->tokens, prompt->tokens, budget->wrap_up);
   return impl_->GenerateScheduled(
       state, std::move(prompt->tokens), request_start, max_tokens,
       effective_sampling, is_cancelled, on_token, request.client_id,
@@ -596,11 +598,13 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
 
   const auto initial =
       state->scheduler->runner().InitialOutputState(effective_request);
-  if (request.reasoning.budget_tokens &&
+  if (const auto budget = ResolveReasoningBudget(
+          request.reasoning, state->reasoning_defaults, max_tokens);
+      budget &&
       initial == TextGenerationBackend::InitialOutputState::kReasoning)
     effective_sampling.reasoning_budget =
         state->scheduler->runner().BuildReasoningBudget(
-            *request.reasoning.budget_tokens, prompt->tokens);
+            budget->tokens, prompt->tokens, budget->wrap_up);
   const std::string client_id =
       request.client_id.empty() ? "anonymous" : request.client_id;
   auto scheduled_request = state->scheduler->Submit(
