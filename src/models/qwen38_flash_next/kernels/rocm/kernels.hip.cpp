@@ -2635,7 +2635,8 @@ __global__ void RopeKernel(float* x, std::uint32_t heads, std::uint32_t d,
   }
 }
 
-__global__ void StoreKvKernel(const float* src, __half* cache,
+template<typename T>
+__global__ void StoreKvKernel(const T* src, std::uint8_t* cache,
                               std::uint32_t row_dim,
                               const std::uint32_t* start_pos) {
   const std::uint32_t t = blockIdx.x;
@@ -2643,8 +2644,9 @@ __global__ void StoreKvKernel(const float* src, __half* cache,
       cache + static_cast<std::size_t>(*start_pos + t) * KvRowBytes(row_dim);
   // row_dim is a multiple of 16: a lane group is always wholly inside.
   for (std::uint32_t i = threadIdx.x; i < row_dim; i += blockDim.x) {
-    cache[static_cast<std::size_t>(*start_pos + t) * row_dim + i] =
-        __float2half(src[static_cast<std::size_t>(t) * row_dim + i]);
+    StoreKv8(
+        row, row_dim, i,
+        static_cast<float>(src[static_cast<std::size_t>(t) * row_dim + i]));
   }
 }
 
@@ -4666,6 +4668,13 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     uint4 codes;
     __half scale;
   };
+  // A thread loads one whole scale block of K (16 codes, one scale): half
+  // the loads of an eight-code split.
+  static_assert(kKeys * (kHeadDim / kKvBlock) == 256, "one K block a thread");
+  struct KRegs {
+    uint4 codes;
+    __half scale;
+  };
 
   const auto load_v = [&](const Tile& tile, VRegs& dst) {
     const std::uint32_t key_position = tile_key(tile, v_key);
@@ -4677,32 +4686,26 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
                      : make_uint4(0u, 0u, 0u, 0u);
     dst.scale = live ? KvScale(row, kWmmaKvWidth, v_col) : __half{};
   };
-  // Coalesced: a wave reads one key row's 512 contiguous bytes.
-  const auto load_k = [&](const Tile& tile, uint4* dst) {
-#pragma unroll
-    for (std::uint32_t n = 0; n < kKRegs; ++n) {
-      const std::uint32_t idx = tid + (n * 256);
-      const std::uint32_t key_position = tile_key(tile, idx / (kHeadDim / 8));
-      const std::uint32_t d8 = (idx % (kHeadDim / 8)) * 8;
-      const bool live = key_position < context_end;
-      dst[n] =
-          live ? *reinterpret_cast<const uint4*>(
-                     k_base +
-                     (static_cast<std::size_t>(key_position) * kWmmaKvWidth) +
-                     d8)
-               : make_uint4(0u, 0u, 0u, 0u);
-    }
+  // Coalesced: half a wave reads one key row's 256 contiguous codes.
+  const std::uint32_t k_row = tid / (kHeadDim / kKvBlock);
+  const std::uint32_t k_dim = (tid % (kHeadDim / kKvBlock)) * kKvBlock;
+  const auto load_k = [&](const Tile& tile, KRegs& dst) {
+    const std::uint32_t key_position = tile_key(tile, k_row);
+    const bool live = key_position < context_end;
+    const std::uint8_t* row =
+        k_cache +
+        (static_cast<std::size_t>(live ? key_position : 0) * kRowBytes);
+    dst.codes = live ? *reinterpret_cast<const uint4*>(row + k_col + k_dim)
+                     : make_uint4(0u, 0u, 0u, 0u);
+    dst.scale = live ? KvScale(row, kWmmaKvWidth, k_col + k_dim) : __half{};
   };
 
-  const auto stage_k = [&](const uint4* regs) {
-#pragma unroll
-    for (std::uint32_t n = 0; n < kKRegs; ++n) {
-      const std::uint32_t idx = tid + (n * 256);
-      const std::uint32_t key_row = idx / (kHeadDim / 8);
-      const std::uint32_t d8 = (idx % (kHeadDim / 8)) * 8;
-      *reinterpret_cast<uint4*>(&k_lds[(key_row * kWmmaKStride) + d8]) =
-          regs[n];
-    }
+  const auto stage_k = [&](const KRegs& regs) {
+    auto* dst = &k_lds[(k_row * kWmmaKStride) + k_dim];
+    reinterpret_cast<uint4*>(dst)[0] =
+        DequantKv8(make_uint2(regs.codes.x, regs.codes.y), regs.scale);
+    reinterpret_cast<uint4*>(dst)[1] =
+        DequantKv8(make_uint2(regs.codes.z, regs.codes.w), regs.scale);
   };
   const auto stage_v = [&](const VRegs& raw) {
     const uint4 regs[kVRegs] = {
@@ -8327,7 +8330,7 @@ struct AttentionProjectionOutput {
   const float* k_gamma;
   float* query;
   float* gate;
-  __half* keys;
+  __half* keys;  ///< F16 rows [token][512], quantized into the cache after
   __half* values;
   const std::uint32_t* position;
   float theta;
@@ -8736,12 +8739,11 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
             else if (gate)
               attention.gate[tok * width + head * dim + col] = v[c];
             else if (key)
-              attention.keys[std::size_t(*attention.position + tok) * kvwidth +
-                             head * dim + col] = __float2half_rn(v[c]);
+              attention.keys[tok * kvwidth + head * dim + col] =
+                  __float2half_rn(v[c]);
             else
-              attention
-                  .values[std::size_t(*attention.position + tok) * kvwidth +
-                          head * dim + col] = __float2half_rn(v[c]);
+              attention.values[tok * kvwidth + head * dim + col] =
+                  __float2half_rn(v[c]);
           }
         }
       }
@@ -8965,11 +8967,19 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
   if (n_tokens == 0 || weights == nullptr || input == nullptr ||
       q_gamma == nullptr || k_gamma == nullptr || query == nullptr ||
       gate == nullptr || keys == nullptr || values == nullptr ||
-      position == nullptr)
+      key_rows == nullptr || value_rows == nullptr || position == nullptr)
     return false;
-  const AttentionProjectionOutput output{q_gamma, k_gamma, query,    gate,
-                                         keys,    values,  position, theta,
-                                         eps,     rope,    yarn};
+  // The epilogue writes F16 K/V rows; quantizing them in the GEMM's epilogue
+  // tripled its time. StoreKv rounds each value to the same F16 first.
+  const AttentionProjectionOutput output{q_gamma,  k_gamma,    query,    gate,
+                                         key_rows, value_rows, position, theta,
+                                         eps,      rope,       yarn};
+  const auto quantize = [&] {
+    hipLaunchKernelGGL(StoreKvKernel<__half>, dim3(n_tokens), dim3(kThreads), 0,
+                       stream, key_rows, keys, 512U, position);
+    hipLaunchKernelGGL(StoreKvKernel<__half>, dim3(n_tokens), dim3(kThreads), 0,
+                       stream, value_rows, values, 512U, position);
+  };
   // One 256-row tile per query, gate, key or value head (52). Four row
   // tiles per token tile in launch order share each activation tile's read
   // (8.8 to 7.9 ms at 4,096 tokens). One K block per LDS stage halves the
@@ -8981,6 +8991,7 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                        dim3((n_tokens + 127) / 128, 52), dim3(kThreads), 0,
                        stream, weights, input, nullptr, n_tokens, 13312, 2560,
                        nullptr, nullptr, nullptr, nullptr, nullptr, output);
+    quantize();
     return true;
   }
   hipLaunchKernelGGL(
@@ -8988,6 +8999,7 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
       dim3((n_tokens + 127) / 128, 52), dim3(kThreads), 0, stream, weights,
       input, nullptr, n_tokens, 13312, 2560, nullptr, nullptr, nullptr, nullptr,
       nullptr, output);
+  quantize();
   return true;
 }
 
