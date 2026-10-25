@@ -133,6 +133,9 @@ bool GrowableRows::Grow(std::size_t rows, hipStream_t stream,
       *error = "K/V rows cannot grow during graph capture";
     return false;
   }
+  // New pages map beside rows queued work may be using; those stay mapped,
+  // so the queue need not drain (draining cost each prefill pass its overlap).
+  hipError_t status = hipSuccess;
   if (!pool_->Charge((want - first) * chunk)) {
     if (error)
       *error = "K/V memory budget exhausted";
