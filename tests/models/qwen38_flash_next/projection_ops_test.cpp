@@ -237,8 +237,8 @@ void CheckAttentionProjection(
     const gufo::models::qwen38_flash_next::YarnRope& yarn = {}) {
   constexpr std::uint32_t start = 131069;
   const std::size_t query_bytes = (std::size_t(batch) * 6144 + 16) * 4;
-  const std::size_t cache_bytes =
-      (std::size_t(start + batch) * 512 + 16) * sizeof(__half);
+  // 8-bit cache rows (512 codes and 32 F16 scales) after a 16-byte guard.
+  const std::size_t cache_bytes = std::size_t(start + batch) * 576 + 32;
   struct Buffers {
     std::vector<void*> pointers;
     ~Buffers() {
@@ -274,10 +274,10 @@ void CheckAttentionProjection(
   if (!q::PrepareAttention(projected, 13312, device_gamma, device_gamma + 256,
                            static_cast<float*>(expected[0]) + 8,
                            static_cast<float*>(expected[1]) + 8,
-                           static_cast<__half*>(expected[2]) + 8,
-                           static_cast<__half*>(expected[3]) + 8, batch, 24, 2,
-                           256, 64, position, 1e7F, 1e-6F, nullptr, nullptr,
-                           false, yarn))
+                           static_cast<std::uint8_t*>(expected[2]) + 16,
+                           static_cast<std::uint8_t*>(expected[3]) + 16, batch,
+                           24, 2, 256, 64, position, 1e7F, 1e-6F, nullptr,
+                           nullptr, false, yarn))
     throw std::runtime_error("attention preparation rejected the model shape");
   hipStream_t stream = nullptr;
   hipGraph_t graph = nullptr;
