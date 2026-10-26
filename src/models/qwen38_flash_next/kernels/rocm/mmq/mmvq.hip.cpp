@@ -503,6 +503,32 @@ __launch_bounds__(32, 1) static __global__
       }
     }
   }
+  if constexpr (tokens * c_rows_per_block > 1 &&
+                tokens * c_rows_per_block <= 32) {
+    // One scatter butterfly for every sum (scatter_reduce_sum32: the same
+    // bits as reducing each sum on every lane).
+    constexpr int n = tokens * c_rows_per_block;
+    float sums[n];
+#pragma unroll
+    for (int j = 0; j < tokens; ++j)
+#pragma unroll
+      for (int i = 0; i < c_rows_per_block; ++i)
+        sums[j * c_rows_per_block + i] = tmp[j][i];
+    constexpr int shift = 5 - (n <= 2    ? 1
+                               : n <= 4  ? 2
+                               : n <= 8  ? 3
+                               : n <= 16 ? 4
+                                         : 5);
+    const int lane = threadIdx.x;
+    const float value = scatter_reduce_sum32(sums, lane);
+    const int index = lane >> shift;
+    const int j = index / c_rows_per_block;
+    const int i = index % c_rows_per_block;
+    if ((lane & ((1 << shift) - 1)) == 0 && index < n &&
+        uint32_t(row0 + i) < nrows_x)
+      dst[j * stride_col_dst + row0 + i] = isfinite(value) ? value : 0.0f;
+    return;
+  }
 #pragma unroll
   for (int j = 0; j < tokens; ++j) {
 #pragma unroll
@@ -905,6 +931,32 @@ __launch_bounds__(32 * waves, 1) static __global__
                                    row_offsets[i] + kbx, kqs);
       }
     }
+  }
+  if constexpr (tokens * c_rows_per_block <= 32) {
+    // One scatter butterfly for every sum (scatter_reduce_sum32: the same
+    // bits as reducing each sum on every lane).
+    constexpr int n = tokens * c_rows_per_block;
+    float sums[n];
+#pragma unroll
+    for (int j = 0; j < tokens; ++j)
+#pragma unroll
+      for (int i = 0; i < c_rows_per_block; ++i)
+        sums[j * c_rows_per_block + i] = tmp[j][i];
+    constexpr int shift = 5 - (n <= 1    ? 0
+                               : n <= 2  ? 1
+                               : n <= 4  ? 2
+                               : n <= 8  ? 3
+                               : n <= 16 ? 4
+                                         : 5);
+    const float value = scatter_reduce_sum32(sums, lane);
+    const int index = lane >> shift;
+    const int j = index / c_rows_per_block;
+    const int i = index % c_rows_per_block;
+    if ((lane & ((1 << shift) - 1)) == 0 && index < n && t0 + j <= last &&
+        uint32_t(row0 + i) < nrows_x)
+      dst[(t0 + j) * stride_col_dst + row0 + i] =
+          isfinite(value) ? value : 0.0f;
+    return;
   }
 #pragma unroll
   for (int j = 0; j < tokens; ++j) {
