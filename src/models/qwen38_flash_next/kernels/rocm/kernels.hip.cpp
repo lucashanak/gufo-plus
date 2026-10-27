@@ -5677,6 +5677,32 @@ __device__ __forceinline__ std::uint32_t SwapHalves(std::uint32_t v) {
   return static_cast<std::uint32_t>(
       __builtin_amdgcn_permlanex16(static_cast<int>(old), static_cast<int>(v),
                                    0x76543210, 0xfedcba98, false, false));
+/// Four Q5_0 / Q4_0 codes (one per byte, below 32) as value + 128, the form
+/// the Q8_0 route's 1152 magic takes: code - 16 (Q5_0) or code - 8 (Q4_0).
+/// No byte borrows from its neighbour.
+template<WeightType kType>
+__device__ __forceinline__ std::uint32_t SmallBlockBiasedBytes(
+    std::uint32_t codes) {
+  static_assert(kType == WeightType::kQ5_0 || kType == WeightType::kQ4_0);
+  return (codes | 0x80808080U) -
+         (kType == WeightType::kQ5_0 ? 0x10101010U : 0x08080808U);
+}
+
+/// The codes of one K16 half (elements 16 * half ...) of a Q5_0 / Q4_0
+/// block, four per word: `qs` the block's 16 code bytes, `qh` its Q5_0
+/// high-bit word.
+template<WeightType kType>
+__device__ __forceinline__ uint4 SmallBlockCodes(uint4 qs, std::uint32_t qh,
+                                                 int half) {
+  const std::uint32_t words[4] = {qs.x, qs.y, qs.z, qs.w};
+  std::uint32_t out[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    out[i] = (words[i] >> (4U * half)) & 0x0F0F0F0FU;
+    if constexpr (kType == WeightType::kQ5_0)
+      out[i] |= SpreadHighBits((qh >> (16 * half + 4 * i)) & 0xFU);
+  }
+  return make_uint4(out[0], out[1], out[2], out[3]);
 }
 
 /// Four halves from four code bytes: 1024 + q as F16, minus `magic` (1024,
@@ -5712,8 +5738,15 @@ __launch_bounds__(256) __global__
   constexpr int kWaveRowTiles = BM / 128;  // 16-row tiles per wave
   constexpr bool kQ5 = kType == WeightType::kQ5_1;
   constexpr bool kQ5K = kType == WeightType::kQ5_K;
-  constexpr bool kQ8 = kType == WeightType::kQ8_0;
-  constexpr bool kKQuant = kType == WeightType::kQ4_K || kQ5K;
+  // IQ4_NL, Q5_0 and Q4_0 take the Q8_0 route once their values are
+  // expanded to signed bytes.
+  constexpr bool kIQ4 =
+      kType == WeightType::kIQ4_NL || kType == WeightType::kIQ4_XS;
+  constexpr bool kSmall =
+      kType == WeightType::kQ5_0 || kType == WeightType::kQ4_0;
+  // The importance formats' grid values also enter as signed bytes; IQ2_XS
+  // carries a second scale for elements 16-31, as Q3_K does.
+  constexpr bool kIQ3S = kType == WeightType::kIQ3_S;
   // 16-byte code chunks per row and stage: Q4_K's nibble pair and Q5_1's
   // two nibble blocks are two, Q8_0's two byte blocks are four.
   constexpr int kChunks = kQ8 ? 2 * BK : BK;
@@ -5857,6 +5890,26 @@ __launch_bounds__(256) __global__
         f_codes_hi[u] =
             make_uint4(IQ4NLBytes(qs.x >> 4U), IQ4NLBytes(qs.y >> 4U),
                        IQ4NLBytes(qs.z >> 4U), IQ4NLBytes(qs.w >> 4U));
+      } else if constexpr (kSmall) {
+        // block_q5_0: d, the high-bit word, 16 code bytes; block_q4_0: d,
+        // 16 code bytes. Elements 0-15 / 16-31 are low / high nibbles.
+        constexpr bool kQ50 = kType == WeightType::kQ5_0;
+        const auto* blk = f_ptr[u] + ((kb0 + f_c) * (kQ50 ? 22 : 18));
+        f_dm[u] = *reinterpret_cast<const std::uint16_t*>(blk);
+        std::uint32_t qh = 0;
+        if constexpr (kQ50)
+          __builtin_memcpy(&qh, blk + 2, 4);
+        uint4 qs;
+        __builtin_memcpy(&qs, blk + (kQ50 ? 6 : 2), 16);
+        const auto flip = [](uint4 c) {
+          return make_uint4(SmallBlockBiasedBytes<kType>(c.x) ^ 0x80808080U,
+                            SmallBlockBiasedBytes<kType>(c.y) ^ 0x80808080U,
+                            SmallBlockBiasedBytes<kType>(c.z) ^ 0x80808080U,
+                            SmallBlockBiasedBytes<kType>(c.w) ^ 0x80808080U);
+        };
+        f_codes[u] = flip(SmallBlockCodes<kType>(qs, qh, 0));
+        f_codes_hi[u] = flip(SmallBlockCodes<kType>(qs, qh, 1));
+      } else if constexpr (kQ8) {
         // block_q8_0 is 34 bytes, so the code loads are 2-byte aligned.
         const auto* blk = f_ptr[u] + ((kb0 + f_c) * 34);
         f_dm[u] = *reinterpret_cast<const std::uint16_t*>(blk);
@@ -6243,7 +6296,10 @@ __launch_bounds__(256) __global__
   constexpr int BK = 2;  // K32 blocks per stage
   constexpr int kTokTiles = BN / 16;
   constexpr bool kQ5 = kType == WeightType::kQ5_1;
-  constexpr int kBlockBytes = kQ5 ? 24 : 34;
+  constexpr bool kIQ4 = kType == WeightType::kIQ4_NL;
+  constexpr bool kQ50 = kType == WeightType::kQ5_0;
+  constexpr bool kQ40 = kType == WeightType::kQ4_0;
+  constexpr int kBlockBytes = kQ5 ? 24 : kQ50 ? 22 : (kIQ4 || kQ40) ? 18 : 34;
   // Activation stage: [kb][16-element quarter][token][16 B], as in
   // RoutedF16GEMMKernel, one padding slot per quarter plane.
   constexpr int kActStride = BN + 1;
@@ -6307,8 +6363,8 @@ __launch_bounds__(256) __global__
   // a stage computes from one while the next stage loads into the other.
   // Activations pass through registers into LDS before each stage.
   uint4 w_codes[2][BK];
-  std::uint32_t w_head[2][BK];  ///< Q8_0: d; Q5_1: d | m
-  std::uint32_t w_high[2][BK];  ///< Q5_1: the block's high-bit word
+  std::uint32_t w_head[2][BK];  ///< Q8_0/IQ4_NL/Q5_0/Q4_0: d; Q5_1: d | m
+  std::uint32_t w_high[2][BK];  ///< Q5_1, Q5_0: the block's high-bit word
   // Padding tokens keep whatever their slots held: their columns are never
   // stored, and WMMA columns do not mix.
   uint4 a_data[kActFetch];
@@ -6324,9 +6380,14 @@ __launch_bounds__(256) __global__
         w_head[S][b] = head.x;
         w_high[S][b] = head.y;
         w_codes[S][b] = *reinterpret_cast<const uint4*>(blk + 8);
+      } else if constexpr (kQ50) {
+        w_head[S][b] = *reinterpret_cast<const std::uint16_t*>(blk);
+        __builtin_memcpy(&w_high[S][b], blk + 2, 4);
+        __builtin_memcpy(&w_codes[S][b], blk + 6, 16);
       } else {
         w_head[S][b] = *reinterpret_cast<const std::uint16_t*>(blk);
-        __builtin_memcpy(&w_codes[S][b], blk + 2 + (16 * f_c), 16);
+        __builtin_memcpy(&w_codes[S][b],
+                         blk + 2 + ((kIQ4 || kQ40) ? 0 : 16 * f_c), 16);
       }
     }
 #pragma unroll
@@ -6347,7 +6408,8 @@ __launch_bounds__(256) __global__
 #pragma unroll
     for (int kb = 0; kb < BK; ++kb) {
       // This lane's K16 half of the row's block, as RoutedF16GEMMKernel
-      // forms it: (scale, bias) = (d, 0) for Q8_0, (d, m) for Q5_1.
+      // forms it: (scale, bias) = (d, 0) for Q8_0 / IQ4_NL / Q5_0 / Q4_0,
+      // (d, m) for Q5_1.
       const std::uint32_t scale_bias =
           kQ5 ? w_head[S][kb] : (row_live ? w_head[S][kb] : 0U);
       const __half2 sb = __builtin_bit_cast(__half2, scale_bias);
@@ -6362,6 +6424,14 @@ __launch_bounds__(256) __global__
         if constexpr (kQ5) {
           nib = ((words[i] >> (4U * f_c)) & 0x0F0F0F0FU) |
                 SpreadHighBits((w_high[S][kb] >> (16 * f_c + 4 * i)) & 0xFU);
+        } else if constexpr (kIQ4) {
+          nib = IQ4NLBiasedBytes(words[i] >> (4U * f_c));
+        } else if constexpr (kQ50 || kQ40) {
+          std::uint32_t codes = (words[i] >> (4U * f_c)) & 0x0F0F0F0FU;
+          if constexpr (kQ50)
+            codes |=
+                SpreadHighBits((w_high[S][kb] >> (16 * f_c + 4 * i)) & 0xFU);
+          nib = SmallBlockBiasedBytes<kType>(codes);
         } else {
           nib = words[i] ^ 0x80808080U;
         }
@@ -8274,6 +8344,18 @@ bool LaunchRoutedF16(const void* w, WeightType type, const __half* x,
           (RoutedF16GEMMKernel<WeightType::kIQ4_NL, kBM, BN, kBK>), grid,
           dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
           swiglu_gate, out, out_half, m, k);
+      return true;
+    case WeightType::kQ5_0:
+      hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ5_0, kBM, BN, kBK>),
+                         grid, dim3(kThreads), 0, stream, w, x, tiles,
+                         pad_bounds, rows_in, rows_out, swiglu_gate, out,
+                         out_half, m, k);
+      return true;
+    case WeightType::kQ4_0:
+      hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ4_0, kBM, BN, kBK>),
+                         grid, dim3(kThreads), 0, stream, w, x, tiles,
+                         pad_bounds, rows_in, rows_out, swiglu_gate, out,
+                         out_half, m, k);
       return true;
     case WeightType::kQ5_K:
       hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ5_K, kBM, BN, kBK>),
