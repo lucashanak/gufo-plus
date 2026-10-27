@@ -975,10 +975,12 @@ void CheckBudgetRows(std::uint32_t seed) {
       vh[i] = __float2half(vf[i]);
     }
   }
-  HipBuffer<__half> d_k(kv_count);
-  HipBuffer<__half> d_v(kv_count);
-  Upload(&d_k, kh);
-  Upload(&d_v, vh);
+  const auto kq = QuantizeKv(&kh);
+  const auto vq = QuantizeKv(&vh);
+  HipBuffer<std::uint8_t> d_k(kq.size());
+  HipBuffer<std::uint8_t> d_v(vq.size());
+  Upload(&d_k, kq);
+  Upload(&d_v, vq);
   const std::size_t q_count = std::size_t{kChain} * kQWidth;
   HipBuffer<float> d_q(q_count);
   HipBuffer<std::uint32_t> d_mask(std::size_t{kChain} * mask_words);
