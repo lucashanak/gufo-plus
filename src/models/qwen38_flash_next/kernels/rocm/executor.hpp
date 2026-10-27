@@ -689,7 +689,8 @@ private:
   bool WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const;
   /// Runs routed experts after the router and shared expert are ready.
   bool MoeExperts(const DeviceLayer& l, const float* x, float* out,
-                  std::uint32_t n_tokens, std::string* error_msg) const;
+                  std::uint32_t n_tokens, std::string* error_msg,
+                  bool join_shexp = false) const;
   bool MoeBatch(const DeviceLayer& l, const float* x, float* out,
                 std::uint32_t rows, std::string* error) const;
   /// Whether a draft of `session` requesting the small head gets it.
@@ -759,6 +760,8 @@ private:
   /// for its launches and joins back through side_done_ (JoinSide).
   mutable hipStream_t stream_{nullptr};
   hipStream_t side_stream_{nullptr};
+  hipEvent_t shexp_fork_{nullptr};
+  hipEvent_t shexp_join_{nullptr};
   hipEvent_t side_start_{nullptr};
   hipEvent_t side_done_{nullptr};
   mutable bool side_pending_{false};  ///< side_done_ not yet waited on
