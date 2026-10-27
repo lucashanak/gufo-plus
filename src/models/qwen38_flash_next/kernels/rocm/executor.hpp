@@ -726,6 +726,7 @@ private:
   /// Runs `body` eagerly, or as the session's captured graph for `key`
   /// when `graph` is set. A prefix may leave its work queued so the host
   /// can wait for disk reads while the GPU computes it.
+  /// `relaxed` waits for a long eager pass without spinning (WaitRelaxed).
   bool Run(Session& session, std::uint64_t key, bool graph,
            const std::function<bool()>& body, std::string* error_msg,
            bool synchronize = true) const;
