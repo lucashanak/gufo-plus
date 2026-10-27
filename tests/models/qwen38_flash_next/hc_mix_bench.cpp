@@ -161,8 +161,13 @@ int main(int argc, char** argv) {
     float* res = Values(std::size_t{kMaxTokens} * kDim, 1, 1.0F);
     float* block_out = Values(std::size_t{kMaxTokens} * kHidden, 2, 0.01F);
     float* inject = Values(std::size_t{kMaxTokens} * kStreams * parts, 3, 0.0F);
-    float* gamma = Values(kDim, 4, 0.25F, 1.0F);
-    float* inject_w = Values(std::size_t{kStreams} * kDim, 5, 0.02F);
+    // Norm and inject weights rotate with the projections: a decode step
+    // reads every mixer's from memory.
+    std::vector<float*> gammas(copies), inject_ws(copies);
+    for (int i = 0; i < copies; ++i) {
+      gammas[i] = Values(kDim, 4 + 16 * i, 0.25F, 1.0F);
+      inject_ws[i] = Values(std::size_t{kStreams} * kDim, 5 + 16 * i, 0.02F);
+    }
     auto* xn = static_cast<float*>(Device(sizeof(float) * kMaxTokens * kDim));
     void* xn_q8 = Device(qfn_mmq_q8_1_bytes(kMaxTokens, kDim));
     auto* lo = static_cast<float*>(Device(sizeof(float) * kMaxTokens * kRank));
@@ -247,6 +252,10 @@ int main(int argc, char** argv) {
           for (int m = 0; m < mixers; ++m) {
             const int c = m % copies;
             const q::HcFusedMix mix{
+                down[c],         up[c],     res,          block_out, inject,
+                parts,           gammas[c], xn,           xn_q8,     lo,
+                lo_q8,           lo_cols,   inject_ws[c], mixed,     mixed_q8,
+                inject,          kHidden,   kStreams,     kRank,     1e-6F,
                 1.0F / kStreams, down_type, up_type};
             if (!q::HcMixQ8Fused(state, mix, n, stream))
               throw std::runtime_error("fused mixer rejected");
