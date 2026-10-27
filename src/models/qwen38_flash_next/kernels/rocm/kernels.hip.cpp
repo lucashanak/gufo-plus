@@ -7197,6 +7197,20 @@ struct FusedFormat<WeightType::kIQ4_NL> {
   }
 };
 
+/// Blocks a down tile's lanes load ahead: the largest divisor of the row's
+/// `iters` blocks per lane whose operands (`regs` per block) fit about 180
+/// registers. hc_mix_bench, Q6_K down at one token: 8 blocks 38.6 us, 20
+/// blocks 34.7, the whole row (40, spilled) 72.8.
+constexpr int FusedDownAhead(int iters, int regs) {
+  int ahead = 1;
+  for (int a = 1; a <= iters; ++a) {
+    if (iters % a == 0 && a * regs <= 180) {
+      ahead = a;
+    }
+  }
+  return ahead;
+}
+
 /// A format's per-token activation operands (none for the Q8_0 route).
 template<WeightType kType>
 struct FusedInput {
@@ -7286,6 +7300,15 @@ __launch_bounds__(kThreads) __global__
       using F = FusedFormat<kDown>;
       const auto* blocks = static_cast<const typename F::Block*>(a.down) +
                            std::size_t{row} * (kFusedDim / F::kQk);
+      // Every lane takes the same number of blocks. A wave streams its row
+      // alone, so the loads of kAhead blocks go out before their products.
+      constexpr int kStep = F::kVdr * 32 / F::kQi;
+      constexpr int kIters = static_cast<int>(kFusedDim / F::kQk) / kStep;
+      static_assert(static_cast<int>(kFusedDim / F::kQk) % kStep == 0);
+      constexpr int kAhead = FusedDownAhead(
+          kIters, static_cast<int>(sizeof(typename F::Lane) / 4 +
+                                   kTokens * sizeof(typename F::Input) / 4));
+      const int iters = FusedOpaque(kIters);
       const int kqs = F::kVdr * (lane % (F::kQi / F::kVdr));
       const float zero = Materialize(0.0f);
       float sum[kTokens];
@@ -7293,6 +7316,27 @@ __launch_bounds__(kThreads) __global__
       for (int t = 0; t < kTokens; ++t) {
         sum[t] = zero;
       }
+      for (int it = 0, kbx0 = lane / (F::kQi / F::kVdr); it < iters;
+           it += kAhead, kbx0 += kAhead * kStep) {
+        typename F::Lane w[kAhead];
+        typename F::Input x[kAhead][kTokens];
+#pragma unroll
+        for (int j = 0; j < kAhead; ++j) {
+          const int kbx = kbx0 + j * kStep;
+          w[j] = F::Load(blocks + kbx, kqs);
+#pragma unroll
+          for (int t = 0; t < kTokens; ++t) {
+            x[j][t] = F::Activations(
+                input + t * kFusedDimBlocks + kbx * (F::kQk / 32), kqs);
+          }
+        }
+        __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+        for (int j = 0; j < kAhead; ++j) {
+#pragma unroll
+          for (int t = 0; t < kTokens; ++t) {
+            sum[t] = F::Add(sum[t], w[j], x[j][t]);
+          }
         }
       }
 #pragma unroll
