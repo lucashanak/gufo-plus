@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -79,6 +80,9 @@ WeightType SmallType(GgmlType type) {
 // The tier's tiled kernels compute whole column tiles; below this width the
 // matrix-vector kernels read each weight once per row and win outright.
 constexpr std::uint32_t kVecBatch = 8;
+// Eager passes of at least this many rows wait for the GPU in WaitRelaxed:
+// a layer's shared expert alone keeps the GPU busy for longer than a poll.
+constexpr std::uint32_t kRelaxedWaitRows = 2048;
 // Keep prompt arithmetic independent of chunk width. A scoped, per-thread
 // policy also lets the output head retain its existing logits-row arithmetic.
 thread_local bool prefill_phase = false;
@@ -958,6 +962,10 @@ Executor::~Executor() {
   }
   if (counts_ready_ != nullptr) {
     (void)hipEventDestroy(counts_ready_);
+  for (hipEvent_t event : {counts_ready_, pass_done_}) {
+    if (event != nullptr)
+      (void)hipEventDestroy(event);
+  }
   for (hipEvent_t event : {shexp_fork_, shexp_join_}) {
     if (event != nullptr)
       (void)hipEventDestroy(event);
@@ -1004,7 +1012,10 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   }
   if (!Check(hipEventCreateWithFlags(&e->counts_ready_, hipEventDisableTiming),
              "expert counts event", error_msg) ||
-      !Check(hipStreamCreate(&e->side_stream_), "side stream", error_msg) ||
+      !Check(hipEventCreateWithFlags(&e->pass_done_, hipEventDisableTiming),
+             "pass event", error_msg) ||
+      !Check(hipStreamCreateWithFlags(&e->notify_stream_, hipStreamNonBlocking),
+             "notify stream", error_msg) ||
       !Check(hipEventCreateWithFlags(&e->shexp_fork_, hipEventDisableTiming),
              "shared expert fork event", error_msg) ||
       !Check(hipEventCreateWithFlags(&e->shexp_join_, hipEventDisableTiming),
@@ -3387,7 +3398,7 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
 
 bool Executor::Run(Session& session, std::uint64_t key, bool graph,
                    const std::function<bool()>& body, std::string* error_msg,
-                   bool synchronize) const {
+                   bool synchronize, bool relaxed) const {
   // A batch shape runs eagerly once before it is captured: the first pass
   // grows the GEMM tier's arena, which capture forbids.
   if (graph && session.warmed_.contains(key)) {
@@ -3453,6 +3464,10 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
     }
     session.warmed_.insert(key);
   }
+  if (synchronize && relaxed && !graph)
+    return Check(hipEventRecord(pass_done_, stream_), "pass event",
+                 error_msg) &&
+           WaitRelaxed(pass_done_, "forward", error_msg);
   return !synchronize ||
          Check(hipStreamSynchronize(stream_), "forward", error_msg);
 }
@@ -4886,7 +4901,7 @@ bool Executor::MtpForward(Session& session,
                    graph ? graph_pool : pool, hidden_source, output.trace,
                    output.kv_only, subset);
   };
-  if (!Run(session, key, graph, body, error_msg)) {
+  if (!Run(session, key, graph, body, error_msg, true, n >= kRelaxedWaitRows)) {
     return false;
   }
   if (output.token != nullptr) {
