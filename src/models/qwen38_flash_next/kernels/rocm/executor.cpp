@@ -958,13 +958,18 @@ Executor::~Executor() {
   }
   if (counts_ready_ != nullptr) {
     (void)hipEventDestroy(counts_ready_);
+  for (hipEvent_t event : {shexp_fork_, shexp_join_}) {
+    if (event != nullptr)
+      (void)hipEventDestroy(event);
   }
   for (hipEvent_t event : {side_start_, side_done_}) {
     if (event != nullptr)
       (void)hipEventDestroy(event);
   }
-  if (side_stream_ != nullptr)
+  if (side_stream_ != nullptr) {
+    qfn_mmq_release_stream(side_stream_);
     (void)hipStreamDestroy(side_stream_);
+  }
   if (stream_ != nullptr) {
     qfn_mmq_release_stream(stream_);
     (void)hipStreamDestroy(stream_);
@@ -1000,6 +1005,10 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   if (!Check(hipEventCreateWithFlags(&e->counts_ready_, hipEventDisableTiming),
              "expert counts event", error_msg) ||
       !Check(hipStreamCreate(&e->side_stream_), "side stream", error_msg) ||
+      !Check(hipEventCreateWithFlags(&e->shexp_fork_, hipEventDisableTiming),
+             "shared expert fork event", error_msg) ||
+      !Check(hipEventCreateWithFlags(&e->shexp_join_, hipEventDisableTiming),
+             "shared expert join event", error_msg) ||
       !Check(hipEventCreateWithFlags(&e->side_start_, hipEventDisableTiming),
              "side stream fork event", error_msg) ||
       !Check(hipEventCreateWithFlags(&e->side_done_, hipEventDisableTiming),
@@ -3045,6 +3054,32 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
                    bool last_only) const {
   const Config& c = config();
   const std::uint32_t used = c.num_experts_used;
+  // A single row's shared expert needs only x. Its three small launches run
+  // on a forked stream beside the router, top-k and routed experts, which
+  // join it before the epilogue reads shexp_out. Verification rows keep one
+  // stream: forking their grouped launches slowed CLI MTP tg256 by 0.8%.
+  const bool fork = n_tokens == 1 && !MatrixRows(n_tokens) && !last_only &&
+                    out == s_.block_out;
+  if (fork) {
+    if (!Check(hipEventRecord(shexp_fork_, stream_), "shared expert fork",
+               error_msg) ||
+        !Check(hipStreamWaitEvent(side_stream_, shexp_fork_, 0),
+               "shared expert fork wait", error_msg))
+      return false;
+    const hipStream_t main = stream_;
+    stream_ = side_stream_;
+    // Decode rows never take GatedDense's staged F16 route.
+    shexp_half_ready_ = false;
+    const bool ok =
+        GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
+                   &l.shexp_down, error_msg) &&
+        Dense(l.shexp_down, s_.shexp_up, s_.shexp_out, n_tokens, error_msg) &&
+        Check(hipEventRecord(shexp_join_, stream_), "shared expert join",
+              error_msg);
+    stream_ = main;
+    if (!ok)
+      return false;
+  }
   // Router logits and the shared-expert gate come out of one GEMM.
   if (!Dense(l.router, x, s_.router, n_tokens, error_msg)) {
     return false;
@@ -3066,6 +3101,10 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   // The shared expert (gated by the last router row) does not depend on
   // routing. Queue its GEMMs after the count download, then prepare the
   // routed dispatch on the CPU without waiting for these GEMMs to finish.
+  if (fork) {
+    shexp_half_ready_ = false;
+    return MoeExperts(l, x, out, n_tokens, error_msg, true);
+  }
   // A wide batch runs them on the side stream beside the routed experts,
   // which leave compute idle while they stream expert weights. The shared
   // expert writes its own scratch and may quantize x into s_.x_q8t, so no
@@ -3170,8 +3209,8 @@ bool Executor::WmmaExperts(const DeviceLayer& l, std::uint32_t n_tokens) const {
 }
 
 bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
-                          std::uint32_t n_tokens,
-                          std::string* error_msg) const {
+                          std::uint32_t n_tokens, std::string* error_msg,
+                          bool join_shexp) const {
   const Config& c = config();
   const std::uint32_t used = c.num_experts_used;
   const std::uint32_t slots = n_tokens * used;
@@ -3273,6 +3312,9 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
                     s_.router + c.num_experts, c.num_experts + 1, out, n_tokens,
                     used, c.hidden_size, stream_);
   } else {
+    if (join_shexp && !Check(hipStreamWaitEvent(stream_, shexp_join_, 0),
+                             "shared expert join wait", error_msg))
+      return false;
     MoeEpilogue(s_.down_e, s_.weights, s_.shexp_out, s_.router + c.num_experts,
                 c.num_experts + 1, out, n_tokens, used, c.hidden_size, stream_);
   }
