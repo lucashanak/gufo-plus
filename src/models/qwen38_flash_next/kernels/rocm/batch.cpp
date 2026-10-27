@@ -431,9 +431,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
                               hipMemcpyHostToDevice, stream_),
                error))
       return false;
-    EmbedTokens(model_->token_embd().data,
-                EmbeddingType(model_->token_embd().type), base.tokens,
-                base.mtp_embd, rows, c.hidden_size, 1, stream_);
+    EmbedRows(base.tokens, base.mtp_embd, rows, 1);
     RmsNormRows(base.mtp_embd, l.nextn_enorm.f32(), base.mtp_embd, rows,
                 c.hidden_size, 1, c.rms_eps, stream_);
     for (std::size_t i = 0; i < items.size(); ++i) {
