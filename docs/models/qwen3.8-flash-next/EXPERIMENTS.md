@@ -110,6 +110,23 @@ more than the 16K-record v3 file; not a format comparison): prefill
 1,407/1,459 tok/s, prose 50.6, code 68.7, C1/C4/C8 53.0/72.1/146.1; the
 eight-way slice 412.9 s.
 
+Public mixes through the same probe (both on the 1M-record dataset):
+
+| Cell | UD-IQ4_XS (MMQ prefill) | UD-Q2_K_XL, MMQ prefill | UD-Q2_K_XL, WMMA prefill |
+| --- | ---: | ---: | ---: |
+| prefill 7.3K / 26.5K | 1,105.6 / 1,128.8 | 1,101.3 / 1,051.6 | 1,521.5 / 1,512.1 |
+| prose / code decode | 42.8 / 60.3 | 47.4 / 67.4 | 46.9 / 66.5 |
+| C1 / C4 / C8 | 43.9 / 60.9 / 125.2 | 50.4 / 65.4 / 126.2 | 44.1 / 63.2 / 127.8 |
+| eight-way slice | 452.2 s | | 378.2 s |
+
+The WMMA column differs from the MMQ one only in the prefill expert route;
+its decode cells differ by run-to-run noise (PLE rows from disk). The
+routed decode stage (`routed_vec_bench`, 48 layers, random routing, IQ4_NL
+down): IQ3_S gate/up 5.97 ms per forward at one row against Q3_K's 3.47
+(same bytes; the paired vector kernel and IQ3_S's grid decode), 39.96 vs
+24.56 at eight rows, 320.1 vs 149.9 at 64; IQ4_XS 4.31 against Q4_K's 4.06;
+Q2_K 3.09; Q6_K 6.17. A gated IQ3_S kernel is not built.
+
 ## Long-prompt prefill (October 27, 2026)
 
 Workload: v3 recipe + shared-Q8_0 MTP, `gufo bench` pp2K–pp128K and cold
