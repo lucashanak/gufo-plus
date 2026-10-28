@@ -37,6 +37,9 @@ constexpr int kFf = 640;
 constexpr int kLayers = 48;
 
 // GGML type ids.
+constexpr int kQ4_0 = 2, kQ5_0 = 6, kQ5_1 = 7, kQ8_0 = 8, kQ2_K = 10,
+              kQ3_K = 11, kQ4_K = 12, kQ5_K = 13, kQ6_K = 14, kIQ2_XXS = 16,
+              kIQ3_XXS = 18, kIQ4_NL = 20, kIQ3_S = 21, kIQ4_XS = 23;
 
 struct Format {
   const char* name;
@@ -54,6 +57,23 @@ const Format kFormats[] = {
     {"iq4_nl", kIQ4_NL, 32, 18, 0, false},
     {"q5_1", kQ5_1, 32, 24, 0, true},
     {"q8_0", kQ8_0, 32, 34, 0, false},
+    {"q4_0", kQ4_0, 32, 18, 0, false},
+    {"q5_0", kQ5_0, 32, 22, 0, false},
+    {"q2_k", kQ2_K, 256, 84, 80, true},
+    {"q6_k", kQ6_K, 256, 210, 208, false},
+    {"iq2_xxs", kIQ2_XXS, 256, 66, 0, false},
+    {"iq3_xxs", kIQ3_XXS, 256, 98, 0, false},
+    {"iq3_s", kIQ3_S, 256, 110, 0, false},
+    {"iq4_xs", kIQ4_XS, 256, 136, 0, false},
+};
+
+/// Formats with the gated gate/up kernel; the others take MoeExperts'
+/// paired vector projections and SwiGLU.
+bool Gated(int type) {
+  return type == kQ3_K || type == kQ4_K || type == kQ5_K || type == kQ8_0 ||
+         type == kIQ4_XS;
+}
+
 const Format& FindFormat(const std::string& name) {
   for (const Format& f : kFormats)
     if (name == f.name)
@@ -203,6 +223,12 @@ void RunLayer(const Buffers& b, int layer, int rows, int stages) {
       qfn_mmq_moe_gated_vec(b.gf->type, b.gate, b.up, x, ids, b.gate_e, kFf,
                             kHidden, rows, kExperts, kUsed, g_stream) != 0)
     throw std::runtime_error("gated launch failed");
+  if ((stages & kGate) && !Gated(b.gf->type)) {
+    if (qfn_mmq_moe_vec(b.gf->type, b.gate, x, ids, b.gate_e, kFf, kHidden,
+                        rows, kExperts, kUsed, g_stream, b.up, b.up_e) != 0)
+      throw std::runtime_error("paired launch failed");
+    q::Swiglu(b.gate_e, b.up_e, std::size_t{rows} * kUsed * kFf, g_stream);
+  }
   if ((stages & kDown) &&
       qfn_mmq_moe_vec(b.df->type, b.down, b.gate_e, ids, b.down_e, kHidden, kFf,
                       rows * kUsed, kExperts, 1, g_stream) != 0)
