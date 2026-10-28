@@ -1149,6 +1149,12 @@ struct Routing {
 };
 
 /// Paired 128-row gate/up launch (the wide prefill route): F16 SwiGLU rows.
+std::vector<__half> SeparateSwiglu(const Routing& r, const void* gate,
+                                   const void* up, q::WeightType type,
+                                   const __half* x, std::size_t m,
+                                   std::size_t k, std::uint32_t tile_rows,
+                                   std::vector<float>* gate_out = nullptr);
+
 std::vector<__half> PairedSwiglu(const Routing& r, const void* gate,
                                  const void* up, q::WeightType type,
                                  const __half* x, std::size_t m,
@@ -1172,7 +1178,7 @@ std::vector<__half> SeparateSwiglu(const Routing& r, const void* gate,
                                    const void* up, q::WeightType type,
                                    const __half* x, std::size_t m,
                                    std::size_t k, std::uint32_t tile_rows,
-                                   std::vector<float>* gate_out = nullptr) {
+                                   std::vector<float>* gate_out) {
   std::uint32_t n = 0;
   auto* tiles = r.Tiles(tile_rows, &n);
   auto* g = Upload(std::vector<float>(r.slots * m, -7.0F));
