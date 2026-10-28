@@ -1595,6 +1595,10 @@ int main() {
     for (const auto down : {q::WeightType::kIQ4_NL, q::WeightType::kQ5_1})
       routes =
           (formats_only || (CheckPassRoutes(q::WeightType::kIQ4_XS, down) &&
+                            CheckPassRoutes(q::WeightType::kIQ3_S, down) &&
+                            CheckPassRoutes(q::WeightType::kIQ3_XXS, down) &&
+                            CheckPassRoutes(q::WeightType::kIQ2_XS, down))) &&
+          routes;
     using gufo::core::GgmlType;
     for (const GgmlType down :
          {GgmlType::kQ4_0, GgmlType::kQ4_1, GgmlType::kQ5_0, GgmlType::kQ5_1,
