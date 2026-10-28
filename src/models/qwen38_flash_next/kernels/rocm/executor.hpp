@@ -679,7 +679,14 @@ private:
   /// `relaxed` waits for a long eager pass without spinning (WaitRelaxed).
   bool Run(Session& session, std::uint64_t key, bool graph,
            const std::function<bool()>& body, std::string* error_msg,
-           bool synchronize = true) const;
+           bool synchronize = true, bool relaxed = false) const;
+  /// Waits for `event` by polling it with sleeps: the CPU cores and the GPU
+  /// share one package power limit, and the core HIP keeps spinning through
+  /// a 16,384-row prefill pass cost that pass 1.6%. Waking often costs too:
+  /// a core on Strix Halo's second CCD polling every 100 us takes ~4 W from
+  /// the GPU (4% of prefill). A wait expected to last `expect_us` sleeps
+  /// through that, then polls every millisecond; unpredicted waits poll at
+  /// an eighth of the time waited so far, between 100 us and 1 ms.
   /// Runs `body` eagerly, or replays its graph for `key`: shape words then
   /// the identity of every session whose buffers the commands name. A key
   /// runs eagerly once, then eagerly again while its graph is recorded.
@@ -717,6 +724,10 @@ private:
   hipEvent_t side_done_{nullptr};
   mutable bool side_pending_{false};  ///< side_done_ not yet waited on
   hipEvent_t counts_ready_{nullptr};
+  /// Relaxed expert-count waits of the current and the previous prompt pass,
+  /// in microseconds per row, by layer: they predict the next waits.
+  mutable std::vector<double> counts_wait_us_per_row_;
+  mutable std::vector<double> counts_wait_us_per_row_prev_;
   hipblasHandle_t blas_{nullptr};
   std::unique_ptr<BlasLt> blaslt_;
 
