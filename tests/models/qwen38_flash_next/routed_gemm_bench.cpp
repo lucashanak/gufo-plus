@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
 namespace {
 
@@ -68,6 +69,14 @@ q::WeightType ParseType(const std::string& name) {
     return q::WeightType::kQ5_1;
   if (name == "q8_0")
     return q::WeightType::kQ8_0;
+  if (name == "q5_0")
+    return q::WeightType::kQ5_0;
+  if (name == "q4_0")
+    return q::WeightType::kQ4_0;
+  if (name == "iq4_xs")
+    return q::WeightType::kIQ4_XS;
+  if (name == "iq3_s")
+    return q::WeightType::kIQ3_S;
   throw std::runtime_error("unknown weight type " + name);
 }
 
@@ -86,8 +95,14 @@ std::uint32_t Next(std::uint32_t* state) {
 
 template<typename T>
 T* Upload(const std::vector<T>& host) {
+  // A zeroed tail, as the device model's uploads carry: the tiled MMQ route
+  // reads whole 256-element k-iterations past 640-wide rows.
+  constexpr std::size_t kTail = 4096;
   void* p = nullptr;
-  CheckHip(hipMalloc(&p, host.size() * sizeof(T)), "hipMalloc");
+  CheckHip(hipMalloc(&p, host.size() * sizeof(T) + kTail), "hipMalloc");
+  CheckHip(hipMemset(static_cast<std::uint8_t*>(p) + host.size() * sizeof(T), 0,
+                     kTail),
+           "hipMemset");
   CheckHip(
       hipMemcpy(p, host.data(), host.size() * sizeof(T), hipMemcpyHostToDevice),
       "hipMemcpy");
@@ -97,8 +112,8 @@ T* Upload(const std::vector<T>& host) {
 template<typename T>
 T* Alloc(std::size_t count) {
   void* p = nullptr;
-  CheckHip(hipMalloc(&p, count * sizeof(T)), "hipMalloc");
-  CheckHip(hipMemset(p, 0, count * sizeof(T)), "hipMemset");
+  CheckHip(hipMalloc(&p, count * sizeof(T) + 4096), "hipMalloc");
+  CheckHip(hipMemset(p, 0, count * sizeof(T) + 4096), "hipMemset");
   return static_cast<T*>(p);
 }
 
@@ -259,12 +274,35 @@ Result RunLayer(const std::vector<std::uint32_t>& counts, int reps,
         1000.0F);
   auto* d_x = Upload(x);
   auto* d_mid = Alloc<__half>(std::size_t{slots} * kFf);
-  auto* d_gate_out = Alloc<float>(wide ? 1 : std::size_t{slots} * kFf);
+  const bool mmq = std::getenv("GUFO_BENCH_MMQ") != nullptr;
+  const bool separate = !wide || Separate(gate_type);
+  auto* d_gate_out =
+      Alloc<float>(separate || mmq ? std::size_t{slots} * kFf : 1);
+  auto* d_up_out = Alloc<float>(mmq ? std::size_t{slots} * kFf : 1);
+  auto* d_down_out = Alloc<float>(mmq ? std::size_t{slots} * kHidden : 1);
+  float* d_xf = nullptr;
+  if (mmq) {
+    std::vector<float> xf(x.size());
+    for (std::size_t i = 0; i < x.size(); ++i)
+      xf[i] = __half2float(x[i]);
+    d_xf = Upload(xf);
+  }
   auto* d_out = Alloc<__half>(std::size_t{slots} * kHidden);
   CheckHip(hipDeviceSynchronize(), "setup");
 
   const auto pair = [&] {
-    if (!wide) {
+    if (mmq) {
+      if (qfn_mmq_moe_raw(static_cast<int>(gate_type), d_gate, d_xf, d_ids,
+                          d_gate_out, kFf, kHidden, tokens, kExperts, kUsed,
+                          nullptr) != 0 ||
+          qfn_mmq_moe_raw(static_cast<int>(gate_type), d_up, d_xf, d_ids,
+                          d_up_out, kFf, kHidden, tokens, kExperts, kUsed,
+                          nullptr) != 0)
+        throw std::runtime_error("tiled gate/up rejected");
+      q::Swiglu(d_gate_out, d_up_out, std::size_t{slots} * kFf, nullptr);
+      return;
+    }
+    if (separate) {
       if (!q::RoutedF16Gemm(d_gate, gate_type, d_x, d_tiles, n_tiles, tile_rows,
                             d_bounds, d_rows_token, d_rows_slot, nullptr,
                             d_gate_out, nullptr, kFf, kHidden, nullptr) ||
@@ -280,6 +318,13 @@ Result RunLayer(const std::vector<std::uint32_t>& counts, int reps,
       throw std::runtime_error("gated GEMM rejected");
   };
   const auto down = [&] {
+    if (mmq) {
+      if (qfn_mmq_moe_raw(static_cast<int>(down_type), d_down, d_gate_out,
+                          d_ids, d_down_out, kHidden, kFf, slots, kExperts, 1,
+                          nullptr) != 0)
+        throw std::runtime_error("tiled down rejected");
+      return;
+    }
     if (!q::RoutedF16Gemm(d_down, down_type, d_mid, d_tiles, n_tiles, tile_rows,
                           d_bounds, d_rows_slot, d_rows_slot, nullptr, nullptr,
                           d_out, kHidden, kFf, nullptr))
@@ -305,7 +350,8 @@ Result RunLayer(const std::vector<std::uint32_t>& counts, int reps,
           Hash(d_out, std::size_t{slots} * kHidden)));
   for (void* p : std::initializer_list<void*>{
            d_ids, d_counts, d_tiles, d_bounds, d_cursors, d_rows_token,
-           d_rows_slot, d_x, d_mid, d_gate_out, d_out})
+           d_rows_slot, d_x, d_mid, d_gate_out, d_up_out, d_down_out, d_xf,
+           d_out})
     CheckHip(hipFree(p), "hipFree");
   return {pair_ms, down_ms, pair_gb, down_gb, pair_tflop, down_tflop};
 }
@@ -314,6 +360,8 @@ Result RunLayer(const std::vector<std::uint32_t>& counts, int reps,
 
 int main(int argc, char** argv) try {
   const int reps = argc > 1 ? std::atoi(argv[1]) : 10;
+  if (std::getenv("GUFO_BENCH_MMQ") != nullptr && qfn_mmq_init(0) != 0)
+    throw std::runtime_error("qfn_mmq_init failed");
   std::vector<std::vector<std::uint32_t>> layers;
   const std::string source = argc > 2 ? argv[2] : "2048";
   if (!source.empty() && std::all_of(source.begin(), source.end(), [](char c) {

@@ -1658,6 +1658,11 @@ int main() {
     // IQ4_XS / IQ3_S gate/up views (the UD-IQ4_XS mix's experts), every tile.
     for (const auto type : {q::WeightType::kIQ4_XS, q::WeightType::kIQ3_S,
                             q::WeightType::kIQ3_XXS, q::WeightType::kIQ2_XS})
+      for (const std::uint32_t tile : {16U, 48U, 128U})
+        ok = Ok(Run(type, 300, 10, 64, 640, 2560,
+                    0x14C40000U + tile + static_cast<std::uint32_t>(type),
+                    tile)) &&
+             ok;
     // Q8_0 down view (five layers keep Q8_0 down projections).
     ok = Ok(Run(q::WeightType::kQ8_0, 3000, 1, 64, 2560, 640, 0x0C0FFEE0U,
                 128)) &&
