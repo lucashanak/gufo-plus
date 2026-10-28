@@ -954,23 +954,14 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
   const std::size_t ratio =
       std::max<std::uint32_t>(1, model_->config().compress_ratio);
   for (std::size_t off = 0; off < tokens.size();) {
-    const auto remaining = tokens.size() - off;
-    const auto capacity = remaining <= exec.max_batch()
-                              ? exec.max_batch()
-                              : model_->PrefillCapacity();
-    std::size_t n = std::min<std::size_t>(capacity, remaining);
-    const bool captures = (checkpoint || consume) && boundary > tokens_.size();
-    // Extended-context attention can fall back from WMMA to the per-token
-    // kernel. Its checkpoint must end a pass: the fused in-pass path requires
-    // WMMA for both query groups. Preserve ordinary split-pass arithmetic on
-    // either side of the boundary. Use the actual launch capability rather
-    // than the model's independently configured native context length.
-    if (captures && boundary < tokens_.size() + n &&
-        tokens_.size() + n >
-            rocm::WmmaCausalAttentionContextLimit(
-                model_->config().num_heads, model_->config().num_kv_heads,
-                model_->config().head_dim, model_->config().compress_ratio)) {
-      n = boundary - tokens_.size();
+    std::size_t n = pass_tokens(tokens.size() - off, ramp);
+    // A following pass starts on a selection block (WmmaCausalAttention).
+    if (const auto end = tokens_.size() + n;
+        prefill && off + n < tokens.size() && end % ratio != 0 &&
+        n > end % ratio)
+      n -= end % ratio;
+    // This pass captures boundaries [next_boundary, last_boundary) in place.
+    std::size_t last_boundary = next_boundary;
     if (ramp != 0) {
       const double grown =
           (kRampPassSeconds + static_cast<double>(n) / kRampTokensPerSecond) *
