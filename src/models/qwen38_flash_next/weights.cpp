@@ -134,8 +134,11 @@ struct Binder {
     const std::uint64_t hc_dim = c.HcDim();
     const auto dense = {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
                         GgmlType::kF32};
-    const auto experts = {GgmlType::kQ4_K, GgmlType::kQ5_K, GgmlType::kQ6_K,
-                          GgmlType::kQ5_1, GgmlType::kQ8_0};
+    // The large trunk projections may also be K-quants: the device keeps a
+    // Q8_0 copy for prefill and the compact rows for decode.
+    // llama.cpp falls back to Q5_0 / Q5_1 / IQ4_NL / Q4_0 on the 640-wide
+    // rows that K-quants cannot cover.
+    const auto projection = {
 
     l.hc_attn = Mixer(p + "hc_attn", c, true);
     l.hc_ffn = Mixer(p + "hc_ffn", c, true);
@@ -287,9 +290,10 @@ std::optional<ModelWeights> ModelWeights::Bind(const core::GgufReader& reader,
     if (rows < c.ple_rows) {
       b.Fail("per_layer_token_embd.weight is missing or too short");
     } else {
-      w.ple_table =
-          b.Get("per_layer_token_embd.weight", c.ple_head_dim, rows, 1,
-                {GgmlType::kIQ4_NL, GgmlType::kQ8_0, GgmlType::kBF16});
+      w.ple_table = b.Get(
+          "per_layer_token_embd.weight", c.ple_head_dim, rows, 1,
+          {GgmlType::kIQ4_NL, GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kQ5_0,
+           GgmlType::kQ5_1, GgmlType::kQ4_0, GgmlType::kQ4_1});
     }
   }
   w.layers.reserve(c.num_layers);
