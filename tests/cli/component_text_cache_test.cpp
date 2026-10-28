@@ -2284,6 +2284,8 @@ int main() {
   BudgetUsesAllocatedSlotsInsteadOfLazyStateClaim();
   InPassCapturePreservesBoundaryAndLiveTail();
   AlignedPrefillKeepsAlignedBoundaries();
+  GridCheckpointsCaptureInPass();
+  PromptTargetBeforeGridKeepsItsPurpose();
   UnalignedPromptEndPublishesBeforeDroppingTheFrontier();
   UnalignedRawPromptKeepsAnAlignedContinuation();
   DisabledCacheDoesNotPrepareARawPromptCheckpoint();

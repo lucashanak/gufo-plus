@@ -736,8 +736,12 @@ struct TextRunnerPool::Request::Impl {
       snapshot_tokens.assign(prompt.begin(),
                              prompt.begin() + stable_prefix_position);
       stable_prefix_position = 0;
+    } else if (PromptEnd() > fallback_position) {
+      snapshot_tokens.assign(prompt.begin(), prompt.begin() + PromptEnd());
     } else {
-      snapshot_tokens = prompt;
+      // The aligned prompt end was this capture; nothing follows it.
+      prompt_snapshot_attempted = true;
+      return;
     }
     prompt_snapshot_attempted = false;
   }
@@ -789,9 +793,9 @@ struct TextRunnerPool::Request::Impl {
     try {
       retain_snapshot = lease.TryReserveSnapshot(
           snapshot_bytes, snapshot_tokens.size(),
-          retain_fallback && (fallback_position == 0 ||
-                              snapshot_tokens.size() == prompt.size()),
-          retain_fallback && snapshot_tokens.size() == prompt.size()
+          retain_fallback &&
+              (fallback_position == 0 || snapshot_tokens.size() == PromptEnd()),
+          retain_fallback && snapshot_tokens.size() == PromptEnd()
               ? SnapshotPurpose::kRetry
               : SnapshotPurpose::kContinuation,
           snapshot_tokens);
@@ -1260,9 +1264,6 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
   while (!impl_->checkpoints.empty() &&
          impl_->checkpoints.front() <= impl_->prefill_offset)
     impl_->checkpoints.erase(impl_->checkpoints.begin());
-  if (!impl_->checkpoints.empty())
-    max_input_tokens = std::min(
-        max_input_tokens, impl_->checkpoints.front() - impl_->prefill_offset);
   // A budget-limited pass ends on an aligned position, so the next pass
   // continues the prompt exactly: shorter, or a budget below the alignment
   // runs to the next one. Every capture boundary is aligned already, so

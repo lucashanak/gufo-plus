@@ -972,11 +972,7 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
   const std::size_t ratio =
       std::max<std::uint32_t>(1, model_->config().compress_ratio);
   for (std::size_t off = 0; off < tokens.size();) {
-    const auto remaining = tokens.size() - off;
-    const auto capacity = remaining <= exec.max_batch()
-                              ? exec.max_batch()
-                              : model_->PrefillCapacity();
-    std::size_t n = std::min<std::size_t>(capacity, remaining);
+    std::size_t n = pass_tokens(tokens.size() - off, ramp);
     // A following pass starts on a selection block (WmmaCausalAttention).
     if (const auto end = tokens_.size() + n;
         prefill && off + n < tokens.size() && end % ratio != 0 &&
