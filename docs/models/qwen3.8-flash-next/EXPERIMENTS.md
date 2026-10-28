@@ -19,10 +19,20 @@
 ## One-launch decode HC mixer (October 29, 2026)
 
 Upstream `main` 34ebb5fe against the branch, Strix Halo (ROCm 7.2.4), UD-Q4_K_XL + shared Q8_0 MTP, `gufo serve --sessions 1 --context 65536`, greedy, thinking off, five fixed prompts (CPU caches, a Python red-black tree, TCP congestion control, Czech railway history, a C++ ISO 8601 parser) of 384 generated tokens; one server process per arm, means of the five decode rates. The first process after another workload reads cold PLE rows and runs 2-4% slower, so every hold started with a discarded warm-up and main ran before and after the candidates.
+## Exactness at the sparse budget (October 28, 2026)
+
+Workload: greedy decoding through the engine API with controlled batch
+composition (diagnostic `exact_probe`: frontier-logit hash per step; AR,
+single-session MTP, eight-way batched AR and MTP, staggered joins, MTP
+started at a chosen position) and the eight-way IQ replay at production
+flags. Evidence: [QUALITY.md](QUALITY.md#exactness-at-the-sparse-budget-october-28-2026).
 
 | Experiment | Outcome |
 | --- | --- |
-| `HcMixQ8Fused`: a decode batch's combine, Q8_0 down/up projections, SiLU and epilogue in one launch (1-8 rows) | Retained as a component result: outputs bit for bit the five separate kernels (`hc_mix_ops`, eager, in place and replayed). `hc_mix_bench`, graph-replayed, µs per mixer: T1 47.8 → 44.5, T2 48.2 → 44.3, T4 51.7 → 48.5, T8 59.2 → 57.2. End to end, replies byte-identical; AR 28.81/29.38 (main before/after) against 29.82 and 29.55 tok/s, MTP 50.3 → 50.7/50.8 (main, three runs); C4 MTP wall throughput (4 × 32,768, four unique 256-token prompts) 76.2/76.9 → 80.0 tok/s. Rejected (exact): warming the down weights during the combine (T8 0.92×), LDS-staged up rows (0.75-0.93×), all 16 up rows ahead at T5-T8 (1.00×). |
+| Dense sweep for rows before the budget in a masked decode/verification launch | Retained (`dense_extent` in `AttentionKernel`). A chain crossing 2,048 tokens used the mask walk for its pre-budget rows, whose tail block lands in its own tile; decoding alone sweeps it in the last dense tile. Fixes the replay's run-to-run divergence. Prefill and plain AR rows take the same route as before. 28-question slice at production flags (budget 0.6): 306 → 304 s, all 28 answers identical. `fnab.sh`, alternating base/fix twice: pp8192 1628/1619 → 1634/1631, pp32768 1710/1625 → 1619/1597 (the prefill pass does not reach the changed kernel; consecutive long prompts vary like this, see below), decode 60.8/58.5 → 62.7/60.2, C1 59.5/56.0 → 62.0/60.1, C4 98.7/95.9 → 100.9/92.6, C8 198.3/190.1 → 192.6/188.9 tok/s: within run-to-run noise. |
+| Bisecting with batch knobs (graphs off, sparse decided by the chain's first row) | Diagnostic only; superseded by the solo MTP-from-position repro, which is deterministic (batched draft widths follow measured cycle times). |
+| Prefill alignment in the server (pass ends and prompt checkpoints rounded down to four tokens) | Retained. Keeps the engine's four-query union tiles; a restore re-prefills at most three tokens. Four long slice answers change (`lcagg_09`, `lcagg_18`, `longctx_13`, `longctx_16`, prompts of 5,754–22,368 tokens): their prompts were split off the alignment before. Their reasoning now equals a single-pass AR prefill through the engine (`exact_probe`, no MTP) over its whole length (750–2,300 characters; 6,678 for the probe's 1,500-token `lcagg_09`), where the previous server's diverged after 173–647 characters. Slice 304 → 303 s; `fnab.sh` against `13c2897c`: pp8192 1703/1642, pp32768 1635/1621, decode 59.6/62.0, C1 55.9/56.4, C4 99.8/95.7, C8 193.9/195.3 tok/s: within run-to-run noise. |
+| Exact sparse prefill for any split (one query per WMMA tile) | Not built: the union tiles are the sparse window's speed (one or three queries per tile measured slower, [October 23](#indexer-and-sparse-attention-at-depth-october-23-2026)). |
 
 ## Prefill DeltaNet (October 23, 2026)
 
