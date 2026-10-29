@@ -90,6 +90,12 @@ constexpr auto kRelaxedWaitCoarsePoll = std::chrono::milliseconds(1);
 // up to 4%; 0.95 overslept often enough to idle the GPU (16K prompt passes,
 // Strix Halo: 1,662-1,674 vs 1,709-1,711 tok/s at 0.92).
 constexpr double kCountsWaitShare = 0.92;
+// Upstream's prompt-pass side stream (DeltaNet Z rows, Q8_0 shared expert).
+// Beside this branch's fused DeltaNet prefill it costs time: v3 + MTP,
+// Strix Halo ROCm 7.2.4, pp32K 1,658-1,662 tok/s with either overlap,
+// 1,693 without the shared-expert one, 1,741 without both (production
+// 1,733). Off until it is retuned for these kernels.
+constexpr bool kPrefillSideStream = false;
 // Keep prompt arithmetic independent of chunk width. A scoped, per-thread
 // policy also lets the output head retain its existing logits-row arithmetic.
 thread_local bool prefill_phase = false;
@@ -3374,8 +3380,8 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   // Only the Q8_0 shared expert overlaps: its kernels take stream_, while
   // the BF16, F16 and F32 routes go through BLAS handles bound to the main
   // stream.
-  const bool overlap = ExpertMatrixRows(n_tokens) && !last_only &&
-                       l.shexp_gate.type == GgmlType::kQ8_0 &&
+  const bool overlap = kPrefillSideStream && ExpertMatrixRows(n_tokens) &&
+                       !last_only && l.shexp_gate.type == GgmlType::kQ8_0 &&
                        l.shexp_up.type == GgmlType::kQ8_0 &&
                        l.shexp_down.type == GgmlType::kQ8_0;
   const hipStream_t main = stream_;

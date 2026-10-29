@@ -67,8 +67,21 @@ Every greedy output, alone, staggered and eight-way, is byte-identical.
 | --- | --- |
 | Register-resident routed down projection over 128-token tiles (`RoutedDownF16Kernel`, Q5_1/Q8_0) and a rewritten paired gate/up (`RoutedPairF16Kernel`, Q4_K/Q5_K) sharing one 128-token map | Retained. gfx1151 WMMA reads row r's A operand from one lane only (r for even rows, r + 16 for odd; the other copy is ignored, verified with garbage in the unread lanes), so each lane decodes one K16 half and one `v_permlanex16` per dword supplies the other: no duplicate decode, no selects. Down keeps each wave's 16 rows' codes in registers (activations are the only LDS stage, 155 VGPRs); the pair loads superblocks raw and decodes them at commit, removing a full memory wait every fourth stage. Loop VALU per WMMA: down 11 → 4.6, pair 6.8 → 3.9. Every row is bit-identical across 16/48/128-row tiles, paired vs separate, and 1/7/9/33/95/96-row passes (`CheckPassRoutes`). `routed_gemm_bench` (synthetic skewed top-10, Q4_K gate/up, Q5_1 down) on main `34ebb5fe`, two rounds, ms per layer at 4,096 / 26,541 rows: gate/up 10.61, 11.06 → 10.30, 10.34 / 54.43, 59.42 → 52.30, 56.35; down 6.58, 6.77 → 5.72, 6.16 / 32.83, 37.83 → 28.29, 31.50. On the production fork (quiet GPU, alternating medians), TFLOPS at 4,096 / 26,541 rows: down Q5_1 21.1 → 23.8 / 25.1 → 30.6, Q8_0 17.8 → 20.4 / 23.6 → 29.0; gate/up Q4_K 26.7 → 28.3 / 32.6 → 33.1, Q5_K 24.1 → 25.3 / 30.2 → 30.7. The GPU runs these kernels power-limited near 1.9 GHz (~110 W), so the measured WMMA ceiling is about 39–48 TFLOPS. `gufo bench` UD-Q4_K_XL pp16384, two rounds: 1,590 / 1,583 → 1,624 / 1,629 tok/s. Rejected (all exact): prefetching two stages ahead, the next token tile's B fragments (199 VGPRs), double-buffered activation stages with one barrier (BK 1 or 2), and 256-row × 64-token down tiles; none beat the version kept. Ablation at 26.5K rows: without WMMA the down kernel takes 16 of 30 ms, without decode −5%, without B fragment reads −3%, without stores −2%. |
 | Weighted top-10 combine folded into the down epilogue | Not done: a token's ten slot rows come from ten experts' tiles spread over the whole launch, so an exact slot-order sum needs every partial first; integer atomics would be order-independent but cost more than the 51 KB/token read and would change every route. The combine already streams about 190 GB/s. |
+## Upstream 0.27.0 merge (October 29, 2026)
 
-## Long prefill passes (October 23, 2026)
+Merged build on Strix Halo (ROCm 7.2.4, v3 recipe + MTP) against production
+da156077: all `qwen38_flash_next` and `qwen36_35b_a3b` ctests pass; the C1 AR
+and MTP prompt sets and the 28-question eight-way slice are byte-identical.
+
+| Overlap | Kept | Why |
+| --- | --- | --- |
+| Prompt-pass side stream for the DeltaNet Z rows and the Q8_0 shared expert (#758) | Upstream's code, off (`kPrefillSideStream`) | Beside the fused DeltaNet prefill, which reads z from its first token, pp32K fell 1,733 → 1,658–1,662 tok/s; without the shared-expert overlap 1,693, without both 1,741 |
+| Decode shared-expert fork and prefill overlap | One non-blocking side stream, separate fork/join events | The two never run in one pass |
+| Q8_0 inject rows on F32 kernels (#788) | Upstream's intent, through this branch's host widening (`CopyF32`); BF16 rows keep their projection | One widening path for every inject format |
+| Selection bounded by the score row (#849) | Upstream's guard, added to the matrix-core scorer's store | The scalar scorer it patched is not used here |
+| Growable qfn_mmq arena (#740) | Upstream's | Same design as this branch's chunks, plus the drain before a block is added |
+| Grid order of the wide GEMMs (#758 `kRowsFastest`, `first_row_tile`) | Both | `kRowsFastest` launches keep their grid; the others take the grouped raster order |
+
 ## Exactness at the sparse budget (October 28, 2026)
 
 Workload: greedy decoding through the engine API with controlled batch
