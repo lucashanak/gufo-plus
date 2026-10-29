@@ -262,15 +262,17 @@ bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner> runner,
   }
 }
 
-bool InferenceBackend::load(
-    const std::string& model_path, std::string* error,
-    std::uint32_t max_context, std::size_t session_count,
-    TextSchedulerPolicy scheduler_policy,
-    const TextSpeculativeConfig& speculative_config,
-    const TextDiskCacheConfig& disk_cache_config,
-    const std::string& vision_model_path,
-    TextRunnerRamCacheOptions ram_cache_config, bool enable_yarn,
-    const PrepareRunnerOptions& prepare_runner_options) {
+bool InferenceBackend::load(const std::string& model_path, std::string* error,
+                            std::uint32_t max_context,
+                            std::size_t session_count,
+                            TextSchedulerPolicy scheduler_policy,
+                            const TextSpeculativeConfig& speculative_config,
+                            const TextDiskCacheConfig& disk_cache_config,
+                            const std::string& vision_model_path,
+                            TextRunnerRamCacheOptions ram_cache_config,
+                            bool enable_yarn,
+                            const PrepareRunnerOptions& prepare_runner_options,
+                            std::size_t kv_cache_bytes) {
   std::string load_error;
   auto reader_owner = core::GgufReader::OpenFile(
       model_path, &load_error, {.allow_unsized_tensors = true});
@@ -299,6 +301,7 @@ bool InferenceBackend::load(
       .disk_cache = disk_cache_config,
       .ram_cache = ram_cache_config,
       .enable_yarn = enable_yarn,
+      .kv_cache_bytes = kv_cache_bytes,
   };
   if (prepare_runner_options &&
       !prepare_runner_options(*provider, *reader, &options, error)) {
@@ -325,7 +328,7 @@ bool InferenceBackend::load(const std::string&, std::string* error,
                             const TextSpeculativeConfig&,
                             const TextDiskCacheConfig&, const std::string&,
                             TextRunnerRamCacheOptions, bool,
-                            const PrepareRunnerOptions&) {
+                            const PrepareRunnerOptions&, std::size_t) {
   SetError(error, "HIP engine is disabled");
   return false;
 }

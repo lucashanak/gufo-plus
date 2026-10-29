@@ -98,6 +98,10 @@ if (ENGINE_ENABLE_HIP)
     SKIP_RETURN_CODE 77
     RUN_SERIAL TRUE
     TIMEOUT 1800)
+  add_executable(qwen38_flash_next_growable_kv_test EXCLUDE_FROM_ALL
+    growable_kv_test.cpp)
+  target_link_libraries(qwen38_flash_next_growable_kv_test PRIVATE
+    qwen38_flash_next_test_hip)
   add_executable(qwen38_flash_next_continuation_probe EXCLUDE_FROM_ALL
     continuation_probe.cpp)
   target_link_libraries(qwen38_flash_next_continuation_probe PRIVATE
@@ -105,7 +109,8 @@ if (ENGINE_ENABLE_HIP)
   add_custom_target(qwen38_flash_next_model_tests
     DEPENDS qwen38_flash_next_session_test qwen38_flash_next_snapshot_test
       qwen38_flash_next_continuation_adapter_test
-      qwen38_flash_next_layered_prefill_test)
+      qwen38_flash_next_layered_prefill_test
+      qwen38_flash_next_growable_kv_test)
 
   add_executable(qwen38_flash_next_dense_gemm_bench EXCLUDE_FROM_ALL
     dense_gemm_bench.cpp)
