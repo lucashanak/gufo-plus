@@ -495,6 +495,10 @@ struct Uploader {
   }
 
   DeviceMixer Mixer(const HcMixer& m) {
+    // Inject rows of every format, BF16 and Q8_0 included, are widened to
+    // the F32 rows the fused mixer reads, so they run the F32 kernels on
+    // their exact values. A separate BF16 projection would take the
+    // library GEMM, whose sums depend on the pass width.
     return {Copy(m.norm), Copy(m.down), Copy(m.up), CopyF32(m.inject)};
   }
 
