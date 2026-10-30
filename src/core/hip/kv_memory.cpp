@@ -61,6 +61,24 @@ void KvPool::Refund(std::size_t bytes) {
   mapped_ -= std::min(mapped_, bytes);
 }
 
+KvPool::~KvPool() {
+  for (const auto& [base, bytes] : ranges_)
+    (void)hipMemAddressFree(base, bytes);
+}
+
+    free_ranges_.erase(reused);
+    return base;
+  }
+  void* base = nullptr;
+  *status = hipMemAddressReserve(&base, bytes, 0, nullptr, 0);
+  if (*status != hipSuccess)
+    return nullptr;
+  ranges_.emplace_back(base, bytes);
+  return base;
+}
+
+bool KvPool::ReserveArena(std::size_t bytes, std::string* error) {
+  const std::lock_guard lock(mutex_);
 GrowableRows::GrowableRows(GrowableRows&& other) noexcept
     : pool_(std::exchange(other.pool_, nullptr)),
       base_(std::exchange(other.base_, nullptr)),
