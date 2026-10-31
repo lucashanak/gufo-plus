@@ -31,6 +31,17 @@ have matching precision. Use the Q4_K_M DFlash2 draft with either target.
 | AR | No speculative option | Target-only generation. |
 | DFlash2 | `--speculative dflash2 --dflash-model PATH` | Adaptive default; `--draft-tokens` caps proposals, `--draft-policy fixed` is a comparison mode. |
 
+### K/V memory
+
+Each session reserves attention K/V for its full `--context` but backs rows in
+2 MiB chunks as it holds tokens, so `--context 262144` costs memory only when
+long prompts arrive. `--kv-cache-bytes N` caps the backed K/V of all sessions
+together; a growth past it first releases rows idle sessions no longer hold,
+otherwise the request fails with "K/V memory exhausted". F16 rows take 64 KiB
+per token (16 attention layers, K and V). `GUFO_QWEN_KV8=1` stores them as
+int8 codes with an F16 scale per 16 values, 36 KiB per token; every attention
+kernel reads the F16 values f16(scale x code).
+
 Greedy speculation must match AR. Sampled modes preserve the target policy,
 but AR and speculation need not share the same-seed sequence. See the
 [quality contract](QUALITY.md). Thinking/template controls and HTTP

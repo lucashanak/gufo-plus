@@ -279,3 +279,24 @@ peaks at 39.14 GiB in both rows.
 <!-- /bench -->
 
 ![Memory occupation](artifacts/charts/memory-q8.svg)
+
+## Growing and 8-bit K/V (2026-10-31)
+
+Strix Halo 128 GB, ROCm 7.2.4, UD-Q4_K_XL + DFlash2 Q4_K_M, `serve --sessions 4`,
+HTTP, greedy. Container = runtime 0.28.0 at `--context 65536` (preallocated F16).
+Fork rows: `--context 262144`, F16 cap 24 GiB, 8-bit cap 16 GiB.
+
+| | Container 65536 | F16 growing 262144 | 8-bit growing 262144 |
+| --- | ---: | ---: | ---: |
+| GTT at readiness | 46,337 MiB | 29,279 MiB | 29,279 MiB |
+| Short replies, tok/s (4 prompts) | 28.1 / 32.9 / 30.2 / 27.0 | 28.5 / 32.4 / 30.0 / 26.7 | 28.4 / 32.1 / 29.8 / 26.6 |
+| 4 concurrent, aggregate tok/s | 36.2 | 42.6 | 43.4 |
+| 7.3K prompt: prefill / decode tok/s | 486 / 21.3 | 513 / 21.1 | 515 / 20.8 |
+| 54K prompt: prefill / decode tok/s | 441 / 15.9 | 439 / 17.0 | 440 / 16.5 |
+| 4 x 50K needles concurrently | 4/4, 407-442 s | 4/4, 397-429 s | 4/4, 392-424 s |
+| Needles at 25K / 100K / 166K | 25K and 50K only | 3/3 | 3/3 |
+
+Greedy text of the container and the F16 growing build is identical on all
+eight prompts; 8-bit rows first diverge after 3,643 characters of a 2,000-token
+reasoning answer.
+
