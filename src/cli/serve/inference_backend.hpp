@@ -80,7 +80,8 @@ public:
   /// Loads weights from a GGUF file. Returns false and sets *error on failure.
   /// `enable_yarn` opts Flash-Next into static YaRN, required for (and only
   /// accepted with) a `max_context` above its native context.
-  /// `kv_cache_bytes` bounds Flash-Next's K/V rows across all sessions.
+  /// `kv_cache_bytes` bounds Flash-Next's and Qwen3.6-35B-A3B's K/V rows
+  /// across all sessions.
   bool load(const std::string& model_path, std::string* error,
             std::uint32_t max_context = 0, std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},

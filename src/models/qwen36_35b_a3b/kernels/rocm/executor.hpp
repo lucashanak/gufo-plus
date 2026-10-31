@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -21,6 +22,7 @@
 #include "src/models/qwen36_35b_a3b/kernels/rocm/blaslt.hpp"
 #include "src/models/qwen36_35b_a3b/kernels/rocm/device_model.hpp"
 #include "src/models/qwen36_35b_a3b/kernels/rocm/kernels.hpp"
+#include "src/models/qwen36_35b_a3b/kernels/rocm/kv_memory.hpp"
 #include "src/models/qwen36_35b_a3b/mtp_sampling.hpp"
 
 namespace gufo::models::qwen36_35b_a3b::rocm {
@@ -52,6 +54,9 @@ public:
     return mutation_epoch_;
   }
   [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
+  /// The part of AllocatedBytes in K/V rows, which grow with the tokens held
+  /// under the executor's K/V budget (Executor::Options::kv_budget).
+  [[nodiscard]] std::size_t KvBytes() const noexcept;
   void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt,
                        std::shared_ptr<qwen::vision::Encoder> encoder,
                        hipStream_t stream);
@@ -76,7 +81,8 @@ private:
     __half* k_cache{nullptr};  ///< [max_context][kv_heads*d]
     __half* v_cache{nullptr};  ///< [max_context][kv_heads*d]
     /// 8-bit copies decode attention reads (KvQ8), kept in step with the
-    /// F16 caches the wide prefill kernels read.
+    /// F16 caches the wide prefill kernels read. Backed as far as
+    /// Executor::ReserveKv has grown them.
     std::int8_t* k_q8{nullptr};
     std::int8_t* v_q8{nullptr};
     __half* k_scale{nullptr};  ///< [max_context][kv_heads*d/16]
@@ -84,6 +90,13 @@ private:
     /// The draft block's cache: its attention never decides a committed
     /// token, so narrow rows may use a split count of their own.
     bool draft{false};
+  };
+  /// The rows that grow with the tokens held: 8-bit K, 8-bit V, K scales and
+  /// V scales of each attention layer in layer order, then the draft
+  /// block's four.
+  struct KvRows {
+    std::vector<GrowableRows> target;
+    std::vector<GrowableRows> draft;
   };
   /// Per-launch values the kernels read from device memory, so a captured
   /// graph replays at any position.
@@ -118,6 +131,7 @@ private:
   std::uint32_t spec_tokens_{0};  ///< tokens of the pending speculative batch
   MtpState mtp_;
   Control* control_{nullptr};
+  std::unique_ptr<KvRows> kv_;
   /// Captured decode graphs by batch shape, and the shapes that ran eagerly
   /// once (the GEMM tier's arena must be grown before capture).
   std::unordered_map<std::uint64_t, hipGraphExec_t> graphs_;
@@ -141,6 +155,9 @@ public:
     std::uint32_t max_logit_rows{1};
     /// Longest speculative batch; bounds the recurrent snapshot storage.
     std::uint32_t max_speculative{1};
+    /// Device bytes of K/V rows all sessions may hold at once. Each session's
+    /// rows grow with its tokens; zero leaves the device heap as the limit.
+    std::size_t kv_budget{0};
   };
 
   ~Executor();
@@ -176,6 +193,22 @@ public:
   [[nodiscard]] std::size_t SessionBytes(
       core::SessionMode mode, std::uint32_t max_context,
       std::uint32_t rollback_depth) const noexcept;
+  /// The part of SessionBytes that grows with the tokens a session holds
+  /// (mapped in KvPool::kChunkBytes steps per buffer).
+  [[nodiscard]] std::size_t GrowableBytes(core::SessionMode mode,
+                                          std::uint32_t tokens) const noexcept;
+  [[nodiscard]] std::size_t kv_budget() const noexcept {
+    return options_.kv_budget;
+  }
+  /// K/V bytes currently mapped across this executor's sessions.
+  [[nodiscard]] std::size_t KvMappedBytes() const;
+  /// Backs the session's first `rows` trunk and `draft_rows` draft positions
+  /// before a write. When the budget is
+  /// short, rows idle sessions no longer hold are released first; sessions
+  /// in `busy` are left alone. Fails without touching the session state.
+  [[nodiscard]] bool ReserveKv(Session& session, std::uint32_t rows,
+                               std::uint32_t draft_rows, std::string* error_msg,
+                               std::span<Session* const> busy = {}) const;
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
 
   enum class ForwardMode { kDecode, kVerify, kPrefill };
@@ -324,6 +357,7 @@ public:
   [[nodiscard]] bool has_mtp() const noexcept { return model_->has_mtp(); }
 
 private:
+  friend class Session;
   Executor() = default;
 
   /// Visits every device region of a snapshot in payload order with
@@ -497,11 +531,24 @@ private:
   /// Executor-wide F16 K/V staging shared by every session and layer: fresh
   /// rows land here before QuantizeKv, and wide attention widens the Q8
   /// prefix back into it. Larger sessions get a larger pair; older pairs stay
-  /// allocated for the sessions that hold them.
+  /// allocated for the sessions that hold them. Plain device allocations:
+  /// wide attention rereads every row of the pair for each prompt pass, and
+  /// 2 MiB mapped chunks cost long prompts several percent.
   mutable __half* kv_half_k_{nullptr};
   mutable __half* kv_half_v_{nullptr};
   mutable std::size_t kv_half_elems_{0};
   mutable std::vector<void*> kv_half_allocations_;
+  /// Session K/V rows under Options::kv_budget.
+  std::unique_ptr<KvPool> kv_pool_;
+  /// Live sessions created here, for releasing the rows an idle session no
+  /// longer holds.
+  mutable std::mutex sessions_mutex_;
+  mutable std::vector<Session*> sessions_;
+  /// Releases backed K/V rows past what idle sessions hold until `want`
+  /// bytes are free or none are left. Returns the bytes released.
+  std::size_t ReleaseIdleKv(std::size_t want,
+                            std::span<Session* const> busy) const;
+  void Unregister(const Session* session) const;
   [[nodiscard]] Scratch RowScratch(const Scratch& base,
                                    std::uint32_t offset) const;
   void UseScratch(const Scratch& scratch) const;
