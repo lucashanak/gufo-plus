@@ -8,19 +8,27 @@ A fork of [Gufo](https://github.com/gufo-org/gufo) for AMD Strix Halo (`gfx1151`
 - **GGUF formats.** Every GGML block format opens and dequantizes; Flash-Next loads llama.cpp and Unsloth mixes (IQ1–IQ4, Q2_K–Q6_K, Q4_0/Q4_1/Q5_0/Q5_1, IQ4_NL, Q8_0) in decode, with WMMA prefill for the common expert formats.
 - **Flash-Next speed.** Faster prefill (routed experts, fused DeltaNet, 16,384-row passes, WMMA indexer), faster single-user and 8-session decode, confidence-gated MTP chains, and waits that do not spin a CPU core (on Strix Halo a busy core takes package power from the GPU).
 - **8-bit K/V that grows.** K/V rows in 8 bits with an F16 scale per 16 values, mapped in 2 MiB chunks as a session grows and capped by `--kv-cache-bytes`: 8 sessions × 262,144 tokens in a 20 GiB budget.
+- **BF16 HC inject fix.** Models that store the HC inject rows in BF16 (for example Swift 1.5 GGUFs) produced garbage for prompts of 96+ tokens; inject rows are now widened to F32 at load.
+- **Fine-tuned MTP head for Swift 1.5.** Swift ships the base model's MTP head; a head trained on Swift's own outputs raises draft acceptance by 4–6 points (+3–5 % decode) with byte-identical outputs.
 - **Serving.** `--reasoning-budget-fraction` (thinking budget as a share of `max_tokens`, with Qwen's wrap-up), model-chosen prefill budget beside active decoders, cache checkpoints that do not split long passes.
 - **Qwen3.6-35B-A3B / Ornith 1.5** (35B and 122B) with native MTP, history drafting and DFlash2 next to MTP.
 
 ## Results
 
-Qwen3.8 Flash-Next (v3 recipe + MTP, 8 sessions) on a 149-question quality suite: **IQ 95.3 in 1,420 s**, against 95.3 in 1,789 s for Halogen on the same machine.
+149-question quality suite on one Strix Halo, 8 sessions, MTP:
+
+| Model | IQ | Suite time | Tokens |
+| --- | ---: | ---: | ---: |
+| Swift 1.5 Qwen3.8 Flash-Next IQ4_XS + fine-tuned MTP head | 95.3 | **1,094 s** | 82,267 |
+| Qwen3.8 Flash-Next, v3 recipe | 95.3 | 1,420 s | 133,578 |
+| Halogen (closed source), same machine | 95.3 | 1,789 s | 136,589 |
 
 ## Upstream status
 
 | PR | Change | State |
 | --- | --- | --- |
 | [#882](https://github.com/gufo-org/gufo/pull/882) | Confidence-gated MTP chains | merged |
-| [#875](https://github.com/gufo-org/gufo/pull/875) | Prefill rows independent of the pass route | open |
+| [#875](https://github.com/gufo-org/gufo/pull/875) | Prefill rows independent of the pass route | merged |
 | [#876](https://github.com/gufo-org/gufo/pull/876) | Dense sweep of pre-budget rows in budget-crossing chains | open |
 | [#877](https://github.com/gufo-org/gufo/pull/877) | Four-token prefill alignment | open |
 | [#878](https://github.com/gufo-org/gufo/pull/878) | `--reasoning-budget-fraction` | open |
@@ -36,7 +44,7 @@ Qwen3.8 Flash-Next (v3 recipe + MTP, 8 sessions) on a 149-question quality suite
 | [#894](https://github.com/gufo-org/gufo/pull/894) | One-launch decode HC mixer | open |
 | [#895](https://github.com/gufo-org/gufo/pull/895) | Fused prefill DeltaNet | open |
 
-Building, running and model documentation are the same as upstream; the original README follows.
+Upstream 0.28.1 includes #875 and #882. Building, running and model documentation are the same as upstream; the original README follows.
 
 ---
 
