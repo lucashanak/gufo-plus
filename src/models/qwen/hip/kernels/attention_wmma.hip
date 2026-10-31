@@ -64,9 +64,11 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <type_traits>
 
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
+#include "src/models/qwen/hip/kernels/kv8.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 
 namespace gufo::hip {
@@ -600,9 +602,14 @@ __launch_bounds__(256, (__clang_major__ >= 24 && kHeadMajor) ? 6 : 2) __global__
 
 // FFN scratch is idle during attention. Keep K head-major and transpose each
 // 16-key V tile into the layout consumed by WMMA. Persistent KV is unchanged.
+// With Kv8, `keys`/`values` are the layer's first 8-bit rows and `first_head`
+// the group's first KV head; the packed layout holds the F16 values readers
+// see, so the attention kernel is the FP16 one.
+template<bool Kv8 = false>
 __global__ void PackAttentionHeads(const __half* keys, const __half* values,
                                    __half* packed_keys, __half* packed_values,
-                                   std::uint32_t length) {
+                                   std::uint32_t length,
+                                   std::uint32_t first_head = 0) {
   __shared__ __half tile[16][kHeadDim + 8];
   // Adjacent blocks read adjacent heads of the same source token tile.
   const std::uint32_t head = blockIdx.x, base = blockIdx.y * 16;
@@ -617,9 +624,23 @@ __global__ void PackAttentionHeads(const __half* keys, const __half* values,
       const auto dst =
           (static_cast<std::size_t>(head) * length + base + key) * kHeadDim +
           dim;
-      *reinterpret_cast<uint4*>(packed_keys + dst) =
-          *reinterpret_cast<const uint4*>(keys + src);
-      value = *reinterpret_cast<const uint4*>(values + src);
+      if constexpr (Kv8) {
+        constexpr std::uint32_t width = kKvHeads * kHeadDim;
+        const std::size_t row_offset =
+            static_cast<std::size_t>(base + key) * kv8::RowBytes(width);
+        const std::uint32_t in_row = (first_head + head) * kHeadDim + dim;
+        *reinterpret_cast<uint4*>(packed_keys + dst) = kv8::LoadHalf8(
+            reinterpret_cast<const std::uint8_t*>(keys) + row_offset, width,
+            in_row);
+        value = kv8::LoadHalf8(
+            reinterpret_cast<const std::uint8_t*>(values) + row_offset, width,
+            in_row);
+      } else {
+        (void)src;
+        *reinterpret_cast<uint4*>(packed_keys + dst) =
+            *reinterpret_cast<const uint4*>(keys + src);
+        value = *reinterpret_cast<const uint4*>(values + src);
+      }
     }
     *reinterpret_cast<uint4*>(&tile[key][dim]) = value;
   }
@@ -649,7 +670,7 @@ bool LaunchQwenWmmaAttention(
     std::uint32_t num_kv_heads, std::uint32_t head_dim, hipStream_t stream,
     float* lse_out, std::uint32_t key_begin, bool skip_kv_write,
     std::span<float> packed_k_workspace, std::span<float> packed_v_workspace,
-    std::size_t first_query) {
+    std::size_t first_query, bool kv8) {
   const detail::AttentionSupportParams support_params{
       .batch_size = batch_size,
       .start_pos = start_pos,
@@ -670,6 +691,57 @@ bool LaunchQwenWmmaAttention(
       static_cast<std::size_t>(layer_idx) * max_context * kKvWidth;
   auto* layer_k = static_cast<__half*>(k_cache_f16) + layer_cache_offset;
   auto* layer_v = static_cast<__half*>(v_cache_f16) + layer_cache_offset;
+
+  if (kv8) {
+    // 8-bit rows: store this chunk, then always attend over packed F16 heads.
+    if (!skip_kv_write)
+      LaunchStoreKv8(k, v, k_cache_f16, v_cache_f16, layer_idx, start_pos,
+                     nullptr, batch_size, max_context, kKvWidth, stream);
+    const std::size_t layer_row_offset = static_cast<std::size_t>(layer_idx) *
+                                         max_context * kv8::RowBytes(kKvWidth);
+    const auto* rows_k =
+        static_cast<const std::uint8_t*>(k_cache_f16) + layer_row_offset;
+    const auto* rows_v =
+        static_cast<const std::uint8_t*>(v_cache_f16) + layer_row_offset;
+    const auto length = start_pos + static_cast<std::uint32_t>(batch_size);
+    const std::size_t key_head_bytes =
+        static_cast<std::size_t>(length) * kHeadDim * sizeof(__half);
+    const std::size_t value_head_bytes =
+        ((static_cast<std::size_t>(length) + 15u) & ~std::size_t{15}) *
+        kHeadDim * sizeof(__half);
+    const auto heads_per_group = static_cast<std::uint32_t>(
+        std::min({std::size_t{kKvHeads},
+                  packed_k_workspace.size_bytes() / key_head_bytes,
+                  packed_v_workspace.size_bytes() / value_head_bytes}));
+    if (heads_per_group == 0 || key_begin >= length ||
+        key_begin % kWmmaKeys != 0)
+      throw std::invalid_argument(
+          "8-bit Qwen prefill attention needs packing workspace");
+    const dim3 grid(
+        static_cast<unsigned int>(
+            (batch_size - first_query + kWmmaQueryRows - 1) / kWmmaQueryRows),
+        kKvHeads * (kGqa / kWmmaHeads));
+    auto* packed_k = reinterpret_cast<__half*>(packed_k_workspace.data());
+    auto* packed_v = reinterpret_cast<__half*>(packed_v_workspace.data());
+    for (std::uint32_t first = 0; first < kKvHeads; first += heads_per_group) {
+      const auto heads = std::min(heads_per_group, kKvHeads - first);
+      const std::size_t query_offset =
+          static_cast<std::size_t>(first) * kGqa * kHeadDim;
+      PackAttentionHeads<true>
+          <<<dim3(heads, (length + 15u) / 16u), block_size, 0, stream>>>(
+              reinterpret_cast<const __half*>(rows_k),
+              reinterpret_cast<const __half*>(rows_v), packed_k, packed_v,
+              length, first);
+      const dim3 group_grid(grid.x, heads * (kGqa / kWmmaHeads));
+      WmmaCausalAttention<kWmmaQueryRows, kWmmaKeys, true>
+          <<<group_grid, block_size, 0, stream>>>(
+              q + query_offset, gate ? gate + query_offset : nullptr, packed_k,
+              packed_v, out_context + query_offset, start_pos, batch_size,
+              lse_out ? lse_out + first * kGqa * batch_size : nullptr,
+              key_begin, static_cast<std::uint32_t>(first_query));
+    }
+    return true;
+  }
 
   if (!skip_kv_write) {
     if (start_pos > 0 && k_cache != nullptr && v_cache != nullptr) {

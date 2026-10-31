@@ -6,11 +6,13 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/kernels/attention_decode_split_k.hpp"
 #include "src/models/qwen/hip/kernels/attention_decode_verify_wave64.hpp"
+#include "src/models/qwen/hip/kernels/kv8.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 
 namespace gufo::hip {
@@ -381,9 +383,10 @@ __launch_bounds__(32) __global__ void QwenDecodeOnlineAttentionKernel(
   }
 }
 
+template<bool Kv8 = false>
 __launch_bounds__(32) __global__ void QwenDecodeOnlineAttentionHalfKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
-    const __half* __restrict__ k_cache, const __half* __restrict__ v_cache,
+    const void* __restrict__ k_plane, const void* __restrict__ v_plane,
     float* __restrict__ out_context, std::uint32_t layer_idx, std::uint32_t pos,
     std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads) {
@@ -439,15 +442,33 @@ __launch_bounds__(32) __global__ void QwenDecodeOnlineAttentionHalfKernel(
       if (position + step >= sequence_length)
         break;
       const auto offset = cache_head_offset + ((position + step) * kv_width);
+      const auto* k_cache = static_cast<const __half*>(k_plane);
+      const auto* v_cache = static_cast<const __half*>(v_plane);
       const __half* key = k_cache + offset;
       const __half* value = v_cache + offset;
+      const std::size_t row =
+          static_cast<std::size_t>(layer_idx) * max_context + position + step;
       float score = 0.0F;
 #pragma unroll
       for (std::uint32_t vector = 0; vector < vectors_per_lane; ++vector) {
         const float4 query_value = query_values[vector];
         const auto element = (lane + (vector * 32)) * 4;
-        const float4 key_value = LoadHalf4(key + element);
-        values[step][vector] = LoadHalf4(value + element);
+        float4 key_value;
+        if constexpr (Kv8) {
+          const auto in_row = static_cast<std::uint32_t>(
+              kv_head * std::size_t{head_dim} + element);
+          key_value =
+              kv8::LoadFloat4(static_cast<const std::uint8_t*>(k_plane) +
+                                  row * kv8::RowBytes(kv_width),
+                              static_cast<std::uint32_t>(kv_width), in_row);
+          values[step][vector] =
+              kv8::LoadFloat4(static_cast<const std::uint8_t*>(v_plane) +
+                                  row * kv8::RowBytes(kv_width),
+                              static_cast<std::uint32_t>(kv_width), in_row);
+        } else {
+          key_value = LoadHalf4(key + element);
+          values[step][vector] = LoadHalf4(value + element);
+        }
         score += (query_value.x * key_value.x) + (query_value.y * key_value.y) +
                  (query_value.z * key_value.z) + (query_value.w * key_value.w);
       }
@@ -612,7 +633,7 @@ __launch_bounds__(32) __global__ void QwenDecodeSplitKAttentionPartialsKernel(
   }
 }
 
-template<bool ShareKv = false, unsigned Lanes = 32>
+template<bool ShareKv = false, unsigned Lanes = 32, bool Kv8 = false>
 __launch_bounds__(ShareKv ? 6 * Lanes : 32) __global__
     void QwenDecodeSplitKAttentionHalfPartialsKernel(
         const float* __restrict__ q, const __half* __restrict__ k_cache,
@@ -621,6 +642,8 @@ __launch_bounds__(ShareKv ? 6 * Lanes : 32) __global__
         std::uint32_t num_heads, std::uint32_t num_kv_heads,
         std::uint32_t split_count) {
   static_assert(Lanes == 32 || (ShareKv && Lanes == 16));
+  // 8-bit rows dequantize while they are staged.
+  static_assert(!Kv8 || ShareKv);
   // Per-head arithmetic is shared with the wave64 verification kernel.
   using Head = detail::SplitKAttentionHead<Lanes, false>;
   constexpr std::uint32_t head_dim = Head::kHeadDim;
@@ -679,12 +702,28 @@ __launch_bounds__(ShareKv ? 6 * Lanes : 32) __global__
            vector += heads_per_block * Lanes) {
         const unsigned token = vector / 32;
         const unsigned dim = (vector % 32) * 8;
-        const std::size_t offset =
-            cache_head_offset + (begin + token) * kv_width + dim;
-        *reinterpret_cast<uint4*>(keys[token] + dim) =
-            *reinterpret_cast<const uint4*>(k_cache + offset);
-        *reinterpret_cast<uint4*>(values[token] + dim) =
-            *reinterpret_cast<const uint4*>(v_cache + offset);
+        if constexpr (Kv8) {
+          const std::size_t row =
+              static_cast<std::size_t>(layer_idx) * max_context + begin + token;
+          const auto in_row =
+              static_cast<std::uint32_t>(kv_head * std::size_t{head_dim} + dim);
+          const auto width = static_cast<std::uint32_t>(kv_width);
+          *reinterpret_cast<uint4*>(keys[token] + dim) =
+              kv8::LoadHalf8(reinterpret_cast<const std::uint8_t*>(k_cache) +
+                                 row * kv8::RowBytes(kv_width),
+                             width, in_row);
+          *reinterpret_cast<uint4*>(values[token] + dim) =
+              kv8::LoadHalf8(reinterpret_cast<const std::uint8_t*>(v_cache) +
+                                 row * kv8::RowBytes(kv_width),
+                             width, in_row);
+        } else {
+          const std::size_t offset =
+              cache_head_offset + (begin + token) * kv_width + dim;
+          *reinterpret_cast<uint4*>(keys[token] + dim) =
+              *reinterpret_cast<const uint4*>(k_cache + offset);
+          *reinterpret_cast<uint4*>(values[token] + dim) =
+              *reinterpret_cast<const uint4*>(v_cache + offset);
+        }
       }
       __syncthreads();
 #pragma unroll 1
@@ -786,7 +825,30 @@ static void LaunchSplitKAttentionHalfPartials(
     const float* q, const __half* k_cache, const __half* v_cache,
     float* scratch, std::uint32_t layer_idx, std::uint32_t start_pos,
     unsigned rows, std::uint32_t max_context, std::uint32_t num_heads,
-    std::uint32_t num_kv_heads, std::uint32_t splits, hipStream_t stream) {
+    std::uint32_t num_kv_heads, std::uint32_t splits, hipStream_t stream,
+    bool kv8 = false) {
+  if (kv8) {
+    // 8-bit rows always take the staged kernels, at every depth.
+    if (num_heads != 6 * num_kv_heads)
+      throw std::invalid_argument(
+          "8-bit Qwen K/V needs six query heads per KV head");
+    if (rows > 1 && num_kv_heads % 2 == 0) {
+      detail::LaunchVerifySplitKAttentionHalfPartialsWave64(
+          q, k_cache, v_cache, scratch, layer_idx, start_pos, rows, max_context,
+          num_heads, num_kv_heads, splits, stream, true);
+    } else if (rows > 1) {
+      QwenDecodeSplitKAttentionHalfPartialsKernel<true, 16, true>
+          <<<dim3(num_kv_heads, rows, splits), 96, 0, stream>>>(
+              q, k_cache, v_cache, scratch, layer_idx, start_pos, max_context,
+              num_heads, num_kv_heads, splits);
+    } else {
+      QwenDecodeSplitKAttentionHalfPartialsKernel<true, 32, true>
+          <<<dim3(num_kv_heads, rows, splits), 192, 0, stream>>>(
+              q, k_cache, v_cache, scratch, layer_idx, start_pos, max_context,
+              num_heads, num_kv_heads, splits);
+    }
+    return;
+  }
   // Share each KV tile across its six query heads in both scalar decoding
   // and verification. Rows retain independent causal endpoints and scratch.
   if (num_heads == 6 * num_kv_heads &&
@@ -822,7 +884,36 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                      std::uint32_t max_context, std::uint32_t num_heads,
                      std::uint32_t num_kv_heads, std::uint32_t head_dim,
                      hipStream_t stream, float* split_k_scratch,
-                     bool skip_kv_write) {
+                     bool skip_kv_write, bool kv8) {
+  if (kv8) {
+    // 8-bit rows: store, then split-K at any depth with scratch, else the
+    // online kernel.
+    if (!skip_kv_write)
+      LaunchStoreKv8(k, v, k_cache_f16, v_cache_f16, layer_idx, pos, nullptr, 1,
+                     max_context, num_kv_heads * head_dim, stream);
+    const std::size_t length = static_cast<std::size_t>(pos) + 1;
+    if (head_dim != 256 || num_kv_heads == 0 || num_heads % num_kv_heads != 0)
+      throw std::invalid_argument("8-bit Qwen K/V needs 256-wide GQA heads");
+    if (split_k_scratch != nullptr &&
+        length >= detail::kSplitKDecodeAttentionMinContext) {
+      const std::uint32_t split_count =
+          detail::SelectDecodeAttentionSplitCount(length);
+      detail::EmitAttentionDispatch("decode_split_k_kv8", "");
+      LaunchSplitKAttentionHalfPartials(
+          q, static_cast<const __half*>(k_cache_f16),
+          static_cast<const __half*>(v_cache_f16), split_k_scratch, layer_idx,
+          pos, 1, max_context, num_heads, num_kv_heads, split_count, stream,
+          true);
+      QwenDecodeSplitKAttentionReduceKernel<<<num_heads, 32, 0, stream>>>(
+          gate, split_k_scratch, out_context, num_heads, split_count);
+    } else {
+      detail::EmitAttentionDispatch("decode_online_kv8", "");
+      QwenDecodeOnlineAttentionHalfKernel<true><<<num_heads, 32, 0, stream>>>(
+          q, gate, k_cache_f16, v_cache_f16, out_context, layer_idx, pos,
+          max_context, num_heads, num_kv_heads);
+    }
+    return;
+  }
   // 1. Write K and V into every non-null selected KV representation across all
   // num_kv_heads. May be skipped when a fused kernel already wrote the cache
   // (opt-c010-qk-rope-kv).
@@ -904,11 +995,36 @@ void LaunchCausalDecodeAttention(
     std::uint32_t layer_idx, std::uint32_t start_pos, std::size_t batch_size,
     std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim, hipStream_t stream,
-    std::span<float> scratch) {
+    std::span<float> scratch, bool kv8) {
   const std::size_t row_scratch =
       detail::DecodeAttentionScratchElements(num_heads, head_dim);
   float* const split_k_scratch =
       scratch.size() >= row_scratch ? scratch.data() : nullptr;
+  if (kv8 && batch_size > 1 && scratch.size() / batch_size >= row_scratch &&
+      split_k_scratch != nullptr &&
+      static_cast<std::size_t>(start_pos) + 1 >=
+          detail::kSplitKDecodeAttentionMinContext &&
+      head_dim == 256 && num_heads == 6 * num_kv_heads) {
+    const auto splits = detail::SelectDecodeAttentionSplitCount(
+        static_cast<std::size_t>(start_pos) + 1);
+    LaunchSplitKAttentionHalfPartials(
+        q, static_cast<const __half*>(k_cache_f16),
+        static_cast<const __half*>(v_cache_f16), split_k_scratch, layer_idx,
+        start_pos, static_cast<unsigned>(batch_size), max_context, num_heads,
+        num_kv_heads, splits, stream, true);
+    QwenDecodeSplitKAttentionReduceKernel<<<
+        dim3(num_heads, static_cast<unsigned>(batch_size)), 32, 0, stream>>>(
+        gate, split_k_scratch, out_context, num_heads, splits);
+    return;
+  }
+  if (kv8 && batch_size > 1 && head_dim == 256 && num_kv_heads > 0 &&
+      num_heads % num_kv_heads == 0) {
+    const dim3 grid(num_heads, static_cast<unsigned>(batch_size));
+    QwenDecodeOnlineAttentionHalfKernel<true><<<grid, 32, 0, stream>>>(
+        q, gate, k_cache_f16, v_cache_f16, out_context, layer_idx, start_pos,
+        max_context, num_heads, num_kv_heads);
+    return;
+  }
   if (batch_size > 1 && scratch.size() / batch_size >= row_scratch &&
       split_k_scratch != nullptr &&
       detail::IsSplitKDecodeAttentionSupported(
@@ -964,7 +1080,7 @@ void LaunchCausalDecodeAttention(
         gate == nullptr ? nullptr : gate + row * width, k_cache, v_cache,
         k_cache_f16, v_cache_f16, out_context + row * width, layer_idx,
         start_pos + static_cast<std::uint32_t>(row), max_context, num_heads,
-        num_kv_heads, head_dim, stream, split_k_scratch, true);
+        num_kv_heads, head_dim, stream, split_k_scratch, true, kv8);
   }
 }
 

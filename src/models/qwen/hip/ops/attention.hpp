@@ -25,7 +25,9 @@ void LaunchFusedQKVProjections(const void* q_w, core::GgmlType q_type,
                                hipStream_t stream = nullptr);
 
 /// Computes Grouped-Query Softmax Attention with KV-cache and optional gating
-/// on GPU. Production supplies canonical FP16 K/V; the independent validation
+/// on GPU. With `kv8` the token-major planes hold 8-bit rows
+/// (kernels/kv8.hpp) and the FP32 planes must be null. Production supplies
+/// canonical FP16 K/V; the independent validation
 /// fallback supplies FP32 K/V. Tests may supply both representations. When
 /// skip_kv_write is true the selected KV cache is assumed already written
 /// (e.g. by the fused QK norm+RoPE kernel, opt-c010-qk-rope-kv).
@@ -37,7 +39,7 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                      std::uint32_t num_kv_heads, std::uint32_t head_dim,
                      hipStream_t stream = nullptr,
                      float* split_k_scratch = nullptr,
-                     bool skip_kv_write = false);
+                     bool skip_kv_write = false, bool kv8 = false);
 
 /// Runs consecutive verification queries with scalar decode arithmetic.
 /// The selected KV cache must already contain all rows. Each row sees only
@@ -50,7 +52,8 @@ void LaunchCausalDecodeAttention(
     std::uint32_t layer_idx, std::uint32_t start_pos, std::size_t batch_size,
     std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim,
-    hipStream_t stream = nullptr, std::span<float> split_k_scratch = {});
+    hipStream_t stream = nullptr, std::span<float> split_k_scratch = {},
+    bool kv8 = false);
 
 /// Computes Grouped-Query Softmax Attention reading position from device memory
 void LaunchAttention(const float* q, const float* k, const float* v,
@@ -59,7 +62,8 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                      std::uint32_t layer_idx, const std::uint32_t* d_pos,
                      std::uint32_t max_context, std::uint32_t num_heads,
                      std::uint32_t num_kv_heads, std::uint32_t head_dim,
-                     hipStream_t stream = nullptr, bool skip_kv_write = false);
+                     hipStream_t stream = nullptr, bool skip_kv_write = false,
+                     bool kv8 = false);
 
 /// Fuses per-head Q/K RMSNorm, RoPE, and the KV-cache write for a single decode
 /// token into one launch (opt-c010-qk-rope-kv). Writes the normed+roped Q into
@@ -74,7 +78,7 @@ void LaunchFusedQKNormRoPEKvWrite(
     std::uint32_t num_kv_heads, std::uint32_t head_dim,
     std::uint32_t rotary_dim, float rope_theta, float eps = 1e-6F,
     hipStream_t stream = nullptr,
-    const models::qwen::vision::DeviceRope* rope = nullptr);
+    const models::qwen::vision::DeviceRope* rope = nullptr, bool kv8 = false);
 
 /// Batched Causal Attention for B tokens with KV Cache. When skip_kv_write is
 /// true the KV cache is assumed already written by the fused prefill kernel
@@ -106,7 +110,7 @@ void LaunchBatchedFusedQKNormRoPEKvWrite(
     std::uint32_t num_kv_heads, std::uint32_t head_dim,
     std::uint32_t rotary_dim, float rope_theta, float eps = 1e-6F,
     hipStream_t stream = nullptr,
-    const models::qwen::vision::DeviceRope* rope = nullptr);
+    const models::qwen::vision::DeviceRope* rope = nullptr, bool kv8 = false);
 
 /// Qwen3.8-specific causal GQA tile for gfx1151. The kernel processes 16 query
 /// positions and two query heads per block while reusing one FP16 K/V tile.
@@ -145,7 +149,17 @@ void LaunchBatchedFusedQKNormRoPEKvWrite(
     hipStream_t stream = nullptr, float* lse_out = nullptr,
     std::uint32_t key_begin = 0, bool skip_kv_write = false,
     std::span<float> packed_k_workspace = {},
-    std::span<float> packed_v_workspace = {}, std::size_t first_query = 0);
+    std::span<float> packed_v_workspace = {}, std::size_t first_query = 0,
+    bool kv8 = false);
+
+/// Writes rows of F32 K and V (`rows` x `width`, normed and roped) into the
+/// 8-bit planes at positions start_pos.. (or *d_pos.. when d_pos is
+/// non-null). See kernels/kv8.hpp for the row format.
+void LaunchStoreKv8(const float* k, const float* v, void* k_plane,
+                    void* v_plane, std::uint32_t layer_idx,
+                    std::uint32_t start_pos, const std::uint32_t* d_pos,
+                    std::size_t rows, std::uint32_t max_context,
+                    std::uint32_t width, hipStream_t stream = nullptr);
 
 /// Large-batch causal attention using float32 QK/PV GEMMs and one reusable
 /// [batch, context] score buffer.

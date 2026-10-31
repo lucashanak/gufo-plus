@@ -5,8 +5,10 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
+#include "src/models/qwen/hip/kernels/kv8.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 
 namespace gufo::hip {
@@ -159,9 +161,10 @@ __launch_bounds__(32) __global__ void QwenDecodeOnlineAttentionPtrKernel(
   }
 }
 
+template<bool Kv8 = false>
 __launch_bounds__(32) __global__ void QwenDecodeOnlineAttentionHalfPtrKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
-    const __half* __restrict__ k_cache, const __half* __restrict__ v_cache,
+    const void* __restrict__ k_plane, const void* __restrict__ v_plane,
     float* __restrict__ out_context, std::uint32_t layer_idx,
     const std::uint32_t* __restrict__ d_pos, std::uint32_t max_context,
     std::uint32_t num_heads, std::uint32_t num_kv_heads) {
@@ -209,15 +212,31 @@ __launch_bounds__(32) __global__ void QwenDecodeOnlineAttentionHalfPtrKernel(
       if (position + step >= sequence_length)
         break;
       const auto offset = cache_head_offset + ((position + step) * kv_width);
-      const __half* key = k_cache + offset;
-      const __half* value = v_cache + offset;
+      const __half* key = static_cast<const __half*>(k_plane) + offset;
+      const __half* value = static_cast<const __half*>(v_plane) + offset;
+      const std::size_t row =
+          static_cast<std::size_t>(layer_idx) * max_context + position + step;
       float score = 0.0F;
 #pragma unroll
       for (std::uint32_t vector = 0; vector < vectors_per_lane; ++vector) {
         const float4 query_value = query_values[vector];
         const auto element = (lane + (vector * 32)) * 4;
-        const float4 key_value = LoadGraphHalf4(key + element);
-        values[step][vector] = LoadGraphHalf4(value + element);
+        float4 key_value;
+        if constexpr (Kv8) {
+          const auto in_row = static_cast<std::uint32_t>(
+              kv_head * std::size_t{head_dim} + element);
+          key_value =
+              kv8::LoadFloat4(static_cast<const std::uint8_t*>(k_plane) +
+                                  row * kv8::RowBytes(kv_width),
+                              static_cast<std::uint32_t>(kv_width), in_row);
+          values[step][vector] =
+              kv8::LoadFloat4(static_cast<const std::uint8_t*>(v_plane) +
+                                  row * kv8::RowBytes(kv_width),
+                              static_cast<std::uint32_t>(kv_width), in_row);
+        } else {
+          key_value = LoadGraphHalf4(key + element);
+          values[step][vector] = LoadGraphHalf4(value + element);
+        }
         score += (query_value.x * key_value.x) + (query_value.y * key_value.y) +
                  (query_value.z * key_value.z) + (query_value.w * key_value.w);
       }
@@ -297,7 +316,19 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                      std::uint32_t layer_idx, const std::uint32_t* d_pos,
                      std::uint32_t max_context, std::uint32_t num_heads,
                      std::uint32_t num_kv_heads, std::uint32_t head_dim,
-                     hipStream_t stream, bool skip_kv_write) {
+                     hipStream_t stream, bool skip_kv_write, bool kv8) {
+  if (kv8) {
+    if (!skip_kv_write)
+      LaunchStoreKv8(k, v, k_cache_f16, v_cache_f16, layer_idx, 0, d_pos, 1,
+                     max_context, num_kv_heads * head_dim, stream);
+    if (head_dim != 256 || num_kv_heads == 0 || num_heads % num_kv_heads != 0)
+      throw std::invalid_argument("8-bit Qwen K/V needs 256-wide GQA heads");
+    detail::EmitAttentionDispatch("decode_online_kv8_graph", "");
+    QwenDecodeOnlineAttentionHalfPtrKernel<true><<<num_heads, 32, 0, stream>>>(
+        q, gate, k_cache_f16, v_cache_f16, out_context, layer_idx, d_pos,
+        max_context, num_heads, num_kv_heads);
+    return;
+  }
   if (!skip_kv_write) {
     WriteKVCachePtrKernel<<<num_kv_heads, 256, 0, stream>>>(
         k, v, k_cache, v_cache, static_cast<__half*>(k_cache_f16),

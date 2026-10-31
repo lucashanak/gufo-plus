@@ -9,6 +9,9 @@ namespace gufo::hip {
 enum class QwenKvCacheStorage : std::uint8_t {
   kFp32,
   kFp16,
+  /// Token-major like kFp16, a row of `width` int8 codes then width / 16 F16
+  /// scales (kernels/kv8.hpp).
+  kQ8,
 };
 
 enum class QwenRecurrentStateStorage : std::uint8_t {
@@ -39,8 +42,22 @@ struct QwenExecutionPolicy {
     return {};
   }
 
-  [[nodiscard]] constexpr bool UsesFp16AttentionKv() const noexcept {
-    return kv_cache_storage == QwenKvCacheStorage::kFp16;
+  /// The canonical token-major plane (FP16 or 8-bit); otherwise the FP32
+  /// head-major reference plane.
+  [[nodiscard]] constexpr bool UsesTokenMajorAttentionKv() const noexcept {
+    return kv_cache_storage == QwenKvCacheStorage::kFp16 ||
+           kv_cache_storage == QwenKvCacheStorage::kQ8;
+  }
+  [[nodiscard]] constexpr bool UsesQ8AttentionKv() const noexcept {
+    return kv_cache_storage == QwenKvCacheStorage::kQ8;
+  }
+  /// Bytes of one position's K (or V) across all KV heads of a layer.
+  [[nodiscard]] constexpr std::size_t AttentionKvRowBytes(
+      std::size_t width) const noexcept {
+    return kv_cache_storage == QwenKvCacheStorage::kQ8
+               ? width + width / 16 * 2
+               : width *
+                     (kv_cache_storage == QwenKvCacheStorage::kFp16 ? 2U : 4U);
   }
 
   [[nodiscard]] constexpr bool UsesBf16RecurrentState() const noexcept {
@@ -50,8 +67,9 @@ struct QwenExecutionPolicy {
   /// Stable bit fingerprint suitable for telemetry and graph-cache identity.
   [[nodiscard]] constexpr std::uint64_t Fingerprint() const noexcept {
     return (static_cast<std::uint64_t>(fuse_qk_norm_rope_kv) << 0U) |
-           (static_cast<std::uint64_t>(UsesFp16AttentionKv()) << 8U) |
-           (static_cast<std::uint64_t>(UsesBf16RecurrentState()) << 9U);
+           (static_cast<std::uint64_t>(UsesTokenMajorAttentionKv()) << 8U) |
+           (static_cast<std::uint64_t>(UsesBf16RecurrentState()) << 9U) |
+           (static_cast<std::uint64_t>(UsesQ8AttentionKv()) << 10U);
   }
 };
 

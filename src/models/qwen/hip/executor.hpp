@@ -347,6 +347,22 @@ public:
   [[nodiscard]] std::uint32_t GetMaxContext() const noexcept {
     return max_context_;
   }
+  /// Token-major K and V planes (FP16 or 8-bit rows), or null.
+  [[nodiscard]] void* KvKeyPlane() const noexcept { return d_attention_kv_f16; }
+  [[nodiscard]] void* KvValuePlane() const noexcept {
+    return d_attention_kv_f16 == nullptr
+               ? nullptr
+               : static_cast<std::uint8_t*>(d_attention_kv_f16) +
+                     static_cast<std::size_t>(
+                         config_.FullAttentionLayerCount()) *
+                         max_context_ *
+                         policy_.AttentionKvRowBytes(
+                             std::size_t{config_.num_key_value_heads} *
+                             config_.head_dim);
+  }
+  [[nodiscard]] bool UsesKv8() const noexcept {
+    return policy_.UsesQ8AttentionKv();
+  }
   [[nodiscard]] std::size_t GetAttentionKvPlaneElements() const noexcept {
     // Qwen27B reaches 2^32 elements per plane at context 262144.
     return static_cast<std::size_t>(config_.FullAttentionLayerCount()) *

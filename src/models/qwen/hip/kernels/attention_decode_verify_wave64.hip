@@ -9,6 +9,7 @@
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/kernels/attention_decode_split_k.hpp"
 #include "src/models/qwen/hip/kernels/attention_decode_verify_wave64.hpp"
+#include "src/models/qwen/hip/kernels/kv8.hpp"
 
 namespace gufo::hip::detail {
 namespace {
@@ -18,6 +19,7 @@ namespace {
 // arithmetic and scratch layout are SplitKAttentionHead's, as in
 // QwenDecodeSplitKAttentionHalfPartialsKernel<true, 16>; the score tree
 // runs on DPP row exchanges because a 16-lane head is one DPP row.
+template<bool Kv8>
 __launch_bounds__(192) __global__
     void QwenVerifySplitKAttentionHalfPartialsWave64Kernel(
         const float* __restrict__ q, const __half* __restrict__ k_cache,
@@ -90,10 +92,26 @@ __launch_bounds__(192) __global__
       __half* key_slot = keys[element / head_dim][token] + (element % head_dim);
       __half* value_slot =
           values[element / head_dim][token] + (element % head_dim);
-      *reinterpret_cast<uint4*>(key_slot) =
-          *reinterpret_cast<const uint4*>(key_tile + offset);
-      *reinterpret_cast<uint4*>(value_slot) =
-          *reinterpret_cast<const uint4*>(value_tile + offset);
+      if constexpr (Kv8) {
+        const std::size_t row =
+            static_cast<std::size_t>(layer_idx) * max_context + begin + token;
+        const auto in_row = static_cast<std::uint32_t>(
+            blockIdx.x * kv_heads_per_block * head_dim + element);
+        const auto width = static_cast<std::uint32_t>(kv_width);
+        *reinterpret_cast<uint4*>(key_slot) =
+            kv8::LoadHalf8(reinterpret_cast<const std::uint8_t*>(k_cache) +
+                               row * kv8::RowBytes(kv_width),
+                           width, in_row);
+        *reinterpret_cast<uint4*>(value_slot) =
+            kv8::LoadHalf8(reinterpret_cast<const std::uint8_t*>(v_cache) +
+                               row * kv8::RowBytes(kv_width),
+                           width, in_row);
+      } else {
+        *reinterpret_cast<uint4*>(key_slot) =
+            *reinterpret_cast<const uint4*>(key_tile + offset);
+        *reinterpret_cast<uint4*>(value_slot) =
+            *reinterpret_cast<const uint4*>(value_tile + offset);
+      }
     }
     __syncthreads();
 #pragma unroll 1
@@ -111,14 +129,22 @@ void LaunchVerifySplitKAttentionHalfPartialsWave64(
     const float* q, const __half* k_cache, const __half* v_cache,
     float* scratch, std::uint32_t layer_idx, std::uint32_t start_pos,
     unsigned rows, std::uint32_t max_context, std::uint32_t num_heads,
-    std::uint32_t num_kv_heads, std::uint32_t splits, hipStream_t stream) {
+    std::uint32_t num_kv_heads, std::uint32_t splits, hipStream_t stream,
+    bool kv8) {
   assert(num_kv_heads % 2 == 0 && "wave64 verification pairs KV heads");
   assert(num_heads == 6 * num_kv_heads && "twelve query heads per block");
   assert(rows > 1 && "single rows keep the 32-lane kernel");
-  QwenVerifySplitKAttentionHalfPartialsWave64Kernel<<<
-      dim3(num_kv_heads / 2, rows, splits), 192, 0, stream>>>(
-      q, k_cache, v_cache, scratch, layer_idx, start_pos, max_context,
-      num_heads, num_kv_heads, splits);
+  const dim3 grid(num_kv_heads / 2, rows, splits);
+  if (kv8)
+    QwenVerifySplitKAttentionHalfPartialsWave64Kernel<true>
+        <<<grid, 192, 0, stream>>>(q, k_cache, v_cache, scratch, layer_idx,
+                                   start_pos, max_context, num_heads,
+                                   num_kv_heads, splits);
+  else
+    QwenVerifySplitKAttentionHalfPartialsWave64Kernel<false>
+        <<<grid, 192, 0, stream>>>(q, k_cache, v_cache, scratch, layer_idx,
+                                   start_pos, max_context, num_heads,
+                                   num_kv_heads, splits);
 }
 
 }  // namespace gufo::hip::detail

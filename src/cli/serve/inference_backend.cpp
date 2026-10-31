@@ -410,7 +410,7 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
         "Qwen DFlash disk cache requires a draft artifact fingerprint");
   }
   const std::string_view state_abi =
-      QwenStateAbi(speculative, execution_policy.UsesFp16AttentionKv(),
+      QwenStateAbi(speculative, execution_policy.UsesTokenMajorAttentionKv(),
                    execution_policy.UsesBf16RecurrentState());
   std::ostringstream identity;
   identity << "schema=gufo-text-continuation-v2\n"
@@ -421,7 +421,9 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
            << "chat_template=qwen38-reasoning-compiled-v3\n"
            << "chat_template_reference_sha256="
            << tokenization::QwenChatTemplate::OfficialTemplateSha256() << '\n'
-           << "state_abi=" << state_abi << "-component-v2\n"
+           << "state_abi=" << state_abi
+           << (execution_policy.UsesQ8AttentionKv() ? "-kv8" : "")
+           << "-component-v2\n"
            << "payload_layout=qwen-component-v2\n"
            // Older learned boundaries could keep logits from an earlier
            // prefix. Their payload has no readiness tag to distinguish them.
@@ -434,7 +436,10 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
            << "attention_split_count="
            << hip::detail::kSplitKDecodeAttentionMaxSplits << '\n'
            << "kv_storage="
-           << (execution_policy.UsesFp16AttentionKv() ? "fp16" : "fp32") << '\n'
+           << (execution_policy.UsesQ8AttentionKv()           ? "q8-block16-f16"
+               : execution_policy.UsesTokenMajorAttentionKv() ? "fp16"
+                                                              : "fp32")
+           << '\n'
            << "recurrent_storage="
            << (execution_policy.UsesBf16RecurrentState() ? "bf16" : "fp32")
            << '\n'
@@ -1119,6 +1124,15 @@ std::unique_ptr<ComponentCacheResources> CreateHipComponentCacheResources(
   return result;
 }
 
+// GUFO_QWEN_KV8=1 keeps the 27B's attention K/V in 8-bit rows.
+hip::QwenExecutionPolicy QwenServingPolicy() {
+  auto policy = hip::QwenExecutionPolicy::Production();
+  const char* kv8 = std::getenv("GUFO_QWEN_KV8");
+  if (kv8 != nullptr && std::string_view(kv8) == "1")
+    policy.kv_cache_storage = hip::QwenKvCacheStorage::kQ8;
+  return policy;
+}
+
 class QwenTextRunner final : public HipTextModelRunner {
 public:
   sampling::JsonConstraint::ToolFormat ToolFormat() const override {
@@ -1135,7 +1149,7 @@ public:
         dflash_model_(std::move(dflash_model)),
         max_context_(max_context),
         speculative_options_(speculative_options),
-        execution_policy_(hip::QwenExecutionPolicy::Production()),
+        execution_policy_(QwenServingPolicy()),
         kv_session_count_(std::max<std::size_t>(session_count, 1)) {
     // Sessions back attention rows as they hold them, under one budget. The
     // address arena (64 sessions' full planes) is reserved before any
@@ -1218,11 +1232,12 @@ public:
     const bool speculative_enabled = dflash_model_ != nullptr;
     return {
         .model_id = model_->GetConfig().model_name,
-        .state_abi =
-            std::string(QwenStateAbi(
-                speculative_enabled, execution_policy_.UsesFp16AttentionKv(),
-                execution_policy_.UsesBf16RecurrentState())) +
-            "-component-v2",
+        .state_abi = std::string(QwenStateAbi(
+                         speculative_enabled,
+                         execution_policy_.UsesTokenMajorAttentionKv(),
+                         execution_policy_.UsesBf16RecurrentState())) +
+                     (execution_policy_.UsesQ8AttentionKv() ? "-kv8" : "") +
+                     "-component-v2",
         .max_context = max_context_,
         .capabilities =
             TextRunnerCapabilities{
@@ -1253,9 +1268,8 @@ public:
       const auto& c = model_->GetConfig();
       const std::size_t full_kv = hip::QwenGrowableKv::FullBytes(
           2 * std::size_t{c.FullAttentionLayerCount()},
-          std::size_t{c.num_key_value_heads} * c.head_dim *
-              (execution_policy_.UsesFp16AttentionKv() ? sizeof(std::uint16_t)
-                                                       : sizeof(float)),
+          execution_policy_.AttentionKvRowBytes(
+              std::size_t{c.num_key_value_heads} * c.head_dim),
           max_context_);
       const std::size_t share = kv_sessions_->budget() / kv_session_count_;
       usage.request_state_bytes = usage.request_state_bytes -
