@@ -111,3 +111,35 @@ prefill copies of the Q6_K matrices and the 8-bit K/V decode copy.
 <!-- /bench -->
 
 ![Memory occupation](artifacts/charts/memory.svg)
+
+## Growing K/V rows
+
+Ornith-1.5 Q6dense (35B with the DFlash2 draft, and 122B), HTTP, greedy,
+thinking off, October 31, 2026, shared host. Prod is the preallocating build
+(`06e97015`); the candidate grows K/V rows in 2 MiB chunks. GTT is
+`mem_info_gtt_used` at readiness and its peak over the run.
+
+| 35B, 8 × 262144 | Prod | Growing | Change |
+| --- | ---: | ---: | ---: |
+| GTT at readiness (GiB) | 55.90 | 30.65 | −25.3 GiB |
+| Greedy, 6 prompts | | identical | |
+| C1 / C4 / C8 aggregate (tok/s), two rounds | 78.7, 86.5 / 142.3, 129.8 / 161.7, 164.2 | 78.3, 86.0 / 138.2, 130.7 / 165.3, 162.9 | noise |
+| pp 30,621 (tok/s) | 1,968 | 1,961 | −0.4% |
+| pp 168,046 (s), prod twice | 227.3, 227.6 | 229.9 | +1.1% |
+| Decode at 93K (tok/s), prod twice | 54.4, 54.0 | 54.1 | 0% |
+| Needles 56K / 112K / 187K | 3/3 | 3/3 | |
+
+With `--kv-cache-bytes 12 GiB`, eight concurrent 93K-token needles answered
+8/8 and GTT peaked at 40.5 GiB (13.8 KiB per held token, staging and chunk
+rounding included); greedy output afterwards was still identical.
+
+| 122B | Prod 4 × 65536 | Growing 4 × 65536 | Growing 8 × 262144, cap 16 GiB |
+| --- | ---: | ---: | ---: |
+| GTT at readiness (GiB) | 83.08 | 79.42 | 80.36 |
+| Greedy, 6 prompts | | identical | identical |
+| C1 / C4 / C8 aggregate (tok/s), mean of two | 33.6 / 48.6 / 49.3 | 33.8 / 49.1 / 51.8 | 31.6 / 49.0 / 59.5 |
+| pp 30,620 (tok/s) | 716 | 728 | |
+| Needles 56K / 112K / 187K, then 4 × 56K concurrent | | | 7/7, GTT peak 89.8 |
+
+At 89.8 GiB GTT the host kept 17 GB available; a 6 GiB cap keeps the 122B
+below about 88 GiB.

@@ -36,11 +36,17 @@ defaults follow the model card (thinking: temperature 1.0, top-p 0.95; off:
 0.7, 0.8; top-k 20 and presence penalty 1.5 in both). Native context is 262144;
 YaRN extension is unsupported.
 
-Memory: weights take about 22.5 GiB. Each full-attention layer keeps an F16
-K/V cache for prefill and an 8-bit copy for decode, about 31 KiB per token
-over the ten trunk layers (34 KiB with the MTP block); recurrent state is fixed
-per session. One 256K-token MTP session needs about 33 GiB; admission reserves
-the configured capacity before creating sessions.
+Memory: weights take about 22.5 GiB. Each full-attention layer keeps an 8-bit
+K/V cache with one F16 scale per 16 values, about 12.4 KiB per token over the
+ten trunk layers and the MTP block; an executor-wide F16 staging pair sized to
+the longest session (512 MiB at 262144) serves prefill attention. Recurrent
+state is fixed per session. K/V rows are not preallocated: each session maps
+2 MiB chunks as its tokens arrive, so readiness costs the same at any
+`--context`. `--kv-cache-bytes N` caps the mapped rows across sessions (0, the
+default, lets every session grow to its full context); a session that would
+pass it first takes rows idle sessions no longer hold, otherwise the request
+fails with "K/V memory exhausted". Admission claims fixed state plus an equal
+share of the cap per session.
 
 ## Producing Q6dense
 
@@ -65,6 +71,7 @@ Lower dense precision (Q5_K) gave no speed gain; see
 Model tests are in `tests/models/qwen36_35b_a3b`: CPU metadata checks, HIP
 operator tests against FP64 references, and the full-model `session_test` /
 `snapshot_test` (MTP versus AR, batching, rollback, prefill chunking, cache
-replay). `reference_probe` runs the CPU oracle; `gpu_probe` times single and
+replay) and `growable_kv_test` (growing K/V rows against pregrown sessions
+across chunk boundaries, restore, cancellation, batching and the cap). `reference_probe` runs the CPU oracle; `gpu_probe` times single and
 multi-stream decoding. Retained result summaries belong in `artifacts/`;
 generated traces stay in the ignored top-level `artifacts/` tree.
