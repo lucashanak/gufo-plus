@@ -15,6 +15,13 @@ A fork of [Gufo](https://github.com/gufo-org/gufo) for AMD Strix Halo (`gfx1151`
 
 ## Results
 
+149-question quality suite on one Strix Halo, 8 sessions, MTP:
+
+| Model | IQ | Suite time | Tokens |
+| --- | ---: | ---: | ---: |
+| Swift 1.5 Qwen3.8 Flash-Next IQ4_XS + fine-tuned MTP head | 95.3 | **1,094 s** | 82,267 |
+| Qwen3.8 Flash-Next, v3 recipe | 95.3 | 1,420 s | 133,578 |
+| Halogen (closed source), same machine | 95.3 | 1,789 s | 136,589 |
 
 ## Upstream status
 
