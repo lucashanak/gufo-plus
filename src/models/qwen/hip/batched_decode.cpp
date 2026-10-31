@@ -181,6 +181,14 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
   }
 
   bool capture_replay = false;
+  {
+    std::array<QwenGpuExecutor*, kMaxDecodeBatch> busy{};
+    for (std::size_t i = 0; i < items.size(); ++i)
+      busy[i] = items[i].executor;
+    for (const auto& item : items)
+      item.executor->ReserveKv(item.position + 1,
+                               std::span(busy.data(), items.size()));
+  }
   std::array<models::qwen::ContinuationWrite, kMaxDecodeBatch> writes;
   for (std::size_t i = 0; i < items.size(); ++i)
     if (auto* hooks = items[i].executor->continuation_hooks_)
@@ -486,6 +494,15 @@ QwenGpuExecutor::ForwardVerificationBatch(
   if (batch_size > arena_.GetMaxBatch()) {
     throw std::length_error(
         "Qwen verification exceeds coordinator scratch capacity");
+  }
+  {
+    std::array<QwenGpuExecutor*, kMaxDecodeBatch> busy{};
+    for (std::size_t i = 0; i < items.size(); ++i)
+      busy[i] = items[i].executor;
+    for (const auto& item : items)
+      item.executor->ReserveKv(
+          item.position + static_cast<std::uint32_t>(item.tokens.size()),
+          std::span(busy.data(), items.size()));
   }
   std::array<models::qwen::ContinuationWrite, kMaxDecodeBatch> writes;
   for (std::size_t i = 0; i < items.size(); ++i)

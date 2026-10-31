@@ -42,7 +42,10 @@ public:
 };
 
 class HipblasLtGemm;
+class KvPool;
 class QwenGpuExecutor;
+class QwenGrowableKv;
+class QwenKvSessions;
 
 struct QwenGpuBatchItem {
   QwenGpuExecutor* executor{nullptr};
@@ -255,9 +258,13 @@ template<typename T>
 /// Preallocated, zero-allocation GPU execution arena on gfx1151.
 class QwenGpuArena {
 public:
+  /// With `kv_pool`, the attention planes are reserved for the full context
+  /// and backed as rows arrive (QwenKvSessions::Reserve) instead of being
+  /// preallocated.
   explicit QwenGpuArena(
       const core::ModelConfig& config, std::uint32_t max_context = 4096,
-      QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
+      QwenExecutionPolicy policy = QwenExecutionPolicy::Production(),
+      KvPool* kv_pool = nullptr);
   ~QwenGpuArena();
 
   QwenGpuArena(const QwenGpuArena&) = delete;
@@ -373,10 +380,22 @@ public:
   [[nodiscard]] std::optional<std::size_t> GetTargetLayerCaptureIndex(
       std::uint32_t layer) const noexcept;
 
+  /// Growable attention planes, or null when they are preallocated.
+  [[nodiscard]] const QwenGrowableKv* GrowableKv() const noexcept {
+    return kv_rows_.get();
+  }
+
 private:
   void FreeAll() noexcept;
   friend class models::qwen::ContinuationAdapter;
   friend class QwenGpuExecutor;
+  friend class QwenKvSessions;
+  /// Attention rows a session keeps backed: the rows it holds plus a margin
+  /// for kernels whose key tiles end past the last written row.
+  [[nodiscard]] std::size_t KvRowsToKeep() const noexcept;
+  std::unique_ptr<QwenGrowableKv> kv_rows_;
+  /// Rows [0, kv_live_rows_) may hold this session's content.
+  std::size_t kv_live_rows_{0};
   void AllocateRecurrentSnapshot();
   void SyncLivePointers() noexcept;
   [[nodiscard]] bool AllocateSsmReplayLog();
@@ -409,10 +428,13 @@ private:
 /// End-to-end GPU model executor running directly on the gfx1151 RDNA 3.5 CUs.
 class QwenGpuExecutor {
 public:
+  /// With `kv_sessions`, this session's attention rows grow with the tokens
+  /// it holds, within the sessions' shared budget.
   explicit QwenGpuExecutor(
       std::shared_ptr<const QwenGpuModel> model,
       std::uint32_t max_context = 4096,
-      QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
+      QwenExecutionPolicy policy = QwenExecutionPolicy::Production(),
+      std::shared_ptr<QwenKvSessions> kv_sessions = nullptr);
   ~QwenGpuExecutor();
 
   [[nodiscard]] static std::unique_ptr<QwenGpuExecutor> Create(
@@ -591,8 +613,15 @@ public:
   /// Ends replay capture after the last verification chunk.
   void FinishVerification();
 
+  /// Backs attention rows [0, end) before a write ending at `end`; the session
+  /// then holds `end` rows. `busy` sessions keep every row. Throws when the
+  /// K/V budget cannot hold them. No-op for preallocated planes.
+  void ReserveKv(std::uint32_t end,
+                 std::span<QwenGpuExecutor* const> busy = {});
+
 private:
   friend class models::qwen::ContinuationAdapter;
+  friend class QwenKvSessions;
   models::qwen::ContinuationHooks* continuation_hooks_{nullptr};
   void CheckPrefillCancellation() const;
   void PrefillLayerCheckpoint(std::uint32_t layer);
@@ -622,6 +651,7 @@ private:
   const models::QwenModelWeights& weights_;
   const tokenization::QwenTokenizer* tokenizer_;
   const QwenExecutionPolicy policy_;
+  std::shared_ptr<QwenKvSessions> kv_sessions_;
   QwenGpuArena arena_;
   const detail::HipGraphCaptureKey graph_key_;
   detail::HipGraphDecodeExecutor graph_executor_;

@@ -46,8 +46,9 @@
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
-#include "src/models/qwen38_flash_next/continuation_adapter.hpp"
+#include "src/models/qwen/hip/kv_growth.hpp"
 #include "src/models/qwen36_35b_a3b/engine.hpp"
+#include "src/models/qwen38_flash_next/continuation_adapter.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
 #endif
 
@@ -1128,12 +1129,27 @@ public:
       std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model = nullptr,
       speculative::SpeculativeOptions speculative_options = {},
       std::string artifact_fingerprint = {},
-      std::string draft_artifact_fingerprint = {})
+      std::string draft_artifact_fingerprint = {},
+      std::size_t kv_cache_bytes = 0, std::size_t session_count = 1)
       : model_(std::move(model)),
         dflash_model_(std::move(dflash_model)),
         max_context_(max_context),
         speculative_options_(speculative_options),
-        execution_policy_(hip::QwenExecutionPolicy::Production()) {
+        execution_policy_(hip::QwenExecutionPolicy::Production()),
+        kv_session_count_(std::max<std::size_t>(session_count, 1)) {
+    // Sessions back attention rows as they hold them, under one budget. The
+    // address arena (64 sessions' full planes) is reserved before any
+    // session allocates or frees: see KvPool::ReserveArena.
+    if (hip::KvPool::Supported(nullptr)) {
+      const auto& c = model_->GetConfig();
+      const std::size_t session_planes = hip::QwenGrowableKv::FullBytes(
+          2 * std::size_t{c.FullAttentionLayerCount()},
+          std::size_t{c.num_key_value_heads} * c.head_dim *
+              sizeof(std::uint16_t),
+          max_context_);
+      kv_sessions_ = std::make_shared<hip::QwenKvSessions>(
+          kv_cache_bytes, 64 * session_planes);
+    }
     if (!artifact_fingerprint.empty()) {
       const bool speculative = dflash_model_ != nullptr;
       persistence_ = TextRunnerPersistenceDescriptor{
@@ -1167,7 +1183,7 @@ public:
                 .max_context = max_context_,
                 .max_draft_tokens = speculative_options_.max_draft_tokens,
                 .policy = speculative_options_.dflash_policy},
-            &ledger),
+            &ledger, kv_sessions_),
         ledger);
     // Qwen's 256-row chunks are small. Preserve a bounded group before
     // waiting, instead of synchronizing every half-MiB range individually.
@@ -1231,6 +1247,21 @@ public:
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
     auto usage = hip::QwenGpuExecutor::EstimateMemoryUsage(
         model_->GetConfig(), max_context_, execution_policy_);
+    if (kv_sessions_ && kv_sessions_->budget() != 0) {
+      // Attention rows grow with the tokens held: a session claims its fixed
+      // state plus an equal share of the K/V budget, not its full context.
+      const auto& c = model_->GetConfig();
+      const std::size_t full_kv = hip::QwenGrowableKv::FullBytes(
+          2 * std::size_t{c.FullAttentionLayerCount()},
+          std::size_t{c.num_key_value_heads} * c.head_dim *
+              (execution_policy_.UsesFp16AttentionKv() ? sizeof(std::uint16_t)
+                                                       : sizeof(float)),
+          max_context_);
+      const std::size_t share = kv_sessions_->budget() / kv_session_count_;
+      usage.request_state_bytes = usage.request_state_bytes -
+                                  std::min(usage.request_state_bytes, full_kv) +
+                                  std::min(full_kv, share);
+    }
     usage.request_state_bytes += hip::QwenGpuArena::RecurrentStateBytes(
         model_->GetConfig(), execution_policy_);
     std::size_t resident_weights = model_->GetResidentBytes();
@@ -1593,6 +1624,8 @@ private:
   std::uint32_t max_context_;
   speculative::SpeculativeOptions speculative_options_;
   hip::QwenExecutionPolicy execution_policy_;
+  std::size_t kv_session_count_;
+  std::shared_ptr<hip::QwenKvSessions> kv_sessions_;
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
   cache::Identity component_identity_;
 };
@@ -3794,8 +3827,11 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     SetError(error, "--enable-yarn applies only to Qwen3.8-Flash-Next");
     return false;
   }
-  if (kv_cache_bytes != 0 && architecture != "qwen4exp") {
-    SetError(error, "--kv-cache-bytes applies only to Qwen3.8-Flash-Next");
+  if (kv_cache_bytes != 0 && architecture != "qwen4exp" &&
+      architecture != "qwen35") {
+    SetError(error,
+             "--kv-cache-bytes applies only to Qwen3.8-Flash-Next and "
+             "Qwen3.8-27B");
     return false;
   }
   // Read once, reused below to derive YaRN from --context for qwen4exp.
@@ -4053,7 +4089,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   }
   return load(std::move(model), error, max_context, session_count,
               prefill_policy, scheduler_policy, speculative_config,
-              std::move(resolved_disk_cache_config), ram_cache_config);
+              std::move(resolved_disk_cache_config), ram_cache_config,
+              kv_cache_bytes);
 #else
   (void)model_path;
   (void)max_context;
@@ -4079,7 +4116,8 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
                             TextSchedulerPolicy scheduler_policy,
                             TextSpeculativeConfig speculative_config,
                             TextDiskCacheConfig disk_cache_config,
-                            TextRunnerRamCacheOptions ram_cache_config) {
+                            TextRunnerRamCacheOptions ram_cache_config,
+                            std::size_t kv_cache_bytes) {
   if (model == nullptr) {
     SetError(error, "Qwen GPU model must not be null");
     return false;
@@ -4189,7 +4227,8 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     auto runner = std::make_shared<QwenTextRunner>(
         std::move(model), max_context, std::move(dflash_model),
         speculative_options, disk_cache_config.model_artifact_fingerprint,
-        disk_cache_config.draft_model_artifact_fingerprint);
+        disk_cache_config.draft_model_artifact_fingerprint, kv_cache_bytes,
+        session_count);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;

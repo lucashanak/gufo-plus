@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "src/core/hip/snapshot_copy.hpp"
+#include "src/models/qwen/hip/kv_growth.hpp"
 
 namespace gufo::models::qwen {
 namespace {
@@ -261,11 +262,13 @@ ContinuationAdapter::ContinuationAdapter(
     std::shared_ptr<const hip::QwenGpuModel> model, std::uint32_t context,
     cache::Identity identity, hip::QwenExecutionPolicy policy,
     std::shared_ptr<const hip::QwenDFlashGpuModel> draft_model,
-    hip::QwenDFlashGpuDraftConfig draft_config, cache::ResourceLedger* ledger)
+    hip::QwenDFlashGpuDraftConfig draft_config, cache::ResourceLedger* ledger,
+    std::shared_ptr<hip::QwenKvSessions> kv_sessions)
     : model_(std::move(model)),
       draft_model_(std::move(draft_model)),
       draft_config_(draft_config),
       ledger_(ledger),
+      kv_sessions_(std::move(kv_sessions)),
       policy_(policy),
       context_(context),
       layout_(model_ ? model_->GetConfig() : core::ModelConfig{}, policy,
@@ -398,8 +401,8 @@ cache::Identity ContinuationAdapter::CompatibilityIdentity() const {
 }
 std::unique_ptr<cache::Slot> ContinuationAdapter::CreateSlot(
     cache::MutationGuard& guard) {
-  auto executor =
-      std::make_unique<hip::QwenGpuExecutor>(model_, context_, policy_);
+  auto executor = std::make_unique<hip::QwenGpuExecutor>(model_, context_,
+                                                         policy_, kv_sessions_);
   // Prepare the rollback pair before readiness. Pinning the current buffer
   // for a prefill pass then requires neither an allocation nor a state copy.
   executor->arena_.AllocateRecurrentSnapshot();
@@ -474,6 +477,9 @@ void ContinuationAdapter::BeginRestore(
   }
   std::vector<Coverage> coverage(descriptors_.size());
   state.GuardAll();
+  // Rows load straight into the planes: back them before any transfer.
+  state.executor->ReserveKv(
+      static_cast<std::uint32_t>(ordered.front().valid_rows));
   Check(hipStreamSynchronize(state.executor->arena_.stream));
   if (state.draft)
     Check(hipStreamSynchronize(state.draft->executor_->stream_));

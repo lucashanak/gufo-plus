@@ -8,6 +8,7 @@
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/hip_utils.hpp"
+#include "src/models/qwen/hip/kv_growth.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -57,20 +58,30 @@ const QwenGpuModel& RequireModel(
 
 QwenGpuExecutor::QwenGpuExecutor(std::shared_ptr<const QwenGpuModel> model,
                                  std::uint32_t max_context,
-                                 QwenExecutionPolicy policy)
+                                 QwenExecutionPolicy policy,
+                                 std::shared_ptr<QwenKvSessions> kv_sessions)
     : model_(std::move(model)),
       weights_(RequireModel(model_).GetWeights()),
       tokenizer_(&model_->GetTokenizer()),
       policy_(policy),
-      arena_(weights_.config, max_context, policy_),
+      kv_sessions_(std::move(kv_sessions)),
+      arena_(weights_.config, max_context, policy_,
+             kv_sessions_ ? &kv_sessions_->pool() : nullptr),
       graph_key_(BuildGraphCaptureKey(weights_, policy_, max_context)),
       h_logits_(weights_.config.vocab_size, 0.0F) {
   AllocateGpuSamplingWorkspace(&sampling_workspace_, weights_.config.vocab_size,
                                max_context);
   detail::EmitQwenExecutionPolicy(policy_.Fingerprint());
+  if (kv_sessions_ && arena_.kv_rows_)
+    kv_sessions_->Register(this);
+  else
+    kv_sessions_.reset();
 }
 
 QwenGpuExecutor::~QwenGpuExecutor() {
+  // No longer a candidate for releasing idle K/V rows.
+  if (kv_sessions_)
+    kv_sessions_->Unregister(this);
   if (continuation_hooks_)
     continuation_hooks_->BeforeRelease();
   (void)hipStreamSynchronize(arena_.stream);
@@ -129,6 +140,12 @@ QwenGpuMemoryUsage QwenGpuExecutor::GetMemoryUsage() const {
   return usage;
 }
 
+void QwenGpuExecutor::ReserveKv(std::uint32_t end,
+                                std::span<QwenGpuExecutor* const> busy) {
+  if (kv_sessions_)
+    kv_sessions_->Reserve(*this, end, busy);
+}
+
 void QwenGpuExecutor::Reset() noexcept {
   try {
     if (continuation_hooks_)
@@ -147,6 +164,7 @@ void QwenGpuExecutor::Reset() noexcept {
   last_hidden_offset_ = 0;
   try {
     arena_.Reset();
+    ReserveKv(0);  // holds no rows; never grows
     if (continuation_hooks_)
       continuation_hooks_->AfterReset();
     reset_failure_ = nullptr;
@@ -187,6 +205,7 @@ void QwenGpuExecutor::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
   h_last_hidden_.clear();
   last_verification_rows_ = 0;
   last_hidden_offset_ = 0;
+  ReserveKv(snapshot.ValidContext());
   arena_.RestoreSnapshot(snapshot);
   vision_input_.RestoreLayout(snapshot.vision_layout_, arena_.stream);
   graph_executor_.Reset();
@@ -206,6 +225,7 @@ void QwenGpuExecutor::RestoreCompactSnapshot(
   h_last_hidden_.clear();
   last_verification_rows_ = 0;
   last_hidden_offset_ = 0;
+  ReserveKv(expected_valid_context);
   arena_.RestoreCompactSnapshot(payload, expected_valid_context);
   vision_input_.RestoreLayout(QwenGpuSnapshot::ReadRopeLayout(payload),
                               arena_.stream);

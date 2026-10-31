@@ -13,6 +13,7 @@
 #include "src/core/hip/snapshot_transfer.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/hip/kv_growth.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 
 namespace gufo::hip {
@@ -701,7 +702,7 @@ void QwenGpuArena::RestoreCompactSnapshot(
 
 QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
                            std::uint32_t max_context,
-                           QwenExecutionPolicy policy)
+                           QwenExecutionPolicy policy, KvPool* kv_pool)
     : config_(config),
       max_context_(std::max(max_context, 1U)),
       max_batch_(std::min(max_context_, kMaxPromptBatch)),
@@ -790,7 +791,19 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
         hipMalloc(&d_weights_bf16, max_weight_elems * sizeof(hip_bfloat16)));
 
     const std::size_t total_kv = GetAttentionKvPlaneElements();
-    if (policy_.UsesFp16AttentionKv()) {
+    if (policy_.UsesFp16AttentionKv() && kv_pool != nullptr && total_kv != 0) {
+      // Full-context address ranges; QwenKvSessions::Reserve backs rows.
+      std::string error;
+      auto rows = std::make_unique<QwenGrowableKv>();
+      if (!KvPool::Supported(&error) ||
+          !rows->Reserve(kv_pool,
+                         2 * std::size_t{config_.FullAttentionLayerCount()},
+                         std::size_t{kv_size} * sizeof(std::uint16_t),
+                         max_context_, &error))
+        throw std::runtime_error("Qwen growable K/V: " + error);
+      d_attention_kv_f16 = rows->data();
+      kv_rows_ = std::move(rows);
+    } else if (policy_.UsesFp16AttentionKv()) {
       HIP_CHECK(
           hipMalloc(&d_attention_kv_f16, total_kv * sizeof(std::uint16_t) * 2));
     } else {
@@ -936,6 +949,8 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   d_ssm_alpha_beta = other.d_ssm_alpha_beta;
   d_logits = other.d_logits;
   d_attention_kv_f16 = other.d_attention_kv_f16;
+  kv_rows_ = std::move(other.kv_rows_);
+  kv_live_rows_ = std::exchange(other.kv_live_rows_, 0);
   d_kv_cache = other.d_kv_cache;
   d_ssm_conv_state = other.d_ssm_conv_state;
   d_ssm_deltanet_state = other.d_ssm_deltanet_state;
@@ -1038,6 +1053,8 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     d_ssm_alpha_beta = other.d_ssm_alpha_beta;
     d_logits = other.d_logits;
     d_attention_kv_f16 = other.d_attention_kv_f16;
+    kv_rows_ = std::move(other.kv_rows_);
+    kv_live_rows_ = std::exchange(other.kv_live_rows_, 0);
     d_kv_cache = other.d_kv_cache;
     d_ssm_conv_state = other.d_ssm_conv_state;
     d_ssm_deltanet_state = other.d_ssm_deltanet_state;
@@ -1150,6 +1167,13 @@ void QwenGpuArena::Reset() {
   has_saved_state_ = false;
 }
 
+std::size_t QwenGpuArena::KvRowsToKeep() const noexcept {
+  // Prefill and verification attention load key tiles of up to 128 rows;
+  // keep whole tiles past the last written row backed.
+  constexpr std::size_t kMarginRows = 256;
+  return std::min<std::size_t>(max_context_, kv_live_rows_ + kMarginRows);
+}
+
 void QwenGpuArena::FreeAll() noexcept {
   if (d_hidden != nullptr)
     LogCleanupError(hipFree(d_hidden));
@@ -1189,8 +1213,14 @@ void QwenGpuArena::FreeAll() noexcept {
     LogCleanupError(hipFree(d_ssm_alpha_beta));
   if (d_logits != nullptr)
     LogCleanupError(hipFree(d_logits));
-  if (d_attention_kv_f16 != nullptr)
+  if (kv_rows_) {
+    // Unmapping is not ordered after queued work.
+    if (stream != nullptr)
+      LogCleanupError(hipStreamSynchronize(stream));
+    kv_rows_.reset();
+  } else if (d_attention_kv_f16 != nullptr) {
     LogCleanupError(hipFree(d_attention_kv_f16));
+  }
   if (d_target_layer_features != nullptr) {
     LogCleanupError(hipFree(d_target_layer_features));
     d_target_layer_features = nullptr;
