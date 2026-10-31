@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string_view>
 #include <type_traits>
@@ -53,6 +54,14 @@ T* Alloc(std::vector<void*>& allocations, std::size_t count,
   if (allocated_bytes)
     *allocated_bytes += bytes;
   return static_cast<T*>(p);
+}
+
+/// Bytes one attention layer's growable K/V rows map once `tokens` rows are
+/// backed: 8-bit K and V plus one F16 scale per 16 values of each.
+std::size_t KvLayerBytes(const Config& c, std::uint32_t tokens) noexcept {
+  const std::size_t kv_row = c.AttentionKvDim();
+  return 2 * (GrowableRows::FullBytes(kv_row * sizeof(std::int8_t), tokens) +
+              GrowableRows::FullBytes(kv_row / 16 * sizeof(__half), tokens));
 }
 
 WeightType SmallType(GgmlType type) {
@@ -125,7 +134,15 @@ std::size_t RoutedTileCapacity(std::size_t slots, const Config& c) {
 }  // namespace
 
 Session::~Session() {
+  // No longer a candidate for releasing idle K/V rows.
+  if (owner_ != nullptr)
+    owner_->Unregister(this);
   TrimRollback(0);
+  if (kv_) {
+    // Unmapping is not ordered after queued work: drain readers first.
+    (void)hipDeviceSynchronize();
+    kv_.reset();
+  }
   for (auto& [key, exec] : graphs_) {
     (void)hipGraphExecDestroy(exec);
   }
@@ -185,8 +202,18 @@ bool Session::CheckCancellation(std::string* error) const {
   return true;
 }
 
+std::size_t Session::KvBytes() const noexcept {
+  std::size_t bytes = 0;
+  if (kv_) {
+    for (const auto* rows : {&kv_->target, &kv_->draft})
+      for (const auto& buffer : *rows)
+        bytes += buffer.mapped_bytes();
+  }
+  return bytes;
+}
+
 std::size_t Session::AllocatedBytes() const noexcept {
-  return allocated_bytes_ + rollback_bytes_ + vision_input_.Bytes();
+  return allocated_bytes_ + KvBytes() + rollback_bytes_ + vision_input_.Bytes();
 }
 
 void Session::TrimRollback(std::uint32_t depth) noexcept {
@@ -239,6 +266,9 @@ void Session::Reset() {
 }
 
 Executor::~Executor() {
+  // K/V chunks are unmapped by the members' destructors; nothing may still
+  // read them.
+  (void)hipDeviceSynchronize();
   (void)hipFree(feat_dev_);
   for (void* p : kv_half_allocations_)
     (void)hipFree(p);
@@ -298,6 +328,19 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       hipblasSetStream(e->blas_, e->stream_) != HIPBLAS_STATUS_SUCCESS) {
     AssignError(error_msg, "hipblasCreate failed");
     return nullptr;
+  }
+  if (!KvPool::Supported(error_msg))
+    return nullptr;
+  e->kv_pool_ = std::make_unique<KvPool>(options.kv_budget);
+  {
+    // The address arena first: session buffers allocated and freed later
+    // never share an address with K/V chunks (see KvPool::ReleaseRange). It
+    // holds 64 sessions at the model context.
+    const Config& mc = model.config();
+    const std::size_t layers = mc.num_layers / mc.full_attention_interval + 1;
+    if (!e->kv_pool_->ReserveArena(
+            64 * layers * KvLayerBytes(mc, mc.context_length), error_msg))
+      return nullptr;
   }
   const Config& c = model.config();
   const std::size_t T = e->options_.max_batch;
@@ -478,15 +521,26 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
       return nullptr;
     kv_half_elems_ = kv_elems;
   }
-  const auto AllocKv = [&](auto& kv) {
+  s->kv_ = std::make_unique<Session::KvRows>();
+  // Reserve the full-context ranges; ReserveKv backs them as rows arrive.
+  const auto reserve = [&](std::vector<GrowableRows>& rows,
+                           std::size_t bytes) -> void* {
+    auto& buffer = rows.emplace_back();
+    return buffer.Reserve(kv_pool_.get(), bytes, max_context, error_msg)
+               ? buffer.data()
+               : nullptr;
+  };
+  const std::size_t q8_row = kv_row * sizeof(std::int8_t);
+  const std::size_t scale_row = kv_row / 16 * sizeof(__half);
+  const auto AllocKv = [&](auto& kv, std::vector<GrowableRows>& rows) {
     kv.k_cache = kv_half_k_;
     kv.v_cache = kv_half_v_;
-    kv.k_q8 = Alloc<std::int8_t>(a, kv_elems, error_msg, &s->allocated_bytes_);
-    kv.v_q8 = Alloc<std::int8_t>(a, kv_elems, error_msg, &s->allocated_bytes_);
-    kv.k_scale =
-        Alloc<__half>(a, kv_elems / 16, error_msg, &s->allocated_bytes_);
-    kv.v_scale =
-        Alloc<__half>(a, kv_elems / 16, error_msg, &s->allocated_bytes_);
+    kv.k_q8 = static_cast<std::int8_t*>(reserve(rows, q8_row));
+    kv.v_q8 = static_cast<std::int8_t*>(reserve(rows, q8_row));
+    kv.k_scale = static_cast<__half*>(reserve(rows, scale_row));
+    kv.v_scale = static_cast<__half*>(reserve(rows, scale_row));
+    return kv.k_q8 != nullptr && kv.v_q8 != nullptr && kv.k_scale != nullptr &&
+           kv.v_scale != nullptr;
   };
   for (std::uint32_t il = 0; il < c.num_layers; ++il) {
     if (c.IsLinearLayer(il)) {
@@ -495,8 +549,8 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
           Alloc<float>(a, conv_elems, error_msg, &s->allocated_bytes_);
       l.state = Alloc<float>(a, state_elems, error_msg, &s->allocated_bytes_);
     } else {
-      auto& at = s->attention_[il];
-      AllocKv(at);
+      if (!AllocKv(s->attention_[il], s->kv_->target))
+        return nullptr;
     }
   }
   s->control_ = Alloc<Session::Control>(a, 1, error_msg, &s->allocated_bytes_);
@@ -504,7 +558,8 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
     s->mtp_.target_hidden = Alloc<float>(
         a, static_cast<std::size_t>(options_.max_speculative) * c.hidden_size,
         error_msg, &s->allocated_bytes_);
-    AllocKv(s->mtp_);
+    if (!AllocKv(s->mtp_, s->kv_->draft))
+      return nullptr;
     s->mtp_.h = Alloc<float>(a, c.hidden_size, error_msg, &s->allocated_bytes_);
   }
   for (void* p : a) {
@@ -516,6 +571,10 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   // buffers until they have landed.
   if (!Check(hipDeviceSynchronize(), "session init", error_msg)) {
     return nullptr;
+  }
+  {
+    const std::lock_guard lock(sessions_mutex_);
+    sessions_.push_back(s.get());
   }
   return s;
 }
@@ -568,11 +627,10 @@ std::size_t Executor::SessionBytes(
       std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels();
   const std::size_t state =
       std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
-  // The 8-bit K and V caches (one F16 scale per 16 values); the F16 staging
-  // pair is shared by the executor, not owned by a session.
-  const std::size_t kv_elems = std::size_t{max_context} * c.AttentionKvDim();
-  const std::size_t kv =
-      2 * (kv_elems * sizeof(std::int8_t) + kv_elems / 16 * sizeof(__half));
+  // The 8-bit K and V caches (one F16 scale per 16 values) as mapped once
+  // every row is backed; the F16 staging pair is shared by the executor,
+  // not owned by a session.
+  const std::size_t kv = KvLayerBytes(c, max_context);
   const auto rollback_state =
       rollback_depth == 0
           ? 0
@@ -587,6 +645,105 @@ std::size_t Executor::SessionBytes(
               ? kv + std::size_t{options_.max_speculative + 1} * c.hidden_size *
                          sizeof(float)
               : 0);
+}
+
+std::size_t Executor::GrowableBytes(core::SessionMode mode,
+                                    std::uint32_t tokens) const noexcept {
+  const auto& c = config();
+  const std::size_t layers = c.num_layers / c.full_attention_interval +
+                             (mode == core::SessionMode::kSpeculative ? 1 : 0);
+  return layers * KvLayerBytes(c, tokens);
+}
+
+std::size_t Executor::KvMappedBytes() const {
+  return kv_pool_->mapped();
+}
+
+void Executor::Unregister(const Session* session) const {
+  const std::lock_guard lock(sessions_mutex_);
+  std::erase(sessions_, session);
+}
+
+bool Executor::ReserveKv(Session& session, std::uint32_t rows,
+                         std::uint32_t draft_rows, std::string* error_msg,
+                         std::span<Session* const> busy) const {
+  if (!session.kv_)
+    return true;
+  auto& kv = *session.kv_;
+  const auto plan = [&](auto&& visit) {
+    for (auto& buffer : kv.target)
+      if (!visit(buffer, rows))
+        return false;
+    for (auto& buffer : kv.draft)
+      if (!visit(buffer, draft_rows))
+        return false;
+    return true;
+  };
+  std::size_t growth = 0;
+  (void)plan([&](const GrowableRows& buffer, std::size_t want) {
+    growth += buffer.GrowthBytes(want);
+    return true;
+  });
+  if (growth == 0)
+    return true;
+  std::vector<Session*> keep(busy.begin(), busy.end());
+  keep.push_back(&session);
+  if (kv_pool_->Available() < growth)
+    (void)ReleaseIdleKv(growth - kv_pool_->Available(), keep);
+  if (kv_pool_->Available() < growth) {
+    AssignError(error_msg, "K/V memory exhausted: " + std::to_string(growth) +
+                               " more bytes needed, " +
+                               std::to_string(kv_pool_->mapped()) + " of " +
+                               std::to_string(kv_pool_->budget()) +
+                               " budgeted bytes in use");
+    return false;
+  }
+  return plan([&](GrowableRows& buffer, std::size_t want) {
+    // The device heap can run out before the budget: release idle rows and
+    // retry once.
+    return buffer.Grow(want, stream_, nullptr) ||
+           (ReleaseIdleKv(buffer.GrowthBytes(want), keep) > 0 &&
+            buffer.Grow(want, stream_, nullptr)) ||
+           buffer.Grow(want, stream_, error_msg);
+  });
+}
+
+std::size_t Executor::ReleaseIdleKv(std::size_t want,
+                                    std::span<Session* const> busy) const {
+  // Held throughout: a session being destroyed elsewhere waits in Unregister.
+  const std::lock_guard lock(sessions_mutex_);
+  std::size_t released = 0;
+  bool drained = false;
+  for (auto* session : sessions_) {
+    if (released >= want)
+      break;
+    if (std::ranges::find(busy, session) != busy.end() || !session->kv_)
+      continue;
+    auto& kv = *session->kv_;
+    // Rows a pending speculative batch wrote stay until it is cut back.
+    const std::uint32_t rows = session->position_ + session->spec_tokens_;
+    const std::uint32_t draft_rows = session->mtp_.position;
+    std::size_t releasable = 0;
+    for (const auto& buffer : kv.target)
+      releasable += buffer.ShrinkBytes(rows);
+    for (const auto& buffer : kv.draft)
+      releasable += buffer.ShrinkBytes(draft_rows);
+    if (releasable == 0)
+      continue;
+    if (!drained) {
+      // Unmapping is not ordered after queued work or snapshot copies.
+      if (hipDeviceSynchronize() != hipSuccess) {
+        (void)hipGetLastError();
+        return released;
+      }
+      drained = true;
+    }
+    for (auto& buffer : kv.target)
+      released += buffer.Shrink(rows);
+    for (auto& buffer : kv.draft)
+      released += buffer.Shrink(draft_rows);
+  }
+  return released;
 }
 
 std::size_t Executor::DeferredScratchBytes() const {
@@ -1608,6 +1765,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   }
   if (speculative && !EnsureRollback(session, n - 1, error_msg))
     return false;
+  if (!ReserveKv(session, start_pos + n, session.mtp_.position, error_msg))
+    return false;
   ++session.mutation_epoch_;
   session.spec_base_ = start_pos;
   session.spec_tokens_ = speculative ? n : 0;
@@ -2091,6 +2250,8 @@ bool Executor::RestoreSnapshot(Session& session,
                 "image snapshot layout does not match its prompt attachment");
     return false;
   }
+  if (!ReserveKv(session, h.position, h.mtp_position, error_msg))
+    return false;
   if (layout.images.empty())
     session.ConfigureVision(nullptr, nullptr, stream_);
   // The session's queued work targets buffers the copies overwrite.
@@ -2254,6 +2415,8 @@ bool Executor::MtpForward(Session& session,
     AssignError(error_msg, "MTP context is full");
     return false;
   }
+  if (!ReserveKv(session, session.position_, pos + n, error_msg))
+    return false;
   ++session.mutation_epoch_;
   session.mtp_.residual_valid = false;
   std::copy(tokens.begin(), tokens.end(), tokens_host_);
@@ -2309,6 +2472,9 @@ bool Executor::MtpDraftChain(Session& session,
     return false;
   }
   if (!session.CheckCancellation(error_msg))
+    return false;
+  // Step k > 0 writes draft row pos + n + k - 1.
+  if (!ReserveKv(session, session.position_, pos + n + drafts - 1, error_msg))
     return false;
   ++session.mutation_epoch_;
   session.mtp_.residual_valid = false;

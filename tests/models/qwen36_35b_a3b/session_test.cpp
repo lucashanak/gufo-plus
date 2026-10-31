@@ -144,7 +144,9 @@ void CheckFailureRecovery(const std::shared_ptr<q36::Model>& model) {
   Require(session->Sync(prompt, &error), error);
   RequireExact(expected, session->Logits(),
                "cancelled restore leaked device state");
-  Require(session->AllocatedBytes() == initial_bytes,
+  // K/V rows stay backed for the session's next request; only rollback
+  // storage is released.
+  Require(session->AllocatedBytes() - session->KvBytes() == initial_bytes,
           "reset retained rollback allocations");
   std::cout
       << "cancelled forward/restore recover exactly; rollback starts empty\n";
@@ -192,10 +194,10 @@ void CheckRollbackReuse(const std::shared_ptr<q36::Model>& model) {
     Require(session->Evaluate(prompt.front(), &error), error);
   const auto full = session->SaveSnapshot(&error);
   Require(full && session->RestoreSnapshot(*full, &error), error);
-  Require(session->AllocatedBytes() == empty_bytes,
+  Require(session->AllocatedBytes() - session->KvBytes() == empty_bytes,
           "restore kept rollback that the restored context cannot use");
   session->Reset();
-  Require(session->AllocatedBytes() == empty_bytes,
+  Require(session->AllocatedBytes() - session->KvBytes() == empty_bytes,
           "explicit reset retained rollback");
   std::cout
       << "rollback restore is bounded, reuses warm rows and replays exactly\n";

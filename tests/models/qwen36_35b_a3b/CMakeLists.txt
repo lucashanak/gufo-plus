@@ -38,8 +38,13 @@ if (ENGINE_ENABLE_HIP)
   add_executable(qwen36_35b_a3b_snapshot_test EXCLUDE_FROM_ALL snapshot_test.cpp)
   target_link_libraries(qwen36_35b_a3b_snapshot_test PRIVATE
     gufo_qwen36_35b_a3b)
+  add_executable(qwen36_35b_a3b_growable_kv_test EXCLUDE_FROM_ALL
+    growable_kv_test.cpp)
+  target_link_libraries(qwen36_35b_a3b_growable_kv_test PRIVATE
+    gufo_qwen36_35b_a3b)
   add_custom_target(qwen36_35b_a3b_model_tests
-    DEPENDS qwen36_35b_a3b_session_test qwen36_35b_a3b_snapshot_test)
+    DEPENDS qwen36_35b_a3b_session_test qwen36_35b_a3b_snapshot_test
+      qwen36_35b_a3b_growable_kv_test)
 
   add_executable(qwen36_35b_a3b_gpu_probe EXCLUDE_FROM_ALL gpu_probe.cpp)
   target_link_libraries(qwen36_35b_a3b_gpu_probe PRIVATE gufo_qwen36_35b_a3b)

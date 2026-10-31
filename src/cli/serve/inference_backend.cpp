@@ -3120,7 +3120,10 @@ public:
   }
   [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
       const noexcept override {
-    return {.per_request_state_bytes = session_->AllocatedBytes(),
+    // K/V rows grow with the tokens held and are bounded by the model's K/V
+    // budget; the claim charges each state a share of it, not its rows.
+    return {.per_request_state_bytes =
+                session_->AllocatedBytes() - session_->KvBytes(),
             .temporary_scratch_bytes = 0};
   }
 
@@ -3794,8 +3797,11 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     SetError(error, "--enable-yarn applies only to Qwen3.8-Flash-Next");
     return false;
   }
-  if (kv_cache_bytes != 0 && architecture != "qwen4exp") {
-    SetError(error, "--kv-cache-bytes applies only to Qwen3.8-Flash-Next");
+  if (kv_cache_bytes != 0 && architecture != "qwen4exp" &&
+      architecture != "qwen35moe") {
+    SetError(error,
+             "--kv-cache-bytes applies only to Qwen3.8-Flash-Next and "
+             "Qwen3.6-35B-A3B (qwen35moe)");
     return false;
   }
   // Read once, reused below to derive YaRN from --context for qwen4exp.
@@ -4006,6 +4012,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .max_draft_tokens = speculative_config.max_draft_tokens,
             .decode_concurrency = static_cast<std::uint32_t>(
                 std::clamp<std::size_t>(session_count, 1, 8)),
+            .kv_cache_bytes = kv_cache_bytes,
         },
         &load_error);
     if (model == nullptr) {
