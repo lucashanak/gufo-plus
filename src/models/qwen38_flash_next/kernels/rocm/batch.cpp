@@ -696,7 +696,7 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
   // anyway, so all rows go through it once (main's cost) and each small-head
   // row gathers its table rows from its own full logits.
   const auto& prefix_head = model_->draft_output();
-  const auto& full_head = model_->output();
+  const auto& full_head = model_->draft_full_output();
   const std::size_t vocab = full_head.rows;
   const std::size_t prefix = prefix_head.rows;
   const std::size_t kSmall = prefix + kMtpDraftExtraRows;

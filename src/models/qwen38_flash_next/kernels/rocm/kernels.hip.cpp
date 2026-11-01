@@ -8138,6 +8138,109 @@ __launch_bounds__(kThreads) __global__
   }
 }
 
+/// ggml's best_index_int8 over kvalues_iq4nl.
+__device__ __forceinline__ int Iq4NlBestIndex(const std::int8_t* values,
+                                              float x) {
+  if (x <= values[0])
+    return 0;
+  if (x >= values[15])
+    return 15;
+  int ml = 0;
+  int mu = 15;
+  while (mu - ml > 1) {
+    const int mav = (ml + mu) / 2;
+    if (x < values[mav])
+      mu = mav;
+    else
+      ml = mav;
+  }
+  return x - values[mu - 1] < values[mu] - x ? mu - 1 : mu;
+}
+
+/// One IQ4_NL block per thread from the Q6_K row it lies in: the 32 values
+/// dequantized as ggml's dequantize_row_q6_K, then ggml's
+/// quantize_row_iq4_nl_impl (block 32, no importance weights, ntry 7).
+__global__ void Q6KToIq4NlKernel(const Q6KBlock* __restrict__ src,
+                                 IQ4NLBlock* __restrict__ dst,
+                                 std::size_t blocks) {
+  const std::size_t b =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (b >= blocks)
+    return;
+  constexpr std::int8_t kValues[16] = {
+      -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+  const Q6KBlock& q = src[b / 8];
+  const int sub = static_cast<int>(b % 8);  // 32-value group in the 256
+  const int half = sub / 4;                 // which 128
+  const int quarter = sub % 4;              // y[l + 32 * quarter]
+  const std::uint8_t* ql = q.ql + 64 * half;
+  const std::uint8_t* qh = q.qh + 32 * half;
+  const std::int8_t* sc = q.scales + 8 * half;
+  const float d = __half2float(q.d);
+  float x[32];
+#pragma unroll
+  for (int l = 0; l < 32; ++l) {
+    const int is = l / 16;
+    int v;
+    switch (quarter) {
+    }
+    x[l] = d * static_cast<float>(sc[is + 2 * quarter]) *
+           static_cast<float>(v - 32);
+  }
+  float amax = 0.0f;
+  float max = 0.0f;
+  for (int j = 0; j < 32; ++j) {
+    const float ax = fabsf(x[j]);
+    if (ax > amax) {
+      amax = ax;
+      max = x[j];
+    }
+  }
+  IQ4NLBlock out;
+  if (amax < 1e-15f) {  // GROUP_MAX_EPS
+    out.d = __float2half(0.0f);
+    for (int j = 0; j < 16; ++j)
+      out.qs[j] = 0;
+    dst[b] = out;
+    return;
+  }
+  float scale = -max / kValues[0];
+  float id = 1.0f / scale;
+  float sumqx = 0.0f;
+  float sumq2 = 0.0f;
+  for (int j = 0; j < 32; ++j) {
+    const float q4 = kValues[Iq4NlBestIndex(kValues, id * x[j])];
+    const float w = x[j] * x[j];
+    sumqx += w * q4 * x[j];
+    sumq2 += w * q4 * q4;
+  }
+  scale = sumqx / sumq2;
+  float best = scale * sumqx;
+  for (int itry = -7; itry <= 7; ++itry) {
+    id = (itry + kValues[0]) / max;
+    sumqx = 0.0f;
+    sumq2 = 0.0f;
+    for (int j = 0; j < 32; ++j) {
+      const float q4 = kValues[Iq4NlBestIndex(kValues, id * x[j])];
+      const float w = x[j] * x[j];
+      sumqx += w * q4 * x[j];
+      sumq2 += w * q4 * q4;
+    }
+    if (sumq2 > 0 && sumqx * sumqx > best * sumq2) {
+      scale = sumqx / sumq2;
+      best = scale * sumqx;
+    }
+  }
+  out.d = __float2half(scale);
+  const float inv = scale != 0.0f ? 1.0f / scale : 0.0f;
+  for (int j = 0; j < 16; ++j) {
+    const int lo = Iq4NlBestIndex(kValues, inv * x[j]);
+    const int hi = Iq4NlBestIndex(kValues, inv * x[j + 16]);
+    out.qs[j] = static_cast<std::uint8_t>(lo | (hi << 4));
+  }
+  dst[b] = out;
+}
+
 }  // namespace
 
 void EmbedTokens(const void* table, WeightType type, const std::int32_t* tokens,
@@ -8489,6 +8592,16 @@ bool SigmoidMulQ8_1(float* x, const float* g, std::size_t count, void* x_q8,
   hipLaunchKernelGGL(SigmoidMulQ8Kernel, dim3(Blocks(count)), dim3(kThreads), 0,
                      stream, x, g, count, x_q8);
   return true;
+}
+
+void Q6KToIq4Nl(const void* q6k, void* iq4nl, std::size_t blocks32,
+                hipStream_t stream) {
+  if (blocks32 == 0)
+    return;
+  hipLaunchKernelGGL(Q6KToIq4NlKernel,
+                     dim3(static_cast<unsigned>((blocks32 + 255) / 256)),
+                     dim3(256), 0, stream, static_cast<const Q6KBlock*>(q6k),
+                     static_cast<IQ4NLBlock*>(iq4nl), blocks32);
 }
 
 void ExpandQ8_0(const void* q8, float* out, std::size_t count,
