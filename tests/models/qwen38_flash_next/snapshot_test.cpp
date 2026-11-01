@@ -398,19 +398,84 @@ void CheckExtendedPrefillCheckpoint(const std::shared_ptr<qfn::Model>& model,
             << " boundary=" << boundary << " exact\n";
 }
 
+/// Checkpoints captured inside long prefill passes: every boundary's
+/// payload, the live logits, a sampled continuation and each checkpoint's
+/// resumed prompt equal a prompt split at the boundaries.
+void CheckDeepPrefillCheckpoints(const std::shared_ptr<qfn::Model>& model,
+                                 std::span<const std::int32_t> prompt,
+                                 gufo::core::SessionMode mode, std::size_t warm,
+                                 std::vector<std::uint32_t> boundaries) {
+  std::string error;
+  constexpr std::uint32_t kContext = 32768;
+  auto source = model->CreateSession(mode, kContext, &error);
+  auto split = model->CreateSession(mode, kContext, &error);
+  Require(source && split, error);
+  if (warm)
+    Require(source->Sync(prompt.first(warm), &error) &&
+                split->Sync(prompt.first(warm), &error),
+            error);
+  std::vector<std::unique_ptr<qfn::SessionSnapshot>> checkpoints;
+  double capture_ms = -1;
+  Require(source->SyncThrough(prompt, boundaries, &checkpoints, &error,
+                              &capture_ms),
+          error);
+  Require(checkpoints.size() == boundaries.size(),
+          "deep checkpoints were not all returned");
+  for (std::size_t i = 0; i < boundaries.size(); ++i) {
+    Require(split->Sync(prompt.first(boundaries[i]), &error), error);
+    Require(checkpoints[i] && Payload(*checkpoints[i]) == Payload(*split),
+            "deep checkpoint at " + std::to_string(boundaries[i]) +
+                " differs from a pass ending there");
+  }
+  Require(split->Sync(prompt, &error), error);
+  Require(std::memcmp(source->Logits().data(), split->Logits().data(),
+                      source->Logits().size_bytes()) == 0,
+          "deep checkpoints changed split-pass logits");
+  Require(Payload(*source) == Payload(*split),
+          "deep checkpoints changed the live frontier");
+  // A resumed checkpoint continues like the prompt split at it and the
+  // boundaries before it (a split at an unaligned boundary groups later
+  // sparse queries from it, in a pass and across passes alike).
+  for (std::size_t i = 0; i < boundaries.size(); ++i) {
+    auto restored = model->CreateSession(mode, kContext, &error);
+    auto reference = model->CreateSession(mode, kContext, &error);
+    Require(restored && reference &&
+                restored->RestoreSnapshot(*checkpoints[i], &error),
+            error);
+    if (warm)
+      Require(reference->Sync(prompt.first(warm), &error), error);
+    for (std::size_t j = 0; j <= i; ++j)
+      Require(reference->Sync(prompt.first(boundaries[j]), &error), error);
+    Require(reference->Sync(prompt, &error) && restored->Sync(prompt, &error),
+            error);
+    Require(Payload(*restored) == Payload(*reference),
+            "deep checkpoint at " + std::to_string(boundaries[i]) +
+                " did not resume exactly");
+  }
+  const sampling::SamplingConfig sampled{
+      .temperature = 0.8F, .top_k = 20, .top_p = 0.95F, .seed = 73};
+  RequireSame(Decode(*split, 16, sampled, 8), Decode(*source, 16, sampled, 8),
+              "deep checkpoint sampled continuation");
+  std::cout << "deep checkpoints mode=" << static_cast<int>(mode)
+            << " tokens=" << prompt.size() << " warm=" << warm
+            << " boundaries=" << boundaries.size() << " exact\n";
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   const bool extended = argc == 6 && std::string_view(argv[5]) == "--extended";
-  if ((argc != 5 && !extended) || std::string_view(argv[1]) != "--model" ||
+  const bool deep = argc == 6 && std::string_view(argv[5]) == "--deep";
+  if ((argc != 5 && !extended && !deep) ||
+      std::string_view(argv[1]) != "--model" ||
       std::string_view(argv[3]) != "--mtp-model") {
     std::cerr << "Usage: snapshot_test --model FIRST.gguf --mtp-model MTP.gguf "
-                 "[--extended]\n";
+                 "[--extended|--deep]\n";
     return 77;
   }
   try {
     std::string error;
-    const std::uint32_t kContext = extended ? 409600 : 8192;
+    const std::uint32_t kContext = extended ? 409600 : deep ? 32768 : 8192;
     auto model = qfn::Model::Load(
         argv[2],
         {.max_context = kContext,
@@ -431,6 +496,37 @@ int main(int argc, char** argv) {
         "The quick brown fox jumps over the lazy dog. "
         "Strix Halo executes this deterministic benchmark sequence. ");
     Require(!pattern.empty(), "empty prompt pattern");
+    if (deep) {
+      // A varied long prompt: the pattern with a running index, so the
+      // sparse selection differs from row to row.
+      std::vector<std::int32_t> long_prompt;
+      for (std::size_t i = 0; long_prompt.size() < 16000; ++i) {
+        const auto line =
+            model->Tokenize(" step " + std::to_string(i * 7919) + ": ");
+        long_prompt.insert(long_prompt.end(), line.begin(), line.end());
+        long_prompt.insert(long_prompt.end(), pattern.begin(), pattern.end());
+      }
+      long_prompt.resize(16000);
+      const auto all = std::span<const std::int32_t>(long_prompt);
+      for (const auto mode : {gufo::core::SessionMode::kAutoregressive,
+                              gufo::core::SessionMode::kSpeculative}) {
+        // One 16,000-row pass: the sparse budget's first row, a point off
+        // the four-token alignment and a deep one.
+        CheckDeepPrefillCheckpoints(model, all, mode, 0, {2048, 6146, 12288});
+        // A pass starting off the alignment after a warm prefix.
+        CheckDeepPrefillCheckpoints(model, all.first(10000), mode, 4095,
+                                    {6144, 8190});
+        // Points five rows into the pass (a split there runs a narrow
+        // head pass) and four rows apart, closer than the draft depth.
+        CheckDeepPrefillCheckpoints(model, all.first(10000), mode, 4095,
+                                    {4100, 4104, 6144});
+        // More boundaries than one pass captures: the pass ends at the
+        // fourth and the next one takes the fifth.
+        CheckDeepPrefillCheckpoints(model, all.first(8000), mode, 0,
+                                    {1024, 2048, 3072, 4096, 5120});
+      }
+      return 0;
+    }
     // Partial prefill batch and three unpooled raw indexer rows at the end
     // of the ring. Continuing (and speculative rollback) crosses its wrap.
     std::vector<std::int32_t> prompt(4095);
