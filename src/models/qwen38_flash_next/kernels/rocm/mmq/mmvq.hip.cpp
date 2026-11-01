@@ -388,6 +388,37 @@ template<> struct MoeFragment<GGML_TYPE_Q5_K> {
   }
 };
 
+// A lane's 32 codes of an IQ4_XS super-block (one K32 sub-block), looked up
+// in the non-linear table once, with the sub-block's signed 6-bit scale.
+template<> struct MoeFragment<GGML_TYPE_IQ4_XS> {
+  int2 v[4];
+  int ls;
+  float d;
+
+  MoeFragment() = default;
+  __device__ __forceinline__ MoeFragment(const void* weights, int kbx,
+                                         int iqs) {
+    const block_iq4_xs* b = static_cast<const block_iq4_xs*>(weights) + kbx;
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+      v[j] = get_int_from_table_16(get_int_b4(b->qs, iqs + j), kvalues_iq4nl);
+    ls = (((b->scales_l[iqs / 8] >> (iqs & 0x04)) & 0x0F) |
+          (((b->scales_h >> (iqs / 2)) & 0x03) << 4)) -
+         32;
+    d = __half2float(b->d);
+  }
+
+    const block_q8_1* q = y + iqs / 4;
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      sumi = ggml_hip_dp4a(v[j].x, get_int_b4(q->qs, j + 0), sumi);
+      sumi = ggml_hip_dp4a(v[j].y, get_int_b4(q->qs, j + 4), sumi);
+    }
+    sumi *= ls;
+  }
+};
+
 /// warp_reduce_sum<32> over up to 32 sums at once (scatter_reduce_sum's
 /// pairs and operands, five levels deep): lane l finishes sum
 /// l >> (5 - levels), and every lane of that group holds the same bits.
@@ -1769,6 +1800,11 @@ void mul_mat_vec_moe_gated(const void* gate, const void* up, ggml_type type,
                                                 experts_used, input_stride,
                                                 stream);
         break;
+      case GGML_TYPE_IQ4_XS:
+        launch_moe_batch_groups<GGML_TYPE_IQ4_XS>(
+            gate, up, input, groups, output, k, rows, tokens, experts_used,
+            input_stride, stream);
+        break;
       default:
         GGML_ASSERT(type == GGML_TYPE_Q8_0);
         launch_moe_batch_groups<GGML_TYPE_Q8_0>(gate, up, input, groups,
@@ -1798,6 +1834,10 @@ void mul_mat_vec_moe_gated(const void* gate, const void* up, ggml_type type,
       launch_moe_grouped<GGML_TYPE_Q3_K>(gate, up, input, groups, output, k,
                                          rows, tokens, experts_used,
                                          input_stride, stream);
+    } else if (type == GGML_TYPE_IQ4_XS) {
+      launch_moe_grouped<GGML_TYPE_IQ4_XS>(gate, up, input, groups, output, k,
+                                           rows, tokens, experts_used,
+                                           input_stride, stream);
     } else {
       GGML_ASSERT(type == GGML_TYPE_Q5_K);
       launch_moe_grouped<GGML_TYPE_Q5_K>(gate, up, input, groups, output, k,
@@ -1819,6 +1859,10 @@ void mul_mat_vec_moe_gated(const void* gate, const void* up, ggml_type type,
         rows * experts_used, rows * row_stride, rows, 1, experts_used, up);
   } else if (type == GGML_TYPE_Q3_K) {
     mul_mat_vec_q_moe<GGML_TYPE_Q3_K, 2, true><<<grid, block, 0, stream>>>(
+        gate, input, ids, output, k, rows, row_stride, input_stride,
+        rows * experts_used, rows * row_stride, rows, 1, experts_used, up);
+  } else if (type == GGML_TYPE_IQ4_XS) {
+    mul_mat_vec_q_moe<GGML_TYPE_IQ4_XS, 2, true><<<grid, block, 0, stream>>>(
         gate, input, ids, output, k, rows, row_stride, input_stride,
         rows * experts_used, rows * row_stride, rows, 1, experts_used, up);
   } else {
