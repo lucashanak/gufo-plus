@@ -78,6 +78,10 @@ void* DecodeWeights(q::WeightType type, std::size_t rows, std::size_t cols,
                     std::uint32_t seed) {
   const bool q6 = type == q::WeightType::kQ6_K;
   const bool q5 = type == q::WeightType::kQ5_1;
+  const bool xs = type == q::WeightType::kIQ4_XS;
+  const std::size_t block_bytes = q6 ? 210 : q5 ? 24 : xs ? 136 : 18;
+  std::vector<std::uint8_t> host(rows * cols / (q6 || xs ? 256 : 32) *
+                                 block_bytes);
   for (auto& b : host)
     b = static_cast<std::uint8_t>(Next(&seed) & 0xFF);
   for (std::size_t b = 0; b < host.size() / block_bytes; ++b) {
@@ -179,34 +183,13 @@ int main(int argc, char** argv) {
     // The mixers chain through one inject buffer, as a decode step does;
     // block_out stays tiny so the residual stays bounded across replays.
     void* state = Device(q::HcMixQ8FusedStateBytes());
-    std::printf("tokens  five-launch_us  fused_us  speedup\n");
-    for (const std::uint32_t n : {1U, 2U, 4U, 8U}) {
-      const auto old_exec = Capture(stream, [&] {
-        for (int m = 0; m < mixers; ++m) {
-          const int c = m % copies;
-          q::HcCombineQ8_1(res, block_out, inject, parts, gamma, xn, xn_q8, n,
-                           kHidden, kStreams, 1e-6F, stream);
-          qfn_mmq_q8_0_dense_vec_preq(down[c], nullptr, xn_q8, lo, kRank,
-                                      static_cast<int>(n), kDim, stream);
-          q::SiluScaleQ8_1(lo, 1.0F / kStreams, n, kRank, lo_cols, lo_q8,
-                           stream);
-          qfn_mmq_q8_0_dense_vec_preq(up[c], nullptr, lo_q8, gate, kDim,
-                                      static_cast<int>(n), kRank, stream);
-          q::HcMixEpilogue(xn, gate, inject_w, mixed, inject, n, kHidden,
-                           kStreams, stream, mixed_q8);
-        }
-      });
-      const auto fused_exec = Capture(stream, [&] {
-        for (int m = 0; m < mixers; ++m) {
-          const int c = m % copies;
-          const q::HcFusedMix mix{down[c],        up[c],    res,      block_out,
-                                  inject,         parts,    gamma,    xn,
-                                  xn_q8,          lo,       lo_q8,    lo_cols,
-                                  inject_w,       mixed,    mixed_q8, inject,
-                                  kHidden,        kStreams, kRank,    1e-6F,
-                                  1.0F / kStreams};
-          if (!q::HcMixQ8Fused(state, mix, n, stream))
-            throw std::runtime_error("fused mixer rejected");
+    // Q8_0 mixers, the v3 recipe's Q6_K down / Q5_1 up compact rows, IQ4_NL
+    // mixers and Swift 1.5 IQ4_XS's IQ4_XS down / IQ4_NL up.
+    const q::WeightType formats[4][2] = {
+        {q::WeightType::kQ8_0, q::WeightType::kQ8_0},
+        {q::WeightType::kQ6_K, q::WeightType::kQ5_1},
+        {q::WeightType::kIQ4_NL, q::WeightType::kIQ4_NL},
+        {q::WeightType::kIQ4_XS, q::WeightType::kIQ4_NL}};
     for (const auto& format : formats) {
       const q::WeightType down_type = format[0];
       const q::WeightType up_type = format[1];

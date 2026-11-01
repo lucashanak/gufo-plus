@@ -564,6 +564,8 @@ int main() {
       CheckFusedDecodeMixer(n, true, q::WeightType::kIQ4_XS,
                             q::WeightType::kIQ4_NL);
     }
+    CheckFusedDecodeMixer(2, false, q::WeightType::kIQ4_XS,
+                          q::WeightType::kIQ4_NL);
     CheckFusedDecodeMixer(1, false);
     CheckFusedDecodeMixer(5, false);
     CheckFusedDecodeMixer(3, false, q::WeightType::kQ6_K, q::WeightType::kQ5_1);
