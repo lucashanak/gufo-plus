@@ -567,9 +567,12 @@ cache::Completion ContinuationAdapter::CapturePrivatePiece(
     metadata.draft = native.mtp_.position;
     metadata.blocks = native.blocks_;
     metadata.draft_blocks = native.mtp_.blocks;
+    // An AR frontier keeps no trunk rows, whichever pass produced it: a
+    // split pass, an in-pass checkpoint and a native restore record the same
+    // base.
     metadata.hidden_base =
-        state.checkpoint ? native.position_ - state.checkpoint->hidden_rows
-                         : session.hidden_base_;
+        native.position_ - (state.checkpoint ? state.checkpoint->hidden_rows
+                                             : session.KeptHiddenRows());
     metadata.residual_valid = native.mtp_.residual_valid;
     metadata.ngram = native.ngram_;
     metadata.policy = session.draft_length_.State();
