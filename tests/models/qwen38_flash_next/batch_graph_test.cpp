@@ -907,6 +907,96 @@ int SparseSplitChecks(const Executor& exec) {
   return failures == 0 ? 0 : 1;
 }
 
+/// A wide copy verification (ForwardWide) must give every row the logits of
+/// consecutive verification passes of at most eight rows, and a rollback to
+/// any kept prefix must continue exactly as those passes cut back at the
+/// same token. Chains cross segment boundaries, end mid-segment and, from
+/// the longer prompt, cross the sparse attention budget.
+int WideChecks(const Executor& exec) {
+  const auto vocab = exec.config().vocab_size;
+  std::string error;
+  int failures = 0;
+  const auto prefill = [&](std::uint32_t length) {
+    auto session =
+        exec.CreateSession(gufo::core::SessionMode::kSpeculative, 2304, &error);
+    if (!session)
+      Throw("wide session", error);
+    std::vector<std::int32_t> prompt(length);
+    for (std::uint32_t t = 0; t < length; ++t)
+      prompt[t] =
+          static_cast<std::int32_t>((t * 2246822519U + 29U) % (vocab - 2));
+    std::vector<float> logits(vocab);
+    if (!exec.Forward(*session, prompt, 1, logits.data(),
+                      Executor::ForwardMode::kPrefill, &error))
+      Throw("wide prefill", error);
+    return session;
+  };
+  // Three decode steps after the kept prefix, greedy from its last row.
+  const auto continue_from = [&](Session& session, std::int32_t token) {
+    std::vector<float> out;
+    std::vector<float> logits(vocab);
+    for (int step = 0; step < 3; ++step) {
+      if (!exec.Forward(session, std::span<const std::int32_t>(&token, 1), 1,
+                        logits.data(), Executor::ForwardMode::kDecode, &error))
+        Throw("wide continuation", error);
+      out.insert(out.end(), logits.begin(), logits.end());
+      token = Argmax(logits);
+    }
+    return out;
+  };
+  for (const std::uint32_t prompt : {300U, 2030U}) {
+    for (const std::uint32_t n : {64U, 20U, 9U}) {
+      std::vector<std::int32_t> chain(n);
+      for (std::uint32_t t = 0; t < n; ++t)
+        chain[t] =
+            static_cast<std::int32_t>((t * 40503U + prompt) % (vocab - 2));
+      for (const std::uint32_t keep :
+           {n, 1U, 7U, 8U, 9U, 16U, 17U, 40U, 56U, 57U, n - 1}) {
+        if (keep == 0 || keep > n)
+          continue;
+        auto wide = prefill(prompt);
+        std::vector<float> wide_rows(std::size_t{n} * vocab);
+        if (!exec.ForwardWide(*wide, chain, &error) ||
+            !exec.SelectBatchLogits(0, n, wide_rows.data(), &error))
+          Throw("wide verification", error);
+        if (keep < n && !exec.Rollback(*wide, keep, &error))
+          Throw("wide rollback", error);
+        // Consecutive passes of at most eight rows, the one holding the
+        // last kept token cut back to it.
+        auto reference = prefill(prompt);
+        std::vector<float> rows;
+        for (std::uint32_t first = 0; first < keep; first += 8) {
+          const auto count = std::min(8U, n - first);
+          std::vector<float> logits(std::size_t{count} * vocab);
+          if (!exec.Forward(
+                  *reference,
+                  std::span<const std::int32_t>(chain).subspan(first, count),
+                  count, logits.data(), Executor::ForwardMode::kVerify,
+                  &error) ||
+              !exec.Rollback(*reference, std::min(count, keep - first), &error))
+            Throw("reference verification", error);
+          rows.insert(rows.end(), logits.begin(), logits.end());
+        }
+        const bool same_rows =
+            std::memcmp(
+                rows.data(), wide_rows.data(),
+                std::min(rows.size(), wide_rows.size()) * sizeof(float)) == 0;
+        const auto next = Argmax(std::span<const float>(wide_rows).subspan(
+            std::size_t{keep - 1} * vocab, vocab));
+        const bool same_state =
+            wide->position() == reference->position() &&
+            continue_from(*wide, next) == continue_from(*reference, next);
+        std::cout << "wide prompt=" << prompt << " rows=" << n
+                  << " keep=" << keep << ": logits "
+                  << (same_rows ? "exact" : "DIFFER") << ", continuation "
+                  << (same_state ? "exact" : "DIFFERS") << '\n';
+        failures += !same_rows + !same_state;
+      }
+    }
+  }
+  return failures == 0 ? 0 : 1;
+}
+
 }  // namespace
 
 int main() {

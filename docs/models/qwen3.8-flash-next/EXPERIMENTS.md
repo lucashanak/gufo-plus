@@ -15,10 +15,41 @@
 | Prefill pass rows versus device memory (November 2, 2026) | Reverted to 4,096 rows; tracked in #952. The forward scratch is sized from the pass at load, whatever `--prefill-chunk` says. On main `6246d77a` (ROCm 10.1, UD-Q4_K_XL + MTP), GTT after `gufo serve` load and `gufo bench -n 16 -r 3` (one ordered pass, 16K → 8K → 4K), 4,096 / 8,192 / 16,384 rows: GTT 89.12 / +1.36 / +4.09 GiB; pp8192 1,987 / 2,055 / 2,062; pp16384 1,955 / 2,021 / 2,055; pp32768 1,927 / 1,990 / 2,023 tok/s; pp2048 and tg16 unchanged. The extra memory left Windows hosts without snapshot headroom (#937). |
 | 16,384-row passes in the original tile order | Rejected: experts −13.9 µs/token, but the dense GEMMs re-read activations for every row tile once a pass outgrew the caches (+17 µs/token; HC down +5.4, fused SSM projection +4.5), so pp32768 stayed 1,661 → 1,663. |
 | Per-pass fixed cost | Not a lever: head GEMV, MTP boundary row and idle gaps total about 3 ms per 4,096-row pass (0.7 µs/token); the GPU is 99.8% busy across a bench prefill. |
+## Wide prompt-lookup verification (November 1, 2026)
 
-## One-launch decode HC mixer (October 29, 2026)
+Strix Halo gfx1151, ROCm 7.2.4, Swift 1.5 IQ4_XS with the Q8_0 MTP head,
+`--sessions 8`, 120 W package limit. HTTP streaming, thinking off, one fresh
+server per build, production `addeb30c` and the candidate alternating in one
+block. Rewrites re-emit a file from the prompt: a 220-line Python module with a
+rename, added docstrings or return hints (2,222–2,238 tokens), a 150-line C++
+header with a rename (1,675), SEARCH/REPLACE blocks (1,122) and lines 60–160 of
+a line-numbered tool-read listing (1,099). Client decode tok/s:
 
-Upstream `main` 34ebb5fe against the branch, Strix Halo (ROCm 7.2.4), UD-Q4_K_XL + shared Q8_0 MTP, `gufo serve --sessions 1 --context 65536`, greedy, thinking off, five fixed prompts (CPU caches, a Python red-black tree, TCP congestion control, Czech railway history, a C++ ISO 8601 parser) of 384 generated tokens; one server process per arm, means of the five decode rates. The first process after another workload reads cold PLE rows and runs 2-4% slower, so every hold started with a discarded warm-up and main ran before and after the candidates.
+| Workload | Production | Candidate | Verifications |
+| --- | ---: | ---: | ---: |
+| Python rename, greedy | 124.1 | 187.9 | 280 → 53 |
+| Python docstrings, greedy | 122.4 | 186.9 | 286 → 54 |
+| Python return hints, greedy | 123.5 | 194.4 | 279 → 41 |
+| C++ rename, greedy | 124.1 | 186.5 | 212 → 41 |
+| SEARCH/REPLACE blocks, greedy | 106.4 | 119.9 | 159 → 104 |
+| Line-numbered listing, greedy | 88.9 | 89.0 | 185 → 185 |
+| Prose / code / Czech, greedy (512 tokens) | 66.5 / 83.6 / 57.6 | 66.3 / 83.4 / 57.6 | unchanged |
+| Python rename, temperature 1 | 123.9 | 182.9 | 280 → 58 |
+| C++ rename, temperature 1 | 126.0 | 191.7 | 211 → 39 |
+| Python rename, second request joins after 6 s (aggregate) | 135.0 | 158.0 | |
+| C++ rename, second request joins after 6 s (aggregate) | 132.0 | 171.8 | |
+| Python rename, eight requests (aggregate) | 206.0 | 205.7 | unchanged |
+
+Every greedy output, alone, staggered and eight-way, is byte-identical to
+production. The sampled requests are unseeded, so their texts may differ run
+to run; 98–100 % of their copied tokens were accepted, as in production.
+
+| Variant | Outcome |
+| --- | --- |
+| 32-row limit | Rejected: rename/docstrings/hints/C++ 157.3/168.4/174.4/170.9 tok/s, against 188.1/187.0/195.0/185.9 at 64 in the same block. At 64 the Python rename's cycles average 42 tokens in 223 ms; production's 7.9 tokens in 64 ms. |
+| Double the width after one whole copy | Rejected: the line-numbered listing breaks every copy at the next line number, so each doubled copy wasted rows (87.9 → 85.1 tok/s). Two whole copies in a row: 89.0–89.2. |
+| Ordinary verification widened past eight rows | Not tried: the eight-row trunk kernels are what the single-token arithmetic is checked against; the wide pass reuses the batched route, which already decodes 64 rows exactly. |
+
 ## Upstream 0.27.0 merge (October 29, 2026)
 
 Merged build on Strix Halo (ROCm 7.2.4, v3 recipe + MTP) against production
