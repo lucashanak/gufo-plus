@@ -1158,11 +1158,11 @@ public:
       const auto& c = model_->GetConfig();
       const std::size_t session_planes = hip::QwenGrowableKv::FullBytes(
           2 * std::size_t{c.FullAttentionLayerCount()},
-          std::size_t{c.num_key_value_heads} * c.head_dim *
-              sizeof(std::uint16_t),
+          execution_policy_.AttentionKvRowBytes(
+              std::size_t{c.num_key_value_heads} * c.head_dim),
           max_context_);
-      kv_sessions_ = std::make_shared<hip::QwenKvSessions>(
-          kv_cache_bytes, 64 * session_planes);
+      kv_sessions_ = std::make_shared<hip::QwenKvSessions>(kv_cache_bytes,
+                                                           64 * session_planes);
     }
     if (!artifact_fingerprint.empty()) {
       const bool speculative = dflash_model_ != nullptr;
