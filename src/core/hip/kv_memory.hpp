@@ -1,8 +1,9 @@
-#ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_KV_MEMORY_HPP_
-#define GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_KV_MEMORY_HPP_
+#ifndef GUFO_CORE_HIP_KV_MEMORY_HPP_
+#define GUFO_CORE_HIP_KV_MEMORY_HPP_
 
 #include <hip/hip_runtime.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -10,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-namespace gufo::models::qwen38_flash_next::rocm {
+namespace gufo::hip {
 
 /// Physical memory for K/V rows that grow with the tokens a session holds,
 /// shared by one executor's sessions under a byte budget. Rows live in
@@ -19,8 +20,7 @@ namespace gufo::models::qwen38_flash_next::rocm {
 /// graphs and borrowed row views keep their addresses while it grows.
 class KvPool {
 public:
-  /// Physical memory is mapped in chunks of this size, or of the whole
-  /// buffer rounded up to kGranuleBytes when it is smaller.
+  /// Physical memory is mapped in chunks of this size.
   static constexpr std::size_t kChunkBytes = std::size_t{2} << 20;
   /// A multiple of the device's allocation granularity.
   static constexpr std::size_t kGranuleBytes = std::size_t{64} << 10;
@@ -42,21 +42,46 @@ public:
   /// Takes `bytes` of the budget, or nothing when they do not fit.
   [[nodiscard]] bool Charge(std::size_t bytes);
   void Refund(std::size_t bytes);
-  /// A virtual range of `bytes`: a released one of that size, or a new
-  /// reservation. Null when the device has no address space left.
-  [[nodiscard]] void* ReserveRange(std::size_t bytes, hipError_t* status);
+  using Clock = std::chrono::steady_clock;
+  /// How long an unmapped address stays unused before chunks map there
+  /// again. On ROCm 7.2.4, chunks mapped into addresses whose previous
+  /// mapping had just been removed (hipMemUnmap, hipFree or
+  /// hipMemAddressFree) intermittently fault on first access with an
+  /// invalid page table entry, though the new mapping succeeded; draining
+  /// the device in between does not help, time does.
+  static constexpr std::chrono::milliseconds kRemapQuarantine{1000};
+  /// Waits until `unmapped_at` is past the quarantine.
+  static void AwaitQuarantine(Clock::time_point unmapped_at);
+  /// A virtual range of `bytes`: fresh address space from the arena when
+  /// there is room, else a released one of that size, else a new
+  /// reservation. `*unmapped_at` is when a released range last lost its
+  /// chunks (the epoch for fresh space). Null when the device has no
+  /// address space left.
+  [[nodiscard]] void* ReserveRange(std::size_t bytes, hipError_t* status,
+                                   Clock::time_point* unmapped_at);
   /// Keeps an unmapped range for ReserveRange. Ranges go back to HIP only
-  /// when the pool is destroyed: on ROCm 7.2.4, chunks mapped into an
-  /// address range that an earlier hipMemAddressFree or hipFree released
-  /// intermittently fault on first access.
-  void ReleaseRange(void* base, std::size_t bytes);
+  /// when the pool is destroyed.
+  void ReleaseRange(void* base, std::size_t bytes,
+                    Clock::time_point unmapped_at);
+  /// Reserves one address arena of up to `bytes` (halved until HIP grants
+  /// it) that later ranges are carved from. Taken before sessions allocate
+  /// and free their other buffers, it never covers an address a later
+  /// hipFree releases. Ranges past the arena are reserved one by one.
+  [[nodiscard]] bool ReserveArena(std::size_t bytes, std::string* error);
 
 private:
   mutable std::mutex mutex_;
   std::size_t budget_;
   std::size_t mapped_{0};
   std::vector<std::pair<void*, std::size_t>> ranges_;  ///< every reservation
-  std::vector<std::pair<void*, std::size_t>> free_ranges_;
+  struct FreeRange {
+    void* base;
+    std::size_t bytes;
+    Clock::time_point unmapped_at;
+  };
+  std::vector<FreeRange> free_ranges_;
+  std::uint8_t* arena_next_{nullptr};
+  std::uint8_t* arena_end_{nullptr};
 };
 
 /// One K, V or pooled-key buffer of a session: rows of `row_bytes` up to
@@ -85,6 +110,8 @@ public:
   }
   /// Bytes Grow(rows) would add.
   [[nodiscard]] std::size_t GrowthBytes(std::size_t rows) const noexcept;
+  /// Bytes Shrink(rows) would release.
+  [[nodiscard]] std::size_t ShrinkBytes(std::size_t rows) const noexcept;
   /// Backs rows [0, rows), charging the pool. New chunks are zeroed on
   /// `stream` before any later work on it. On failure nothing changes.
   [[nodiscard]] bool Grow(std::size_t rows, hipStream_t stream,
@@ -102,8 +129,16 @@ private:
   std::size_t row_bytes_{0};
   std::size_t max_rows_{0};
   std::vector<hipMemGenericAllocationHandle_t> chunks_;
+  /// Chunks below this index were mapped before (by this buffer or the
+  /// range's previous owner); remapping them waits out the quarantine.
+  std::size_t dirty_chunks_{0};
+  KvPool::Clock::time_point unmapped_at_{};
 };
 
-}  // namespace gufo::models::qwen38_flash_next::rocm
+/// Device properties for K/V chunks: pinned device memory on the current
+/// device.
+[[nodiscard]] hipMemAllocationProp KvChunkProp();
 
-#endif  // GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_KV_MEMORY_HPP_
+}  // namespace gufo::hip
+
+#endif  // GUFO_CORE_HIP_KV_MEMORY_HPP_

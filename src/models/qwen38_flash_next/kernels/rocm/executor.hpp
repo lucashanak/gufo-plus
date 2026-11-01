@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "src/core/hip/host_allocations.hpp"
+#include "src/core/hip/kv_memory.hpp"
 #include "src/core/session_mode.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
 #include "src/models/qwen/vision/device_input.hpp"
@@ -26,11 +27,13 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
-#include "src/models/qwen38_flash_next/kernels/rocm/kv_memory.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
+
+using gufo::hip::GrowableRows;
+using gufo::hip::KvPool;
 
 /// Compact decode-row formats with a fused gate/up decode GEMV
 /// (qfn_mmq_moe_gated_vec); the others project gate and up separately.

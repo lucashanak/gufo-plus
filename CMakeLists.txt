@@ -377,6 +377,7 @@ if (ENGINE_ENABLE_HIP)
     src/models/minimax_h3/video_vae.hip
     src/models/minimax_h3/attention.hip
     src/core/hip/snapshot_copy.hip
+    src/core/hip/kv_memory.cpp
     src/core/hip/weight_upload.cpp
     src/core/speculative/speculative_verifier.cpp
   )

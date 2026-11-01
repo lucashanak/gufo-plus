@@ -1032,6 +1032,14 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   if (!KvPool::Supported(error_msg))
     return nullptr;
   e->kv_pool_ = std::make_unique<KvPool>(options.kv_budget);
+  // The address arena first: session buffers allocated and freed later never
+  // share an address with K/V chunks (see KvPool::kRemapQuarantine). It
+  // holds 64 sessions at the executor's context.
+  if (!e->kv_pool_->ReserveArena(
+          64 * e->GrowableBytes(core::SessionMode::kSpeculative,
+                                e->context_capacity_),
+          error_msg))
+    return nullptr;
   e->yarn_ = MakeYarnRope(c.rope_scaling, c.rotary_dim, c.rope_theta);
   const std::size_t T = e->options_.max_batch;
   e->blaslt_ = BlasLt::Create(e->stream_, error_msg);
