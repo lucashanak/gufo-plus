@@ -2189,7 +2189,8 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
                           a.cols == b.cols && a.experts == b.experts;
   if (!MatrixRows(n_tokens) && n_used <= 32 && same_shape &&
       (a.type == GgmlType::kQ3_K || a.type == GgmlType::kQ4_K ||
-       a.type == GgmlType::kQ5_K || a.type == GgmlType::kQ8_0)) {
+       a.type == GgmlType::kQ5_K || a.type == GgmlType::kQ8_0 ||
+       a.type == GgmlType::kIQ4_XS)) {
     // The shared expert quantized the same rows (or their producer did).
     const void* ready = ReadyQ8(x, n_tokens, a.cols);
     if ((ready != nullptr
@@ -3292,9 +3293,9 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     const auto gate_type = static_cast<WeightType>(l.ffn_gate_exps.type);
     // The importance formats have no paired kernel: their prefill tiles
     // take the separate launches at the wide map's 128-token height.
-    const bool paired = gate_type == WeightType::kQ3_K ||
-                        gate_type == WeightType::kQ4_K ||
-                        gate_type == WeightType::kQ5_K;
+    const bool paired =
+        gate_type == WeightType::kQ3_K || gate_type == WeightType::kQ4_K ||
+        gate_type == WeightType::kQ5_K || gate_type == WeightType::kIQ4_XS;
     const bool wide = routed_wide_tiles_ != 0;
     const std::uint32_t gate_tiles =
         wide ? routed_wide_tiles_ : routed_n_tiles_;

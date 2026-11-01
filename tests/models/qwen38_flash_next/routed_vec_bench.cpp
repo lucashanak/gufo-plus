@@ -6,8 +6,8 @@
 // bandwidth and an FNV-1a hash of every layer's output.
 //
 // routed_vec_bench [reps] [gate format] [down format] [routing] [rows,...]
-//   formats: q3_k q4_k q5_k q8_0 (gated kernel), q2_k q6_k q4_0 iq2_xxs
-//   iq3_xxs iq3_s iq4_xs (paired vector kernel and SwiGLU) / iq4_nl q5_1
+//   formats: q3_k q4_k q5_k q8_0 iq4_xs (gated kernel), q2_k q6_k q4_0
+//   iq2_xxs iq3_xxs iq3_s (paired vector kernel and SwiGLU) / iq4_nl q5_1
 //   q5_0 q4_0 q8_0 (default q3_k iq4_nl);
 //   routing: disjoint, random, overlap, shared or all (default all).
 #include <hip/hip_fp16.h>
@@ -70,7 +70,8 @@ const Format kFormats[] = {
 /// Formats with the gated gate/up kernel; the others take MoeExperts'
 /// paired vector projections and SwiGLU.
 bool Gated(int type) {
-  return type == kQ3_K || type == kQ4_K || type == kQ5_K || type == kQ8_0;
+  return type == kQ3_K || type == kQ4_K || type == kQ5_K || type == kQ8_0 ||
+         type == kIQ4_XS;
 }
 
 const Format& FindFormat(const std::string& name) {

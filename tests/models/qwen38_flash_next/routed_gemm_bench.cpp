@@ -68,8 +68,8 @@ std::size_t BlockElems(q::WeightType type) {
 }
 /// Gate/up formats without the paired kernel (separate 128-token tiles).
 bool Separate(q::WeightType type) {
-  return type == q::WeightType::kIQ4_XS || type == q::WeightType::kIQ3_S ||
-         type == q::WeightType::kIQ3_XXS || type == q::WeightType::kIQ2_XS;
+  return type == q::WeightType::kIQ3_S || type == q::WeightType::kIQ3_XXS ||
+         type == q::WeightType::kIQ2_XS;
 }
 q::WeightType ParseType(const std::string& name) {
   if (name == "q3_k")

@@ -996,7 +996,8 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
   if ((gate_type == core::GgmlType::kQ3_K ||
        gate_type == core::GgmlType::kQ4_K ||
        gate_type == core::GgmlType::kQ5_K ||
-       gate_type == core::GgmlType::kQ8_0) &&
+       gate_type == core::GgmlType::kQ8_0 ||
+       gate_type == core::GgmlType::kIQ4_XS) &&
       l.ffn_up_exps.type == gate_type &&
       l.ffn_up_exps.rows == l.ffn_gate_exps.rows &&
       l.ffn_up_exps.cols == l.ffn_gate_exps.cols &&

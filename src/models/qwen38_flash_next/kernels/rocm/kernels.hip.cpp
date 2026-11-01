@@ -6918,9 +6918,11 @@ __launch_bounds__(256) __global__
   constexpr int kRows = 64;  // output rows (gate/up pairs) per block
   constexpr bool kQ5K = kType == WeightType::kQ5_K;
   constexpr bool kQ3K = kType == WeightType::kQ3_K;
-  constexpr std::size_t kBlockBytes = kQ3K   ? kQ3KBlockBytes
-                                      : kQ5K ? kQ5KBlockBytes
-                                             : sizeof(Q4KBlock);
+  constexpr bool kIQ4XS = kType == WeightType::kIQ4_XS;
+  constexpr std::size_t kBlockBytes = kQ3K     ? kQ3KBlockBytes
+                                      : kQ5K   ? kQ5KBlockBytes
+                                      : kIQ4XS ? 136
+                                               : sizeof(Q4KBlock);
   constexpr int kActStride = BN + 1;
   constexpr int kActBytes = BK * 4 * kActStride * 16;
   constexpr int kPairStride = kRows + 2;
@@ -6976,7 +6978,8 @@ __launch_bounds__(256) __global__
   // A superblock's raw header, high bits and this lane's code chunks,
   // loaded with its first stage's fetch and decoded at that stage's commit.
   uint4 raw_header;
-  uint4 raw_codes[4];  ///< Q4_K/Q5_K: chunk f_c of groups 0-3; Q3_K: qs, hm
+  uint4 raw_codes[4];  ///< Q4_K/Q5_K: chunk f_c of groups 0-3; Q3_K: qs, hm;
+                       ///< IQ4_XS: the stage's two K32 blocks
   uint4 raw_qh[2];     ///< Q5_K: the 32 high-bit bytes
   // The committed superblock: header, nibble-packed codes per group.
   uint4 header = make_uint4(0u, 0u, 0u, 0u);
@@ -6990,7 +6993,11 @@ __launch_bounds__(256) __global__
   const auto fetch_stage = [&]<int G>(int sb) {
     if constexpr (G == 0) {
       const std::uint8_t* blk = w_row + (sb * kBlockBytes);
-      if constexpr (kQ3K) {
+      if constexpr (kIQ4XS) {
+        // d, scales_h and scales_l: everything but the codes.
+        raw_header = make_uint4(0u, 0u, 0u, 0u);
+        __builtin_memcpy(&raw_header, blk, 8);
+      } else if constexpr (kQ3K) {
         raw_header = make_uint4(0u, 0u, 0u, 0u);
         __builtin_memcpy(&raw_header, blk + 96, 14);
         __builtin_memcpy(&raw_codes[0], blk + 32 + (16 * f_c), 16);
@@ -7009,6 +7016,13 @@ __launch_bounds__(256) __global__
           raw_codes[g] = chunks[kCodeChunk + (g * 2) + f_c];
       }
     }
+    if constexpr (kIQ4XS) {
+      // A K32 block keeps elements 0-15 / 16-31 in the low / high nibbles
+      // of its 16 bytes: both lanes of a pair read blocks 2G and 2G + 1.
+      const std::uint8_t* qs = w_row + (sb * kBlockBytes) + 8 + (32 * G);
+      __builtin_memcpy(&raw_codes[0], qs, 16);
+      __builtin_memcpy(&raw_codes[1], qs + 16, 16);
+    }
     const int kb0 = (sb * 8) + (G * 2);
 #pragma unroll
     for (int i = 0; i < kActFetch; ++i) {
@@ -7019,11 +7033,16 @@ __launch_bounds__(256) __global__
 
   // The committed stage's (scale, bias) for K32 block kb of the group, and
   // Q5_K's high-bit word.
-  std::uint32_t own_scale = 0;   ///< Q4_K/Q5_K: block 2G + f_c; Q3_K: 2G
-  std::uint32_t own_scale2 = 0;  ///< Q3_K: block 2G + 1
+  std::uint32_t own_scale = 0;   ///< Q4_K/Q5_K: block 2G + f_c; Q3_K/IQ4_XS: 2G
+  std::uint32_t own_scale2 = 0;  ///< Q3_K/IQ4_XS: block 2G + 1
   std::uint32_t own_high = 0;    ///< Q5_K: block 2G + f_c
   const auto commit_stage = [&]<int G>() {
-    if constexpr (G == 0) {
+    if constexpr (kIQ4XS) {
+      if constexpr (G == 0)
+        header = raw_header;
+      codes[0] = raw_codes[0];
+      codes[1] = raw_codes[1];
+    } else if constexpr (G == 0) {
       header = raw_header;
       if constexpr (kQ3K) {
 #pragma unroll
@@ -7039,7 +7058,22 @@ __launch_bounds__(256) __global__
         }
       }
     }
-    if constexpr (kQ3K) {
+    if constexpr (kIQ4XS) {
+      // RoutedF16GEMMKernel's F16 block scale d * (ls - 32), bias zero.
+      const float d =
+          __half2float(__builtin_bit_cast(__half, std::uint16_t(header.x)));
+      const std::uint32_t scales_h = header.x >> 16U;
+      const auto scale_of = [&](int ib) {
+        const int ls = static_cast<int>(
+            ((header.y >> (8 * (ib / 2) + 4 * (ib % 2))) & 0xFU) |
+            (((scales_h >> (2 * ib)) & 3U) << 4U));
+        return row_live ? std::uint32_t(__builtin_bit_cast(
+                              std::uint16_t, __float2half(d * float(ls - 32))))
+                        : 0U;
+      };
+      own_scale = scale_of(2 * G);
+      own_scale2 = scale_of((2 * G) + 1);
+    } else if constexpr (kQ3K) {
       // This lane's element half of both K32 blocks of the group.
       own_scale = Q3KScaleBias(header, (2 * (2 * G)) + f_c, row_live);
       own_scale2 = Q3KScaleBias(header, (2 * (2 * G + 1)) + f_c, row_live);
@@ -7088,19 +7122,21 @@ __launch_bounds__(256) __global__
   for (int j = 0; j < kTokTiles; ++j)
     acc[j] = v8f{0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
 
-  constexpr float kMagic = kQ3K ? -1028.0F : -1024.0F;
+  // IQ4_XS takes the Q8_0 route's signed bytes (q + 128, 1152 magic).
+  constexpr float kMagic = kIQ4XS ? -1152.0F : kQ3K ? -1028.0F : -1024.0F;
   const __half2 magic = __floats2half2_rn(kMagic, kMagic);
   const auto compute_stage = [&]<int G>() {
-    const uint4 c = codes[G];
-    const std::uint32_t words[4] = {c.x, c.y, c.z, c.w};
-    const std::uint32_t peer_scale = kQ3K ? 0U : SwapHalves(own_scale);
+    constexpr bool kOwnScales = kQ3K || kIQ4XS;
+    const std::uint32_t peer_scale = kOwnScales ? 0U : SwapHalves(own_scale);
     const std::uint32_t peer_high = kQ5K ? SwapHalves(own_high) : 0U;
 #pragma unroll
     for (int kb = 0; kb < BK; ++kb) {
-      const __half2 sb =
-          __builtin_bit_cast(__half2, kQ3K ? (kb == 0 ? own_scale : own_scale2)
-                                      : f_c == kb ? own_scale
-                                                  : peer_scale);
+      const uint4 c = codes[kIQ4XS ? kb : G];
+      const std::uint32_t words[4] = {c.x, c.y, c.z, c.w};
+      const __half2 sb = __builtin_bit_cast(
+          __half2, kOwnScales  ? (kb == 0 ? own_scale : own_scale2)
+                   : f_c == kb ? own_scale
+                               : peer_scale);
       const __half2 scale2 = __low2half2(sb);
       const __half2 bias2 = __high2half2(sb);
       const std::uint32_t high =
@@ -7108,9 +7144,15 @@ __launch_bounds__(256) __global__
       __half2 h[8];
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
-        std::uint32_t nib = (words[i] >> (4U * kb)) & 0x0F0F0F0FU;
-        if constexpr (kQ5K)
-          nib |= SpreadHighBits((high >> (4 * i)) & 0xFU);
+        std::uint32_t nib;
+        if constexpr (kIQ4XS) {
+          // Lane f_c decodes elements 16 f_c .. 16 f_c + 15 of block 2G + kb.
+          nib = IQ4NLBiasedBytes(words[i] >> (4U * f_c));
+        } else {
+          nib = (words[i] >> (4U * kb)) & 0x0F0F0F0FU;
+          if constexpr (kQ5K)
+            nib |= SpreadHighBits((high >> (4 * i)) & 0xFU);
+        }
         CodesToHalves(nib, magic, scale2, bias2, h[2 * i], h[2 * i + 1]);
       }
       using v8u = __attribute__((__vector_size__(32))) std::uint32_t;
@@ -8784,20 +8826,15 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                                  rows_in, rows_out, swiglu_gate, out, out_half,
                                  m, k, stream);
     case 128: {
-      if (type == WeightType::kIQ4_XS || type == WeightType::kIQ3_S ||
-          type == WeightType::kIQ3_XXS || type == WeightType::kIQ2_XS) {
-        // IQ4_XS / IQ3_S gate/up have no paired kernel: prefill runs these
-        // 128-token tiles separately (each token's sums are the 16/48-row
-        // tiles').
+      if (type == WeightType::kIQ3_S || type == WeightType::kIQ3_XXS ||
+          type == WeightType::kIQ2_XS) {
+        // IQ3_S / IQ3_XXS / IQ2_XS gate/up have no paired kernel: prefill
+        // runs these 128-token tiles separately (each token's sums are the
+        // 16/48-row tiles').
         constexpr int kBM = 128;
         const dim3 grid(static_cast<unsigned int>((m + kBM - 1) / kBM),
                         n_tiles);
-        if (type == WeightType::kIQ4_XS)
-          hipLaunchKernelGGL(
-              (RoutedF16GEMMKernel<WeightType::kIQ4_XS, kBM, 128, 2>), grid,
-              dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in,
-              rows_out, swiglu_gate, out, out_half, m, k);
-        else if (type == WeightType::kIQ3_S)
+        if (type == WeightType::kIQ3_S)
           hipLaunchKernelGGL(
               (RoutedF16GEMMKernel<WeightType::kIQ3_S, kBM, 128, 2>), grid,
               dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in,
@@ -8849,10 +8886,11 @@ bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
   }
   const dim3 grid(static_cast<unsigned int>((m + 63) / 64), n_tiles);
   const auto kernel =
-      type == WeightType::kQ4_K   ? RoutedPairF16Kernel<WeightType::kQ4_K>
-      : type == WeightType::kQ5_K ? RoutedPairF16Kernel<WeightType::kQ5_K>
-      : type == WeightType::kQ3_K ? RoutedPairF16Kernel<WeightType::kQ3_K>
-                                  : nullptr;
+      type == WeightType::kQ4_K     ? RoutedPairF16Kernel<WeightType::kQ4_K>
+      : type == WeightType::kQ5_K   ? RoutedPairF16Kernel<WeightType::kQ5_K>
+      : type == WeightType::kQ3_K   ? RoutedPairF16Kernel<WeightType::kQ3_K>
+      : type == WeightType::kIQ4_XS ? RoutedPairF16Kernel<WeightType::kIQ4_XS>
+                                    : nullptr;
   if (kernel == nullptr)
     return false;
   hipLaunchKernelGGL(kernel, grid, dim3(kThreads), 0, stream, gate, up, x,

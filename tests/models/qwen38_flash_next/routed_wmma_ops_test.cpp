@@ -823,7 +823,7 @@ void CheckVectorGrouping(bool down = false, int experts = 8) {
                          q::WeightType::kQ8_0}
            : std::vector{q::WeightType::kQ3_K, q::WeightType::kQ4_K,
                          q::WeightType::kQ5_K, q::WeightType::kQ5_1,
-                         q::WeightType::kQ8_0};
+                         q::WeightType::kQ8_0, q::WeightType::kIQ4_XS};
   std::vector<float> x(tokens * cols);
   std::uint32_t seed = 37;
   // Mix ordinary and small activations: saturated SwiGLU alone misses
@@ -854,16 +854,20 @@ void CheckVectorGrouping(bool down = false, int experts = 8) {
                         MakeIQ4NL(experts, rows, cols, 81),
                         MakeQ8_0(experts, rows, cols, 83)};
     } else {
-      weights = {MakeQ3K(experts, rows, cols, 7),
-                 MakeQ4K(experts, rows, cols, 11),
-                 MakeQ5K(experts, rows, cols, 13),
-                 MakeQ5_1(experts, rows, cols, 17),
-                 MakeQ8_0(experts, rows, cols, 23)};
-      paired_weights = {MakeQ3K(experts, rows, cols, 67),
-                        MakeQ4K(experts, rows, cols, 71),
-                        MakeQ5K(experts, rows, cols, 73),
-                        MakeQ5_1(experts, rows, cols, 79),
-                        MakeQ8_0(experts, rows, cols, 83)};
+      weights = {
+          MakeQ3K(experts, rows, cols, 7),
+          MakeQ4K(experts, rows, cols, 11),
+          MakeQ5K(experts, rows, cols, 13),
+          MakeQ5_1(experts, rows, cols, 17),
+          MakeQ8_0(experts, rows, cols, 23),
+          MakeAny(gufo::core::GgmlType::kIQ4_XS, experts, rows, cols, 29)};
+      paired_weights = {
+          MakeQ3K(experts, rows, cols, 67),
+          MakeQ4K(experts, rows, cols, 71),
+          MakeQ5K(experts, rows, cols, 73),
+          MakeQ5_1(experts, rows, cols, 79),
+          MakeQ8_0(experts, rows, cols, 83),
+          MakeAny(gufo::core::GgmlType::kIQ4_XS, experts, rows, cols, 89)};
     }
     const std::size_t count = tokens * used * rows;
     const std::vector<float> dirty(count + 2 * guard, poison);
@@ -958,7 +962,8 @@ void CheckVectorGrouping(bool down = false, int experts = 8) {
       if (formats[f] == q::WeightType::kQ3_K ||
           formats[f] == q::WeightType::kQ4_K ||
           formats[f] == q::WeightType::kQ5_K ||
-          formats[f] == q::WeightType::kQ8_0) {
+          formats[f] == q::WeightType::kQ8_0 ||
+          formats[f] == q::WeightType::kIQ4_XS) {
         // Compare the fused vector path with the original GPU SwiGLU too:
         // inactive experts, nonfinite scales and a ragged last row must
         // retain their exact values and output guards.
@@ -1053,13 +1058,17 @@ void CheckPairedMmq() {
 /// one must produce the same tokens.
 void CheckGatedDecodeShape() {
   constexpr int experts = 32, rows = 640, cols = 2560, used = 10, tokens = 8;
-  for (const auto type : {q::WeightType::kQ3_K, q::WeightType::kQ4_K,
-                          q::WeightType::kQ5_K, q::WeightType::kQ8_0}) {
+  for (const auto type :
+       {q::WeightType::kQ3_K, q::WeightType::kQ4_K, q::WeightType::kQ5_K,
+        q::WeightType::kQ8_0, q::WeightType::kIQ4_XS}) {
     const auto make = [&](std::uint32_t seed) {
       return type == q::WeightType::kQ3_K   ? MakeQ3K(experts, rows, cols, seed)
              : type == q::WeightType::kQ4_K ? MakeQ4K(experts, rows, cols, seed)
              : type == q::WeightType::kQ5_K ? MakeQ5K(experts, rows, cols, seed)
-                                            : MakeQ8_0(experts, rows, cols, seed);
+             : type == q::WeightType::kQ8_0
+                 ? MakeQ8_0(experts, rows, cols, seed)
+                 : MakeAny(gufo::core::GgmlType::kIQ4_XS, experts, rows, cols,
+                           seed);
     };
     const auto a = make(101), b = make(202);
     std::vector<float> x(tokens * cols);
@@ -1164,14 +1173,15 @@ std::vector<__half> SeparateSwiglu(const Routing& r, const void* gate,
                                    std::size_t k, std::uint32_t tile_rows,
                                    std::vector<float>* gate_out = nullptr);
 
-/// The wide prefill gate/up route: the paired kernel, or for IQ4_XS (which
-/// has none) the separate launches at the 128-token tile height.
+/// The wide prefill gate/up route: the paired kernel, or for the formats
+/// without one (IQ3_S, IQ3_XXS, IQ2_XS) the separate launches at the
+/// 128-token tile height.
 std::vector<__half> PairedSwiglu(const Routing& r, const void* gate,
                                  const void* up, q::WeightType type,
                                  const __half* x, std::size_t m,
                                  std::size_t k) {
-  if (type == q::WeightType::kIQ4_XS || type == q::WeightType::kIQ3_S ||
-      type == q::WeightType::kIQ3_XXS || type == q::WeightType::kIQ2_XS)
+  if (type == q::WeightType::kIQ3_S || type == q::WeightType::kIQ3_XXS ||
+      type == q::WeightType::kIQ2_XS)
     return SeparateSwiglu(r, gate, up, type, x, m, k, 128);
   std::uint32_t n = 0;
   auto* tiles = r.Tiles(128, &n);

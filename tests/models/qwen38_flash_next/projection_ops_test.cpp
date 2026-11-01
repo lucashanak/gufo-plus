@@ -1803,6 +1803,11 @@ int main() {
           CheckDenseFormat(type, 641, 2560,
                            0xF0A70000U + static_cast<std::uint32_t>(type)) &&
           formats;
+    // IQ4_XS trunk shapes (Swift recipe): ssm_out and the shared expert.
+    formats =
+        CheckDenseFormat(GgmlType::kIQ4_XS, 2561, 6144, 0xF0C76144U) && formats;
+    formats =
+        CheckDenseFormat(GgmlType::kIQ4_XS, 643, 2560, 0xF0C70643U) && formats;
     for (const GgmlType type :
          {GgmlType::kQ4_0, GgmlType::kQ4_1, GgmlType::kQ5_0, GgmlType::kQ5_1})
       for (const auto& [rows, cols] :

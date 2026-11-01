@@ -39,7 +39,7 @@ using gufo::hip::KvPool;
 /// (qfn_mmq_moe_gated_vec); the others project gate and up separately.
 inline bool GatedVecFormat(core::GgmlType type) {
   return type == core::GgmlType::kQ3_K || type == core::GgmlType::kQ4_K ||
-         type == core::GgmlType::kQ5_K;
+         type == core::GgmlType::kQ5_K || type == core::GgmlType::kIQ4_XS;
 }
 
 class Executor;

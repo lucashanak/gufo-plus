@@ -36,6 +36,7 @@ constexpr Format kQ5K{"Q5_K", 13, 256, 176};
 constexpr Format kQ6K{"Q6_K", 14, 256, 210};
 constexpr Format kQ51{"Q5_1", 7, 32, 24};
 constexpr Format kIQ4NL{"IQ4_NL", 20, 32, 18};
+constexpr Format kIQ4XS{"IQ4_XS", 23, 256, 136};
 
 void CheckHip(hipError_t error, const char* operation) {
   if (error != hipSuccess)
@@ -102,6 +103,11 @@ void KQuant() {
       {"ssm_out", 2560, 6144, {kQ4K, kQ6K}},
       {"hc_down", 320, 10240, {kQ4K, kQ6K, kIQ4NL}},
       {"hc_up", 10240, 320, {kQ51, kIQ4NL}},
+      // The Swift recipe's IQ4_XS trunk.
+      {"attn_qkv", 10240, 2560, {kIQ4XS}},
+      {"attn_gate", 6144, 2560, {kIQ4XS}},
+      {"ssm_out", 2560, 6144, {kIQ4XS}},
+      {"hc_down", 320, 10240, {kIQ4XS}},
   };
   for (const Shape& s : shapes) {
     void* q8 =
@@ -117,7 +123,7 @@ void KQuant() {
     for (const Format& f : s.formats) {
       void* compact_rows = RandomDevice(
           std::size_t(s.m) * s.k / f.block * f.bytes, f.bytes, 0, 0x4B1U + s.m);
-      for (const int rows : {8, 9, 16, 32, 48, 64}) {
+      for (const int rows : {2, 4, 8, 9, 16, 24, 32, 48, 64}) {
         // DenseBatch's former Q8_0 route (QuantizeBatch, then its chunks).
         const auto before = [&] {
           Require(qfn_mmq_quantize_q8_1(x, xq, rows, s.k, nullptr), "quantize");
