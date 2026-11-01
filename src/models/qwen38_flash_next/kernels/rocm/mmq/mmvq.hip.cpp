@@ -408,6 +408,11 @@ template<> struct MoeFragment<GGML_TYPE_IQ4_XS> {
     d = __half2float(b->d);
   }
 
+  /// acc + vec_dot_iq4_xs_q8_1 as the single-token kernel compiles it:
+  /// dd = d * d8 rounded, then one FMA dd * float(sumi) + acc. Left to
+  /// itself fast-math regroups a hoisted d into (sumi * d) * d8.
+  __device__ __forceinline__ float DotAcc(const block_q8_1* y, int iqs,
+                                          float acc) const {
     const block_q8_1* q = y + iqs / 4;
     int sumi = 0;
 #pragma unroll
@@ -416,6 +421,11 @@ template<> struct MoeFragment<GGML_TYPE_IQ4_XS> {
       sumi = ggml_hip_dp4a(v[j].y, get_int_b4(q->qs, j + 4), sumi);
     }
     sumi *= ls;
+    float d8 = __low2float(q->ds);
+    asm("" : "+v"(d8));
+    float dd = __fmul_rn(d, d8);
+    asm("" : "+v"(dd));
+    return __fmaf_rn(dd, float(sumi), acc);
   }
 };
 
@@ -1378,13 +1388,12 @@ __launch_bounds__(64) static __global__
           continue;
         const auto* x = input + row_of[t] * input_stride + kb * (qk / QK8_1);
 #pragma unroll
-        for (int r = 0; r < 2; ++r)
-          sum[t][r] += dot(
-              weights,
-              input + (single_request ? token : t) * input_stride +
-                  kb * (qk / QK8_1),
-              (expert * rows + min(row0 + r, rows - 1)) * blocks_per_row + kb,
-              kqs);
+        for (int r = 0; r < block_rows; ++r) {
+          if constexpr (type == GGML_TYPE_IQ4_XS)
+            sum[t][r] = w[r].DotAcc(x, kqs, sum[t][r]);
+          else
+            sum[t][r] += w[r].Dot(x, kqs);
+        }
         // Keep one input's activations live at a time (Q4_K keeps its tuned
         // schedule).
         if constexpr (type != GGML_TYPE_Q4_K && columns > 2)
