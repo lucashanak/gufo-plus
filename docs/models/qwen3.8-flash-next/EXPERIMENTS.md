@@ -1,5 +1,40 @@
 # Qwen3.8 Flash-Next experiments
 
+## Wide prompt-lookup verification (November 1, 2026)
+
+Strix Halo gfx1151, ROCm 7.2.4, Swift 1.5 IQ4_XS with the Q8_0 MTP head,
+`--sessions 8`, 120 W package limit. HTTP streaming, thinking off, one fresh
+server per build, production `addeb30c` and the candidate alternating in one
+block. Rewrites re-emit a file from the prompt: a 220-line Python module with a
+rename, added docstrings or return hints (2,222–2,238 tokens), a 150-line C++
+header with a rename (1,675), SEARCH/REPLACE blocks (1,122) and lines 60–160 of
+a line-numbered tool-read listing (1,099). Client decode tok/s:
+
+| Workload | Production | Candidate | Verifications |
+| --- | ---: | ---: | ---: |
+| Python rename, greedy | 124.1 | 187.9 | 280 → 53 |
+| Python docstrings, greedy | 122.4 | 186.9 | 286 → 54 |
+| Python return hints, greedy | 123.5 | 194.4 | 279 → 41 |
+| C++ rename, greedy | 124.1 | 186.5 | 212 → 41 |
+| SEARCH/REPLACE blocks, greedy | 106.4 | 119.9 | 159 → 104 |
+| Line-numbered listing, greedy | 88.9 | 89.0 | 185 → 185 |
+| Prose / code / Czech, greedy (512 tokens) | 66.5 / 83.6 / 57.6 | 66.3 / 83.4 / 57.6 | unchanged |
+| Python rename, temperature 1 | 123.9 | 182.9 | 280 → 58 |
+| C++ rename, temperature 1 | 126.0 | 191.7 | 211 → 39 |
+| Python rename, second request joins after 6 s (aggregate) | 135.0 | 158.0 | |
+| C++ rename, second request joins after 6 s (aggregate) | 132.0 | 171.8 | |
+| Python rename, eight requests (aggregate) | 206.0 | 205.7 | unchanged |
+
+Every greedy output, alone, staggered and eight-way, is byte-identical to
+production. The sampled requests are unseeded, so their texts may differ run
+to run; 98–100 % of their copied tokens were accepted, as in production.
+
+| Variant | Outcome |
+| --- | --- |
+| 32-row limit | Rejected: rename/docstrings/hints/C++ 157.3/168.4/174.4/170.9 tok/s, against 188.1/187.0/195.0/185.9 at 64 in the same block. At 64 the Python rename's cycles average 42 tokens in 223 ms; production's 7.9 tokens in 64 ms. |
+| Double the width after one whole copy | Rejected: the line-numbered listing breaks every copy at the next line number, so each doubled copy wasted rows (87.9 → 85.1 tok/s). Two whole copies in a row: 89.0–89.2. |
+| Ordinary verification widened past eight rows | Not tried: the eight-row trunk kernels are what the single-token arithmetic is checked against; the wide pass reuses the batched route, which already decodes 64 rows exactly. |
+
 ## Upstream 0.27.0 merge (October 29, 2026)
 
 Merged build on Strix Halo (ROCm 7.2.4, v3 recipe + MTP) against production
