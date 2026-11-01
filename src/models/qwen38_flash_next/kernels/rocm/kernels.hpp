@@ -245,6 +245,12 @@ bool SigmoidMulQ8_1(float* x, const float* g, std::size_t count, void* x_q8,
 void NarrowActivations(const float* x, void* out, bool bf16, std::size_t count,
                        hipStream_t stream);
 /// Expands `count` Q8_0 weights (whole 32-element blocks) to F32.
+/// Requantizes Q6_K rows to IQ4_NL (ggml's quantize_row_iq4_nl, no
+/// importance weights): `blocks32` IQ4_NL blocks, eight per Q6_K block.
+/// Feeds the MTP draft head, whose proposals the target verifies.
+void Q6KToIq4Nl(const void* q6k, void* iq4nl, std::size_t blocks32,
+                hipStream_t stream);
+
 void ExpandQ8_0(const void* q8, float* out, std::size_t count,
                 hipStream_t stream);
 

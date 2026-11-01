@@ -173,6 +173,8 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (!m->device_) {
     return nullptr;
   }
+  if (m->mtp_weights_ && !m->device_->PrepareDraftHead(error_msg))
+    return nullptr;
   if (m->mtp_weights_ && m->device_->output().rows > kMtpDraftVocab) {
     std::vector<std::int32_t> specials;
     for (std::uint32_t id = kMtpDraftVocab; id < m->device_->output().rows;
@@ -1354,18 +1356,11 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const std::size_t room = ContextSize() - tokens_.size();
   const std::size_t cap =
       std::min<std::size_t>({max_tokens, room, exec.max_speculative()});
-  // Head eligibility is MtpDraftSubsetAllowed. Sampled cohorts are never
-  // jointly planned (DecodeBatchImpl), so a sampled request decides the same
-  // way alone and in any batch. Every request keeps the established length
-  // controller and AR backoff.
-  // Greedy proposals never change the output: the target verifies them over
-  // the full vocabulary with its penalties and grammar, and the draft argmax
-  // applies neither. A greedy request decoding alone therefore drafts as on a
-  // one-session server, with or without penalties (the Qwen3.8 non-thinking
-  // preset sets presence penalty 1.5), whatever the configured capacity.
-  const bool allow_subset = MtpDraftSubsetAllowed(
-      sampler.config().uses_random_sampling(), model_->DecodeConcurrency(),
-      occupancy, batch_drafts.has_value());
+  // Every request may draft through the small head (draft_vocab.hpp):
+  // greedy proposals never change the output, since the target verifies them
+  // over the full vocabulary with its penalties and grammar, and sampled
+  // proposals are corrected against the full target distribution. Every
+  // request keeps the established length controller and AR backoff.
   pending->policy_concurrency = MtpPolicyConcurrency(
       sampler.config().uses_random_sampling(), sampler.config().seed >= 0,
       batch_drafts.has_value(), occupancy);
@@ -1519,9 +1514,9 @@ bool Session::PrepareDecode(const DecodeRequest& request,
       return DraftCatchUp(anchor, false, error_msg);
     }
   }
-  if (allow_subset && !SyncDraftVocab(error_msg))
+  if (!SyncDraftVocab(error_msg))
     return false;
-  pending->draft_subset = allow_subset && model_->draft_subset_ &&
+  pending->draft_subset = model_->draft_subset_ &&
                           draft_vocab_.Fits(anchor, [&](std::int32_t token) {
                             return model_->InDraftSubset(token);
                           });

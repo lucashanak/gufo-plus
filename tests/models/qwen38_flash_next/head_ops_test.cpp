@@ -233,6 +233,62 @@ void CheckConfidence(std::uint32_t vocab, float spread, std::uint32_t seed) {
 
 }  // namespace
 
+/// The MTP draft head's IQ4_NL rows (Q6KToIq4Nl): deterministic, and every
+/// row within IQ4_NL's error of the Q6_K values (relative RMS per row).
+void CheckDraftRequant(int rows, std::uint32_t seed) {
+  constexpr int cols = 2560;
+  const std::size_t q6_row = cols / 256 * 210;
+  const std::size_t nl_row = cols / 32 * 18;
+  std::vector<std::uint8_t> q6(std::size_t(rows) * q6_row);
+  for (auto& b : q6)
+    b = static_cast<std::uint8_t>(Next(&seed));
+  for (std::size_t b = 0; b < q6.size() / 210; ++b) {
+    const __half dh =
+        __float2half((Uniform(&seed, 0.2F) + 1.0F) * 2e-4F);
+    std::memcpy(q6.data() + b * 210 + 208, &dh, 2);
+  }
+  void* d6 = nullptr;
+  void* dnl = nullptr;
+  const std::size_t blocks32 = std::size_t(rows) * (cols / 32);
+  CheckHip(hipMalloc(&d6, q6.size()), "requant source");
+  CheckHip(hipMalloc(&dnl, blocks32 * 18), "requant output");
+  CheckHip(hipMemcpy(d6, q6.data(), q6.size(), hipMemcpyHostToDevice),
+           "requant upload");
+  std::vector<std::uint8_t> first(blocks32 * 18), second(blocks32 * 18);
+  for (auto* host : {&first, &second}) {
+    CheckHip(hipMemset(dnl, 0x5A, blocks32 * 18), "requant poison");
+    q::Q6KToIq4Nl(d6, dnl, blocks32, nullptr);
+    CheckHip(hipDeviceSynchronize(), "requant");
+    CheckHip(hipMemcpy(host->data(), dnl, host->size(), hipMemcpyDeviceToHost),
+             "requant download");
+  }
+  CheckHip(hipFree(d6), "requant free");
+  CheckHip(hipFree(dnl), "requant free");
+  if (first != second)
+    throw std::runtime_error("Q6_K -> IQ4_NL requantization is not deterministic");
+  std::vector<float> a(cols), b(cols);
+  double worst = 0.0;
+  for (int r = 0; r < rows; ++r) {
+    gufo::quant::DequantizeQ6_K(q6.data() + std::size_t(r) * q6_row, a.data(),
+                                cols);
+    gufo::quant::DequantizeIQ4_NL(first.data() + std::size_t(r) * nl_row,
+                                  b.data(), cols);
+    double err = 0.0, ref = 0.0;
+    for (int i = 0; i < cols; ++i) {
+      err += (double(a[i]) - b[i]) * (double(a[i]) - b[i]);
+      ref += double(a[i]) * a[i];
+    }
+    worst = std::max(worst, std::sqrt(err / std::max(ref, 1e-30)));
+  }
+  // Uniform random 6-bit codes are IQ4_NL's hardest input: about 6-7%.
+  if (!(worst < 0.09))
+    throw std::runtime_error("Q6_K -> IQ4_NL relative RMS error " +
+                             std::to_string(worst));
+  std::cout << "draft head requantization: " << rows
+            << " rows deterministic, worst relative RMS error " << worst
+            << '\n';
+}
+
 int main() {
   try {
     if (qfn_mmq_init(0) != 0)
@@ -248,6 +304,9 @@ int main() {
     CheckWidths(kQ3_K, 1027, 2560, 1.0F, 0x4EAD4000U);
     CheckWidths(kQ5_1, 1025, 320, 1.0F, 0x4EAD5000U);
     CheckWidths(kIQ4_NL, 1031, 320, 1.0F, 0x4EAD6000U);
+    // The MTP draft head's IQ4_NL rows at the head's width.
+    CheckWidths(kIQ4_NL, 1029, 2560, 1.0F, 0x4EAD7000U);
+    CheckDraftRequant(257, 0xD4AF7000U);
     // The draft head (98,304 prefix + 1,024 table rows), the full head, and
     // a row shorter than one block.
     CheckConfidence(99328, 8.0F, 0xC0F1U);

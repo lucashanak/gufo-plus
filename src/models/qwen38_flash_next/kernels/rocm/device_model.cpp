@@ -621,10 +621,41 @@ bool DeviceModel::SetDraftVocab(std::uint32_t prefix_rows,
         static_cast<std::uint32_t>(id) >= output_.rows)
       return fail("draft special tokens must lie above the prefix");
   }
-  // The prefix is the head's own leading rows: no copy.
+  // The prefix is the head's own leading rows: no copy. It keeps the Q6_K
+  // rows: an IQ4_NL prefix lowered acceptance enough to lose on sampled
+  // code and at 16K context.
   draft_output_ = output_;
   draft_output_.rows = prefix_rows;
   draft_specials_ = std::move(specials);
+  return true;
+}
+
+bool DeviceModel::PrepareDraftHead(std::string* error_msg) {
+  if (!draft_full_output_.empty() || output_.decode == nullptr ||
+      output_.decode_type != core::GgmlType::kQ6_K || output_.cols % 256 != 0)
+    return true;
+  const std::size_t blocks32 =
+      std::size_t{output_.rows} * (output_.cols / 32);
+  const std::size_t bytes = blocks32 * 18;  // block_iq4_nl
+  void* rows = nullptr;
+  if (hipMalloc(&rows, bytes) != hipSuccess) {
+    if (error_msg != nullptr)
+      *error_msg = "draft head allocation failed";
+    return false;
+  }
+  allocations_.push_back(rows);
+  bytes_ += bytes;
+  Q6KToIq4Nl(output_.decode, rows, blocks32, nullptr);
+  const auto status = hipDeviceSynchronize();
+  if (status != hipSuccess) {
+    if (error_msg != nullptr)
+      *error_msg = "draft head conversion failed: " +
+                   std::string(hipGetErrorString(status));
+    return false;
+  }
+  draft_full_output_ = output_;
+  draft_full_output_.decode = rows;
+  draft_full_output_.decode_type = core::GgmlType::kIQ4_NL;
   return true;
 }
 

@@ -3546,7 +3546,8 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
   if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg) ||
       !(draft != nullptr
             ? DraftLogits(*draft, s_.mixed, s_.logits, error_msg)
-            : Dense(model_->output(), s_.mixed, s_.logits, 1, error_msg))) {
+            : Dense(model_->draft_full_output(), s_.mixed, s_.logits, 1,
+                    error_msg))) {
     return false;
   }
   const auto count = std::min<std::uint32_t>(rows, kMtpCandidates);
