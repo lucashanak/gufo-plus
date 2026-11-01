@@ -3323,6 +3323,9 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
     const auto gate_type = static_cast<WeightType>(l.ffn_gate_exps.type);
     // The importance formats have no paired kernel: their prefill tiles
     // take the separate launches at the wide map's 128-token height.
+    const bool paired =
+        gate_type == WeightType::kQ3_K || gate_type == WeightType::kQ4_K ||
+        gate_type == WeightType::kQ5_K || gate_type == WeightType::kIQ4_XS;
     const bool wide = routed_wide_tiles_ != 0;
     const std::uint32_t gate_tiles =
         wide ? routed_wide_tiles_ : routed_n_tiles_;

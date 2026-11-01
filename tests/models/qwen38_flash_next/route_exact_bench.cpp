@@ -103,6 +103,13 @@ void KQuant() {
       {"ssm_out", 2560, 6144, {kQ4K, kQ6K}},
       {"hc_down", 320, 10240, {kQ4K, kQ6K, kIQ4NL}},
       {"hc_up", 10240, 320, {kQ51, kIQ4NL}},
+      // The Swift recipe's IQ4_XS trunk.
+      {"attn_qkv", 10240, 2560, {kIQ4XS}},
+      {"attn_gate", 6144, 2560, {kIQ4XS}},
+      {"ssm_out", 2560, 6144, {kIQ4XS}},
+      {"hc_down", 320, 10240, {kIQ4XS}},
+  };
+  for (const Shape& s : shapes) {
     void* q8 =
         RandomDevice(std::size_t(s.m) * s.k / 32 * 34, 34, 0, 0x4B2U + s.m);
     constexpr int kMaxRows = 64;
