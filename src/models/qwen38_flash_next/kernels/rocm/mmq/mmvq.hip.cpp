@@ -1086,91 +1086,6 @@ __launch_bounds__(32 * waves, 1) static __global__
   }
 }
 
-/// Dense rows of a format with a MoeFragment (IQ4_XS) for several tokens:
-/// block b takes token pass b % passes of `waves` row groups, one per wave.
-/// Each wave decodes its `c_rows` rows' codes once per block and applies
-/// them to every token of the pass, so the table lookups no longer repeat
-/// per token. Tokens past `n_tokens` repeat the last one and are not stored.
-/// Per row and token the lane, block order, products and butterfly are
-/// mul_mat_vec_dense_kq's, so a row's result is the single-token launch's.
-template<ggml_type type, int c_rows, int tokens, int waves>
-__launch_bounds__(32 * waves, 1) static __global__ void mul_mat_vec_dense_frag(
-    const void* __restrict__ vx, const void* __restrict__ vy,
-    float* __restrict__ dst, const uint32_t ncols_x, const uint32_t nrows_x,
-    const uint32_t stride_row_x, const uint32_t stride_col_y,
-    const uint32_t stride_col_dst, const uint32_t n_tokens) {
-  constexpr int n = tokens * c_rows;
-  static_assert(n <= 32 || n % 32 == 0, "whole 32-sum butterflies");
-  constexpr int qk = ggml_hip_type_traits<type>::qk;
-  constexpr int qi = ggml_hip_type_traits<type>::qi;
-  constexpr int vdr = get_vdr_mmvq(type);
-  constexpr int blocks_per_iter = vdr * 32 / qi;
-  const int lane = threadIdx.x & 31;
-  const uint32_t passes = (n_tokens + tokens - 1) / tokens;
-  const int t0 = tokens * int(blockIdx.x % passes);
-  const int row0 =
-      c_rows * (int(blockIdx.x / passes) * waves + int(threadIdx.x >> 5));
-  const int last = int(n_tokens) - 1;
-  const int blocks_per_row_x = ncols_x / qk;
-  const block_q8_1* y = (const block_q8_1*)vy;
-  uint32_t row_offsets[c_rows];
-#pragma unroll
-  for (int i = 0; i < c_rows; ++i)
-    row_offsets[i] = min(uint32_t(row0 + i), nrows_x - 1) * stride_row_x;
-  uint32_t token_offsets[tokens];
-#pragma unroll
-  for (int j = 0; j < tokens; ++j)
-    token_offsets[j] = uint32_t(min(t0 + j, last)) * stride_col_y;
-  const int kqs = vdr * (lane % (qi / vdr));
-  float tmp[n] = {};
-  for (int kbx = lane / (qi / vdr); kbx < blocks_per_row_x;
-       kbx += blocks_per_iter) {
-    const int kby = kbx * (qk / QK8_1);
-    MoeFragment<type> w[c_rows];
-#pragma unroll
-    for (int i = 0; i < c_rows; ++i)
-      w[i] = MoeFragment<type>(vx, row_offsets[i] + kbx, kqs);
-#pragma unroll
-    for (int j = 0; j < tokens; ++j) {
-#pragma unroll
-      for (int i = 0; i < c_rows; ++i)
-        tmp[j * c_rows + i] =
-            w[i].DotAcc(y + token_offsets[j] + kby, kqs, tmp[j * c_rows + i]);
-    }
-  }
-  if constexpr (n <= 32) {
-    constexpr int shift = 5 - (n <= 1    ? 0
-                               : n <= 2  ? 1
-                               : n <= 4  ? 2
-                               : n <= 8  ? 3
-                               : n <= 16 ? 4
-                                         : 5);
-    const float value = scatter_reduce_sum32(tmp, lane);
-    const int index = lane >> shift;
-    const int j = index / c_rows;
-    const int i = index % c_rows;
-    if ((lane & ((1 << shift) - 1)) == 0 && index < n && t0 + j <= last &&
-        uint32_t(row0 + i) < nrows_x)
-      dst[(t0 + j) * stride_col_dst + row0 + i] =
-          isfinite(value) ? value : 0.0f;
-  } else {
-#pragma unroll
-    for (int c = 0; c < n; c += 32) {
-      float part[32];
-#pragma unroll
-      for (int s = 0; s < 32; ++s)
-        part[s] = tmp[c + s];
-      const float value = scatter_reduce_sum32(part, lane);
-      // 32 sums: lane l finishes sum l.
-      const int j = (c + lane) / c_rows;
-      const int i = (c + lane) % c_rows;
-      if (t0 + j <= last && uint32_t(row0 + i) < nrows_x)
-        dst[(t0 + j) * stride_col_dst + row0 + i] =
-            isfinite(value) ? value : 0.0f;
-    }
-  }
-}
-
 template<ggml_type type, int c_rows, int tokens, int waves, typename Kernel>
 static void launch_dense_kq_passes(Kernel kernel, const void* weights,
                                    const block_q8_1* input, float* output,
@@ -1202,10 +1117,6 @@ static void launch_dense_kq_many(const void* weights, const block_q8_1* input,
     launch_dense_kq_passes<type, 4, kTokens, kWaves>(
         mul_mat_vec_dense_kq_many<type, 4, kTokens, kWaves>, weights, input,
         output, k, rows, n_tokens, input_stride, stream);
-  else if constexpr (type == GGML_TYPE_IQ4_XS)
-    launch_dense_kq_passes<type, 4, kTokens, kWaves>(
-        mul_mat_vec_dense_frag<type, 4, kTokens, kWaves>, weights, input,
-        output, k, rows, n_tokens, input_stride, stream);
   else
     launch_dense_kq_passes<type, 2, kTokens, kWaves>(
         mul_mat_vec_dense_kq_pass<type, 2, kTokens, kWaves>, weights, input,
@@ -1225,17 +1136,6 @@ static void launch_dense_kq(const void* weights, const block_q8_1* input,
           <<<dim3((rows + kRows - 1) / kRows), dim3(32), 0, stream>>>(
               weights, input, output, k, rows, k / ggml_blck_size(type),
               input_stride, rows);
-      return;
-    }
-  }
-  if constexpr (tokens > 1 && type == GGML_TYPE_IQ4_XS) {
-    if (n_tokens == tokens) {
-      // Codes decoded once per row for every token (see
-      // mul_mat_vec_dense_frag); tokens * kRows sums fit one butterfly.
-      constexpr int kRows = 4;
-      launch_dense_kq_passes<type, kRows, tokens, 1>(
-          mul_mat_vec_dense_frag<type, kRows, tokens, 1>, weights, input,
-          output, k, rows, n_tokens, input_stride, stream);
       return;
     }
   }
