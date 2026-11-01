@@ -408,7 +408,11 @@ template<> struct MoeFragment<GGML_TYPE_IQ4_XS> {
     d = __half2float(b->d);
   }
 
-  __device__ __forceinline__ float Dot(const block_q8_1* y, int iqs) const {
+  /// acc + vec_dot_iq4_xs_q8_1 as the single-token kernel compiles it:
+  /// dd = d * d8 rounded, then one FMA dd * float(sumi) + acc. Left to
+  /// itself fast-math regroups a hoisted d into (sumi * d) * d8.
+  __device__ __forceinline__ float DotAcc(const block_q8_1* y, int iqs,
+                                          float acc) const {
     const block_q8_1* q = y + iqs / 4;
     int sumi = 0;
 #pragma unroll
@@ -417,8 +421,11 @@ template<> struct MoeFragment<GGML_TYPE_IQ4_XS> {
       sumi = ggml_hip_dp4a(v[j].y, get_int_b4(q->qs, j + 4), sumi);
     }
     sumi *= ls;
-    const float dd = d * __low2float(q->ds);
-    return dd * sumi;
+    float d8 = __low2float(q->ds);
+    asm("" : "+v"(d8));
+    float dd = __fmul_rn(d, d8);
+    asm("" : "+v"(dd));
+    return __fmaf_rn(dd, float(sumi), acc);
   }
 };
 
@@ -1127,7 +1134,8 @@ __launch_bounds__(32 * waves, 1) static __global__ void mul_mat_vec_dense_frag(
     for (int j = 0; j < tokens; ++j) {
 #pragma unroll
       for (int i = 0; i < c_rows; ++i)
-        tmp[j * c_rows + i] += w[i].Dot(y + token_offsets[j] + kby, kqs);
+        tmp[j * c_rows + i] =
+            w[i].DotAcc(y + token_offsets[j] + kby, kqs, tmp[j * c_rows + i]);
     }
   }
   if constexpr (n <= 32) {
@@ -1480,8 +1488,12 @@ __launch_bounds__(64) static __global__
           continue;
         const auto* x = input + row_of[t] * input_stride + kb * (qk / QK8_1);
 #pragma unroll
-        for (int r = 0; r < block_rows; ++r)
-          sum[t][r] += w[r].Dot(x, kqs);
+        for (int r = 0; r < block_rows; ++r) {
+          if constexpr (type == GGML_TYPE_IQ4_XS)
+            sum[t][r] = w[r].DotAcc(x, kqs, sum[t][r]);
+          else
+            sum[t][r] += w[r].Dot(x, kqs);
+        }
         // Keep one input's activations live at a time (Q4_K keeps its tuned
         // schedule).
         if constexpr (type != GGML_TYPE_Q4_K && columns > 2)
