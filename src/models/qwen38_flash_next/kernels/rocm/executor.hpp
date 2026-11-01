@@ -30,6 +30,9 @@
 
 namespace gufo::models::qwen38_flash_next::rocm {
 
+using gufo::hip::GrowableRows;
+using gufo::hip::KvPool;
+
 /// Compact decode-row formats with a fused gate/up decode GEMV
 /// (qfn_mmq_moe_gated_vec); the others project gate and up separately.
 inline bool GatedVecFormat(core::GgmlType type) {
