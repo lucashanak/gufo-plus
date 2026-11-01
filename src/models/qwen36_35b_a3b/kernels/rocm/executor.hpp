@@ -16,16 +16,19 @@
 #include <unordered_set>
 #include <vector>
 
+#include "src/core/hip/kv_memory.hpp"
 #include "src/core/session_mode.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
 #include "src/models/qwen/vision/device_input.hpp"
 #include "src/models/qwen36_35b_a3b/kernels/rocm/blaslt.hpp"
 #include "src/models/qwen36_35b_a3b/kernels/rocm/device_model.hpp"
 #include "src/models/qwen36_35b_a3b/kernels/rocm/kernels.hpp"
-#include "src/models/qwen36_35b_a3b/kernels/rocm/kv_memory.hpp"
 #include "src/models/qwen36_35b_a3b/mtp_sampling.hpp"
 
 namespace gufo::models::qwen36_35b_a3b::rocm {
+
+using gufo::hip::GrowableRows;
+using gufo::hip::KvPool;
 
 class Executor;
 struct ArgmaxCandidate;

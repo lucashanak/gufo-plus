@@ -6,7 +6,7 @@
 // decoding. A small budget then has to refuse growth cleanly, leave its peers
 // intact, and reuse the rows an idle session no longer holds.
 //
-// growable_kv_test --model MODEL.gguf [--batch-only]
+// growable_kv_test --model MODEL.gguf [--batch-only | --churn ROUNDS]
 #include <algorithm>
 #include <cstring>
 #include <iostream>
@@ -271,6 +271,47 @@ void CheckBatch(q36::Model& model) {
                "exact\n";
 }
 
+/// Sessions destroyed and created again round after round, eight at a time,
+/// each grown deep into its context: the address ranges come first from the
+/// arena, then from released ranges after their quarantine. Every round must
+/// reproduce the first round's logits and tokens exactly.
+void CheckChurn(q36::Model& model, unsigned rounds) {
+  std::string error;
+  const std::uint32_t lengths[] = {36000, 900,   7300, 12000,
+                                   4097,  33000, 5200, 20000};
+  std::vector<std::vector<float>> expected(8);
+  std::vector<std::vector<std::int32_t>> expected_tokens(8);
+  for (unsigned round = 0; round < rounds; ++round) {
+    std::vector<std::unique_ptr<q36::Session>> sessions;
+    for (std::size_t i = 0; i < 8; ++i) {
+      sessions.push_back(Create(model));
+      const auto slot = (i + round) % 8;
+      const auto prompt =
+          Prompt(model, lengths[slot], "churn " + std::to_string(slot));
+      Require(sessions.back()->Sync(prompt, &error), error);
+      sampling::SamplerState sampler(
+          {.seed = 5},
+          std::vector<sampling::TokenId>(prompt.begin(), prompt.end()));
+      q36::Session::DecodeResult step;
+      Require(sessions.back()->DecodeStep(1, sampler, &step, &error, false),
+              error);
+      if (round == 0) {
+        expected[slot].assign(sessions.back()->Logits().begin(),
+                              sessions.back()->Logits().end());
+        expected_tokens[slot] = step.tokens;
+      } else {
+        Require(step.tokens == expected_tokens[slot],
+                "churn round " + std::to_string(round) + " changed tokens");
+        RequireExact(
+            expected[slot], sessions.back()->Logits(),
+            "churn round " + std::to_string(round) + " changed logits");
+      }
+    }
+    std::cout << "churn round " << round << ": eight sessions exact\n"
+              << std::flush;
+  }
+}
+
 void CheckBudget(const char* path, std::span<const float> expected,
                  std::uint32_t tokens, std::size_t per_session,
                  std::size_t full_claim) {
@@ -325,6 +366,26 @@ void CheckBudget(const char* path, std::span<const float> expected,
 int main(int argc, char** argv) {
   const bool batch_only =
       argc == 4 && std::string_view(argv[3]) == "--batch-only";
+  // --churn N: only the destroy/create stress, N rounds.
+  if (argc == 5 && std::string_view(argv[3]) == "--churn") {
+    std::string error;
+    auto model = q36::Model::Load(
+        argv[2],
+        {.max_context = kContext, .mtp = true, .decode_concurrency = 8},
+        &error);
+    if (model == nullptr) {
+      std::cerr << "FAIL: " << error << '\n';
+      return 1;
+    }
+    try {
+      CheckChurn(*model, static_cast<unsigned>(std::stoul(argv[4])));
+      std::cout << "PASS\n";
+      return 0;
+    } catch (const std::exception& e) {
+      std::cerr << "FAIL: " << e.what() << '\n';
+      return 1;
+    }
+  }
   if ((argc != 3 && !batch_only) || std::string_view(argv[1]) != "--model") {
     std::cerr << "Usage: growable_kv_test --model MODEL.gguf [--batch-only]\n";
     return 77;

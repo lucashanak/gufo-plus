@@ -53,7 +53,6 @@ if (ENGINE_ENABLE_HIP)
     ${Q36_ROCM_DIR}/device_model.cpp
     ${Q36_ROCM_DIR}/executor.cpp
     ${Q36_ROCM_DIR}/batch.cpp
-    ${Q36_ROCM_DIR}/kv_memory.cpp
     engine.cpp)
   target_sources(gufo_qwen36_35b_a3b PRIVATE ${Q36_HIP_SOURCES})
   set_source_files_properties(${Q36_ROCM_DIR}/kernels.hip.cpp PROPERTIES LANGUAGE HIP)
