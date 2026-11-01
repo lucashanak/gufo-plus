@@ -8826,15 +8826,21 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                                  rows_in, rows_out, swiglu_gate, out, out_half,
                                  m, k, stream);
     case 128: {
-      if (type == WeightType::kIQ3_S || type == WeightType::kIQ3_XXS ||
-          type == WeightType::kIQ2_XS) {
+      if (type == WeightType::kIQ4_XS || type == WeightType::kIQ3_S ||
+          type == WeightType::kIQ3_XXS || type == WeightType::kIQ2_XS) {
         // IQ3_S / IQ3_XXS / IQ2_XS gate/up have no paired kernel: prefill
         // runs these 128-token tiles separately (each token's sums are the
-        // 16/48-row tiles').
+        // 16/48-row tiles'). IQ4_XS prefill takes the paired kernel; its
+        // separate 128-token tiles remain the reference the pair matches.
         constexpr int kBM = 128;
         const dim3 grid(static_cast<unsigned int>((m + kBM - 1) / kBM),
                         n_tiles);
-        if (type == WeightType::kIQ3_S)
+        if (type == WeightType::kIQ4_XS)
+          hipLaunchKernelGGL(
+              (RoutedF16GEMMKernel<WeightType::kIQ4_XS, kBM, 128, 2>), grid,
+              dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in,
+              rows_out, swiglu_gate, out, out_half, m, k);
+        else if (type == WeightType::kIQ3_S)
           hipLaunchKernelGGL(
               (RoutedF16GEMMKernel<WeightType::kIQ3_S, kBM, 128, 2>), grid,
               dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in,
