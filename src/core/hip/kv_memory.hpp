@@ -42,12 +42,46 @@ public:
   /// Takes `bytes` of the budget, or nothing when they do not fit.
   [[nodiscard]] bool Charge(std::size_t bytes);
   void Refund(std::size_t bytes);
+  using Clock = std::chrono::steady_clock;
+  /// How long an unmapped address stays unused before chunks map there
+  /// again. On ROCm 7.2.4, chunks mapped into addresses whose previous
+  /// mapping had just been removed (hipMemUnmap, hipFree or
+  /// hipMemAddressFree) intermittently fault on first access with an
+  /// invalid page table entry, though the new mapping succeeded; draining
+  /// the device in between does not help, time does.
+  static constexpr std::chrono::milliseconds kRemapQuarantine{1000};
+  /// Waits until `unmapped_at` is past the quarantine.
+  static void AwaitQuarantine(Clock::time_point unmapped_at);
+  /// A virtual range of `bytes`: fresh address space from the arena when
+  /// there is room, else a released one of that size, else a new
+  /// reservation. `*unmapped_at` is when a released range last lost its
+  /// chunks (the epoch for fresh space). Null when the device has no
+  /// address space left.
+  [[nodiscard]] void* ReserveRange(std::size_t bytes, hipError_t* status,
+                                   Clock::time_point* unmapped_at);
+  /// Keeps an unmapped range for ReserveRange. Ranges go back to HIP only
+  /// when the pool is destroyed.
+  void ReleaseRange(void* base, std::size_t bytes,
+                    Clock::time_point unmapped_at);
+  /// Reserves one address arena of up to `bytes` (halved until HIP grants
+  /// it) that later ranges are carved from. Taken before sessions allocate
+  /// and free their other buffers, it never covers an address a later
+  /// hipFree releases. Ranges past the arena are reserved one by one.
+  [[nodiscard]] bool ReserveArena(std::size_t bytes, std::string* error);
 
 private:
   mutable std::mutex mutex_;
   std::size_t budget_;
   std::size_t mapped_{0};
   std::vector<std::pair<void*, std::size_t>> ranges_;  ///< every reservation
+  struct FreeRange {
+    void* base;
+    std::size_t bytes;
+    Clock::time_point unmapped_at;
+  };
+  std::vector<FreeRange> free_ranges_;
+  std::uint8_t* arena_next_{nullptr};
+  std::uint8_t* arena_end_{nullptr};
 };
 
 /// One K, V or pooled-key buffer of a session: rows of `row_bytes` up to
@@ -95,3 +129,16 @@ private:
   std::size_t row_bytes_{0};
   std::size_t max_rows_{0};
   std::vector<hipMemGenericAllocationHandle_t> chunks_;
+  /// Chunks below this index were mapped before (by this buffer or the
+  /// range's previous owner); remapping them waits out the quarantine.
+  std::size_t dirty_chunks_{0};
+  KvPool::Clock::time_point unmapped_at_{};
+};
+
+/// Device properties for K/V chunks: pinned device memory on the current
+/// device.
+[[nodiscard]] hipMemAllocationProp KvChunkProp();
+
+}  // namespace gufo::hip
+
+#endif  // GUFO_CORE_HIP_KV_MEMORY_HPP_
