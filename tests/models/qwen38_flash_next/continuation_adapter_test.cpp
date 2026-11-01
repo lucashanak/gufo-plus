@@ -3,12 +3,14 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "src/cache/slot.hpp"
@@ -291,6 +293,83 @@ void CheckSlotReuse(const std::shared_ptr<qfn::Model>& model, bool mtp) {
   std::cout << (mtp ? "MTP" : "AR")
             << ",slot_reuse,sampled/greedy/cancellation/reset,PASS\n";
 }
+/// Several component checkpoints captured in one pass, through the
+/// production adapter path, against a prompt split at every point: a point
+/// five rows into the pass, one four rows later (closer than the draft
+/// depth), one on a selection block and one off the alignment. Each frozen
+/// checkpoint, the live frontier and a resumed checkpoint equal the split.
+void CheckInPassMany(const std::shared_ptr<qfn::Model>& model, bool mtp,
+                     std::span<const std::int32_t> prompt) {
+  gufo::hip::TransferPool streams(2);
+  qfn::ContinuationAdapter adapter(
+      model,
+      mtp ? gufo::core::SessionMode::kSpeculative
+          : gufo::core::SessionMode::kAutoregressive,
+      16384, {'i', 'n', 'p', 'a', 's', 's'});
+  Guard source_guard, reference_guard;
+  auto source = adapter.CreateSlot(source_guard);
+  auto reference = adapter.CreateSlot(reference_guard);
+  auto& a = adapter.GetSession(*source);
+  auto& b = adapter.GetSession(*reference);
+  std::string error;
+  constexpr std::uint32_t kEnd = 10000;
+  const std::uint32_t points[] = {5, 9, 6144, 9001};
+  std::vector<Checkpoint> frozen(std::size(points));
+  std::vector<std::size_t> order;
+  adapter.PrefillThrough(*source, prompt.first(kEnd), points,
+                         [&](std::size_t i) {
+                           order.push_back(i);
+                           frozen[i] = Capture(adapter, *source, streams);
+                         });
+  Require(
+      (order == std::vector<std::size_t>{0, 1, 2, 3}) && a.Position() == kEnd,
+      "in-pass captures out of order or frontier changed");
+  for (std::size_t i = 0; i < std::size(points); ++i) {
+    Require(b.Sync(prompt.first(points[i]), &error), error);
+    const auto split = Capture(adapter, *reference, streams);
+    std::string differing;
+    for (std::size_t c = 0; c < split.bytes.size(); ++c) {
+      const auto& x = frozen[i].bytes.at(c);
+      const auto& y = split.bytes[c];
+      if (x == y)
+        continue;
+      std::size_t first = 0, count = 0;
+      for (std::size_t j = 0; j < std::min(x.size(), y.size()); ++j)
+        if (x[j] != y[j] && count++ == 0)
+          first = j;
+      differing +=
+          " [component " + std::to_string(c) + " kind " +
+          std::to_string(static_cast<int>(adapter.Components()[c].kind)) +
+          " bytes " + std::to_string(y.size()) + " first " +
+          std::to_string(first) + " differing " + std::to_string(count) + "]";
+    }
+    if (frozen[i].positions != split.positions)
+      differing += " [positions]";
+    Require(differing.empty(),
+            "component in-pass checkpoint at " + std::to_string(points[i]) +
+                " differs from a pass ending there:" + differing);
+  }
+  Require(b.Sync(prompt.first(kEnd), &error), error);
+  SameLogits(a, b);
+  {
+    const auto live = Capture(adapter, *source, streams);
+    const auto split = Capture(adapter, *reference, streams);
+    Require(live.positions == split.positions && live.bytes == split.bytes,
+            "in-pass checkpoints changed the live frontier");
+  }
+  // Resume the unaligned checkpoint against the split there.
+  Load(adapter, *source, frozen[3], streams);
+  Require(adapter.Validate(*source, frozen[3].positions),
+          "component in-pass restore rejected");
+  Require(a.Sync(prompt.first(kEnd), &error), error);
+  SameLogits(a, b);
+  Require(Decode(a, 24, mtp) == Decode(b, 24, mtp),
+          "resumed in-pass checkpoint continued differently");
+  Require(adapter.Invalidate(*source) && adapter.Invalidate(*reference),
+          "in-pass reset failed");
+  std::cout << (mtp ? "MTP" : "AR") << ",in_pass_many,PASS\n";
+}
+
 void CheckInPass(const std::shared_ptr<qfn::Model>& model, bool mtp,
                  std::span<const std::int32_t> prompt) {
   gufo::hip::TransferPool streams(2);
@@ -310,17 +389,19 @@ void CheckInPass(const std::shared_ptr<qfn::Model>& model, bool mtp,
         adapter.PrefillCheckpointPositions(*source, boundary);
     Checkpoint frozen;
     bool called = false;
-    adapter.PrefillThrough(*source, prompt.first(boundary + 5), boundary, [&] {
-      called = true;
-      Require(adapter.Positions(*source) == predicted,
-              "in-pass positions differ from admission prediction");
-      Reject([&] { (void)adapter.GetSession(*source); });
-      Reject([&] { (void)a.Sync(prompt.first(boundary + 5), &error); });
-      Reject([&] { a.Reset(); });
-      Require(!adapter.Invalidate(*source),
-              "in-pass consumer invalidated its capture frontier");
-      frozen = Capture(adapter, *source, streams);
-    });
+    const std::uint32_t points[] = {boundary};
+    adapter.PrefillThrough(
+        *source, prompt.first(boundary + 5), points, [&](std::size_t) {
+          called = true;
+          Require(adapter.Positions(*source) == predicted,
+                  "in-pass positions differ from admission prediction");
+          Reject([&] { (void)adapter.GetSession(*source); });
+          Reject([&] { (void)a.Sync(prompt.first(boundary + 5), &error); });
+          Reject([&] { a.Reset(); });
+          Require(!adapter.Invalidate(*source),
+                  "in-pass consumer invalidated its capture frontier");
+          frozen = Capture(adapter, *source, streams);
+        });
     Require(called && a.Position() == boundary + 5,
             "in-pass capture changed the completed live frontier");
     std::unique_ptr<qfn::SessionSnapshot> native;
@@ -357,12 +438,14 @@ void CheckInPass(const std::shared_ptr<qfn::Model>& model, bool mtp,
         std::min<std::size_t>(64, component->state_bytes));
     std::optional<cache::Completion> pending;
     Reject([&] {
-      adapter.PrefillThrough(*source, prompt.first(2052), 2047, [&] {
-        pending.emplace(adapter.CapturePrivatePiece(*source, component->id, 0,
-                                                    bytes, *stream));
-        if (throw_consumer)
-          throw std::runtime_error("rejected in-pass consumer");
-      });
+      const std::uint32_t points[] = {2047};
+      adapter.PrefillThrough(
+          *source, prompt.first(2052), points, [&](std::size_t) {
+            pending.emplace(adapter.CapturePrivatePiece(*source, component->id,
+                                                        0, bytes, *stream));
+            if (throw_consumer)
+              throw std::runtime_error("rejected in-pass consumer");
+          });
     });
     Require(pending && pending->Ready() &&
                 pending->Wait() == cache::TransferResult::kSucceeded,
@@ -915,6 +998,22 @@ void CheckLearnedDraftPolicy(const std::shared_ptr<qfn::Model>& model) {
 }
 }  // namespace
 int main(int argc, char** argv) {
+  // ctest runs the in-pass checks with the model named by the environment and
+  // skips them without it.
+  std::array<char*, 6> from_env{};
+  if (argc == 2 && std::string_view(argv[1]) == "--in-pass-only") {
+    char* first = std::getenv("QWEN38_FLASH_NEXT_MODEL");
+    char* mtp = std::getenv("QWEN38_FLASH_NEXT_MTP_MODEL");
+    if (!first || !*first || !mtp || !*mtp) {
+      std::cerr << "QWEN38_FLASH_NEXT_MODEL and QWEN38_FLASH_NEXT_MTP_MODEL "
+                   "are not set; skipping\n";
+      return 77;
+    }
+    static char model_flag[] = "--model", mtp_flag[] = "--mtp-model";
+    from_env = {argv[0], model_flag, first, mtp_flag, mtp, argv[1]};
+    argc = 6;
+    argv = from_env.data();
+  }
   const bool guard_only =
       argc == 6 && std::string_view(argv[5]) == "--guard-only";
   const bool image_only =
@@ -978,6 +1077,8 @@ int main(int argc, char** argv) {
     if (!image_only) {
       CheckInPass(model, false, prompt);
       CheckInPass(model, true, prompt);
+      CheckInPassMany(model, false, prompt);
+      CheckInPassMany(model, true, prompt);
     }
     if (in_pass_only)
       return 0;

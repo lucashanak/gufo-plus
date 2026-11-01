@@ -176,6 +176,15 @@ public:
                                  std::unique_ptr<SessionSnapshot>* checkpoint,
                                  std::string* error_msg = nullptr,
                                  double* capture_ms = nullptr);
+  /// The same for ascending boundaries anywhere beyond the frontier: each
+  /// is captured inside the pass that covers it (at most
+  /// rocm::kMaxPassCheckpoints per pass), without splitting it.
+  /// `checkpoints` receives one snapshot per boundary.
+  [[nodiscard]] bool SyncThrough(
+      std::span<const std::int32_t> prompt,
+      std::span<const std::uint32_t> boundaries,
+      std::vector<std::unique_ptr<SessionSnapshot>>* checkpoints,
+      std::string* error_msg = nullptr, double* capture_ms = nullptr);
   [[nodiscard]] bool Evaluate(std::int32_t token,
                               std::string* error_msg = nullptr);
   struct DecodeResult {
@@ -299,19 +308,29 @@ private:
   Session(std::shared_ptr<Model> model, std::unique_ptr<rocm::Session> session);
   void ResetImpl(bool reuse_mtp);
 
-  using PrefillCapture = std::function<void(const rocm::PrefillCheckpoint&)>;
-  bool SyncThroughComponents(std::span<const std::int32_t>, std::uint32_t,
-                             const PrefillCapture&, std::string*);
+  /// Receives the index of a boundary and its in-pass checkpoint view.
+  using PrefillCapture =
+      std::function<void(std::size_t, const rocm::PrefillCheckpoint&)>;
+  /// `next`, as for Sync, names the tokens the following step appends.
+  bool SyncThroughComponents(std::span<const std::int32_t>,
+                             std::span<const std::uint32_t>,
+                             const PrefillCapture&, std::string*,
+                             std::span<const std::int32_t> next = {});
+  /// True when `boundaries` ascend strictly beyond the frontier, within
+  /// `prompt`.
+  bool ValidCheckpointBoundaries(std::span<const std::int32_t> prompt,
+                                 std::span<const std::uint32_t> boundaries,
+                                 std::string* error_msg) const;
 
-  bool Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
-            bool prefill = false, std::uint32_t boundary = 0,
-            std::unique_ptr<SessionSnapshot>* checkpoint = nullptr,
-            double* capture_ms = nullptr,
-            std::span<const std::int32_t> after = {},
-            const PrefillCapture& capture = {});
+  bool Feed(
+      std::span<const std::int32_t> tokens, std::string* error_msg,
+      bool prefill = false, std::span<const std::uint32_t> boundaries = {},
+      std::vector<std::unique_ptr<SessionSnapshot>>* checkpoints = nullptr,
+      double* capture_ms = nullptr, std::span<const std::int32_t> after = {},
+      const PrefillCapture& capture = {});
   bool SyncImpl(std::span<const std::int32_t> prompt, std::string* error_msg,
-                std::uint32_t boundary,
-                std::unique_ptr<SessionSnapshot>* checkpoint,
+                std::span<const std::uint32_t> boundaries,
+                std::vector<std::unique_ptr<SessionSnapshot>>* checkpoints,
                 double* capture_ms = nullptr,
                 std::span<const std::int32_t> next = {},
                 const PrefillCapture& capture = {});

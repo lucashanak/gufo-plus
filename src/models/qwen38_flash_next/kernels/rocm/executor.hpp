@@ -316,9 +316,20 @@ public:
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
 
   enum class ForwardMode { kDecode, kVerify, kPrefill };
+  /// A view of `session` after `prefix` rows of the pass over `tokens`,
+  /// filled by the Forward that runs it. Each of a pass's checkpoints takes
+  /// its own `slot` (below kMaxPassCheckpoints) of executor storage, which
+  /// the next pass overwrites: consume the view before it. `previous` is the
+  /// prefix of the pass's preceding checkpoint (zero for the first), so the
+  /// view keeps the hidden rows a pass starting there would. Slot 0 is
+  /// counted in DeferredScratchBytes; the others are allocated when a pass
+  /// first needs them and fail (returning null) without device headroom.
   [[nodiscard]] std::unique_ptr<PrefillCheckpoint> MakePrefillCheckpoint(
       Session& session, std::span<const std::int32_t> tokens,
-      std::uint32_t prefix, std::string* error_msg) const;
+      std::uint32_t prefix, std::string* error_msg, std::uint32_t slot = 0,
+      std::uint32_t previous = 0) const;
+  /// Returns the storage of checkpoint slots above 0 to the snapshot pool.
+  void ReleasePassCheckpointStorage() const noexcept;
 
   /// Appends `tokens` (at most max_batch) to the session and returns the
   /// logits of the last `n_logits` tokens in `logits` (n_logits * vocab
@@ -330,12 +341,12 @@ public:
   /// prompt: once its own n-gram rows have arrived it starts reading the
   /// next chunk's, so that read overlaps this chunk's layers. The rows are
   /// used only if the next batch has exactly those tokens.
-  [[nodiscard]] bool Forward(Session& session,
-                             std::span<const std::int32_t> tokens,
-                             std::uint32_t n_logits, float* logits,
-                             ForwardMode mode, std::string* error_msg,
-                             PrefillCheckpoint* checkpoint = nullptr,
-                             std::span<const std::int32_t> next = {}) const;
+  [[nodiscard]] bool Forward(
+      Session& session, std::span<const std::int32_t> tokens,
+      std::uint32_t n_logits, float* logits, ForwardMode mode,
+      std::string* error_msg,
+      std::span<PrefillCheckpoint* const> checkpoints = {},
+      std::span<const std::int32_t> next = {}) const;
 
   struct BatchItem {
     Session* session;
@@ -648,7 +659,7 @@ private:
   bool Ple(const DeviceLayer& l, Session& s, std::uint32_t n_tokens, float* res,
            bool speculative, std::string* error_msg,
            bool embeddings_ready = false,
-           PrefillCheckpoint* checkpoint = nullptr) const;
+           std::span<PrefillCheckpoint* const> checkpoints = {}) const;
   bool LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                        const float* x, float* out, std::uint32_t n_tokens,
                        bool speculative, std::string* error_msg,
@@ -664,7 +675,7 @@ private:
                  std::uint32_t max_context, bool sparse, std::string* error_msg,
                  bool last_only = false, bool projections_ready = false,
                  bool project_output = true,
-                 std::uint32_t checkpoint_tokens = 0) const;
+                 PassCheckpoints checkpoints = {}) const;
   /// Orders the main stream after the work queued on side_stream_.
   bool JoinSide(std::string* error_msg) const;
   bool Moe(const DeviceLayer& l, const float* x, float* out,
@@ -702,7 +713,7 @@ private:
                    std::uint32_t start_pos, std::uint32_t pool_grid,
                    std::uint32_t first_layer, std::uint32_t end_layer,
                    std::string* error_msg,
-                   PrefillCheckpoint* checkpoint = nullptr,
+                   std::span<PrefillCheckpoint* const> checkpoints = {},
                    bool embeddings_ready = false) const;
   bool MtpBody(Session& session, std::uint32_t n, std::uint32_t pos, bool token,
                bool candidates, std::string* error_msg, std::uint32_t pool_grid,
@@ -750,7 +761,8 @@ private:
   [[nodiscard]] std::shared_ptr<SnapshotAllocator> GetSnapshotAllocator() const;
   mutable std::once_flag snapshot_allocator_once_;
   mutable std::shared_ptr<SnapshotAllocator> snapshot_allocator_;
-  mutable std::shared_ptr<void> checkpoint_storage_;
+  /// One region per in-pass checkpoint slot, allocated on first use.
+  mutable std::shared_ptr<void> checkpoint_storage_[kMaxPassCheckpoints];
   /// The stream kernels are queued on. Overlapped work swaps in side_stream_
   /// for its launches: a decode MoE queues its shared expert there (joined
   /// through shexp_join_), a prompt pass its shared expert and checkpoint
@@ -924,6 +936,7 @@ private:
   /// Compact sampled candidates of a wide verification's rows.
   mutable std::vector<std::vector<sampling::LogitCandidate>> wide_candidates_;
   bool EnsureWideSegments(std::uint32_t segments, std::string* error) const;
+  [[nodiscard]] std::size_t WideSegmentFloats() const;
   bool ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
                         std::string* error) const;
   /// Captured batched graphs, least recently used evicted beyond a bound.

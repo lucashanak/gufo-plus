@@ -248,16 +248,18 @@ Session& ContinuationAdapter::GetSession(cache::Slot& slot) {
   state.BeforeExecution();
   return *state.session;
 }
-void ContinuationAdapter::PrefillThrough(cache::Slot& slot,
-                                         std::span<const std::int32_t> prompt,
-                                         std::uint32_t boundary,
-                                         const std::function<void()>& capture) {
+void ContinuationAdapter::PrefillThrough(
+    cache::Slot& slot, std::span<const std::int32_t> prompt,
+    std::span<const std::uint32_t> boundaries,
+    const std::function<void(std::size_t)>& capture,
+    std::span<const std::int32_t> next) {
   auto& state = As(slot);
   state.BeforeExecution();
   if (!capture)
     throw std::invalid_argument("missing component checkpoint consumer");
   std::string error;
-  const auto consume = [&](const rocm::PrefillCheckpoint& checkpoint) {
+  const auto consume = [&](std::size_t index,
+                           const rocm::PrefillCheckpoint& checkpoint) {
     struct BoundaryScope {
       State& state;
       bool guarding;
@@ -277,11 +279,12 @@ void ContinuationAdapter::PrefillThrough(cache::Slot& slot,
         state.guarding = guarding;
       }
     } scope(state, checkpoint);
-    capture();
+    capture(index);
     if (state.pending)
       throw std::logic_error("in-pass capture returned with pending transfers");
   };
-  if (!state.session->SyncThroughComponents(prompt, boundary, consume, &error))
+  if (!state.session->SyncThroughComponents(prompt, boundaries, consume, &error,
+                                            next))
     throw std::runtime_error("component in-pass prefill failed: " + error);
 }
 cache::Capabilities ContinuationAdapter::GetCapabilities() const {
@@ -564,9 +567,12 @@ cache::Completion ContinuationAdapter::CapturePrivatePiece(
     metadata.draft = native.mtp_.position;
     metadata.blocks = native.blocks_;
     metadata.draft_blocks = native.mtp_.blocks;
+    // An AR frontier keeps no trunk rows, whichever pass produced it: a
+    // split pass, an in-pass checkpoint and a native restore record the same
+    // base.
     metadata.hidden_base =
-        state.checkpoint ? native.position_ - state.checkpoint->hidden_rows
-                         : session.hidden_base_;
+        native.position_ - (state.checkpoint ? state.checkpoint->hidden_rows
+                                             : session.KeptHiddenRows());
     metadata.residual_valid = native.mtp_.residual_valid;
     metadata.ngram = native.ngram_;
     metadata.policy = session.draft_length_.State();
