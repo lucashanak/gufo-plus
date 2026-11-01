@@ -174,6 +174,8 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (!m->device_) {
     return nullptr;
   }
+  if (m->mtp_weights_ && !m->device_->PrepareDraftHead(error_msg))
+    return nullptr;
   if (m->mtp_weights_ &&
       m->device_->output().rows > speculative::kDraftVocabPrefix) {
     std::vector<std::int32_t> specials;
@@ -1391,14 +1393,11 @@ bool Session::PrepareDecode(const DecodeRequest& request,
           *session_, exec.YarnLevelFor(tokens_.size() + cap + 1), error_msg)) {
     return false;
   }
-  // Head eligibility is speculative::DraftSubsetAllowed. Sampled cohorts are
-  // never jointly planned (DecodeBatchImpl), so a sampled request decides the
-  // same way alone and in any batch. A greedy request decoding alone has no
-  // peers to delay, so it drafts as on one session. Every request keeps the
-  // established length controller and AR backoff.
-  const bool allow_subset = speculative::DraftSubsetAllowed(
-      sampler.config().uses_random_sampling(), model_->DecodeConcurrency(),
-      occupancy, batch_drafts.has_value());
+  // Every request may draft through the small head (draft_vocab.hpp):
+  // greedy proposals never change the output, since the target verifies them
+  // over the full vocabulary with its penalties and grammar, and sampled
+  // proposals are corrected against the full target distribution. Every
+  // request keeps the established length controller and AR backoff.
   pending->policy_concurrency = MtpPolicyConcurrency(
       sampler.config().uses_random_sampling(), sampler.config().seed >= 0,
       batch_drafts.has_value(), occupancy);
@@ -1554,7 +1553,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   }
   if (!SyncDraftVocab(error_msg))
     return false;
-  pending->draft_subset = allow_subset && model_->draft_subset_ &&
+  pending->draft_subset = model_->draft_subset_ &&
                           draft_vocab_.Fits(anchor, [&](std::int32_t token) {
                             return model_->InDraftSubset(token);
                           });

@@ -110,6 +110,16 @@ public:
   /// The leading output() rows the MTP draft head scores in place (see
   /// draft_vocab.hpp); empty when the draft projects the full vocabulary.
   const DeviceTensor& draft_output() const noexcept { return draft_output_; }
+  /// The head MTP draft steps project the full vocabulary through (text
+  /// outside the small head's prefix, and mixed batches): output() with its
+  /// decode rows requantized to IQ4_NL when PrepareDraftHead found Q6_K rows
+  /// (31% fewer bytes per draft step), else output() itself. Proposals only
+  /// steer speculation; the target verifies every token through output().
+  const DeviceTensor& draft_full_output() const noexcept {
+    return draft_full_output_.empty() ? output_ : draft_full_output_;
+  }
+  /// Builds the IQ4_NL draft rows of a Q6_K head (no-op otherwise).
+  [[nodiscard]] bool PrepareDraftHead(std::string* error_msg);
   /// Special tokens above the prefix: the first rows of each session's
   /// draft table.
   std::span<const std::int32_t> draft_specials() const noexcept {
@@ -151,6 +161,7 @@ private:
   DeviceTensor output_;
   std::size_t output_bytes_{0};
   DeviceTensor draft_output_;
+  DeviceTensor draft_full_output_;
   std::vector<std::int32_t> draft_specials_;
   DeviceMixer hc_head_;
   std::vector<DeviceLayer> layers_;
