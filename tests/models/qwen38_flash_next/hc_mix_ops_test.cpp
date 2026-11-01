@@ -201,14 +201,16 @@ std::vector<std::uint8_t> MakeQ8_0(std::size_t blocks, std::uint32_t seed) {
   return weights;
 }
 
-/// Compact decode-format rows (Q6_K, Q5_1, IQ4_NL) of random codes with
+/// Compact decode-format rows (Q6_K, Q5_1, IQ4_NL, IQ4_XS) of random codes with
 /// sane F16 scales, as projection_ops_test builds them; a Q5_1 minimum
 /// centres the 5-bit codes.
 std::vector<std::uint8_t> MakeDecodeRows(q::WeightType type, std::size_t rows,
                                          std::size_t cols, std::uint32_t seed) {
   const bool q6 = type == q::WeightType::kQ6_K;
-  const std::size_t block = q6 ? 256 : 32;
+  const bool xs = type == q::WeightType::kIQ4_XS;
+  const std::size_t block = q6 || xs ? 256 : 32;
   const std::size_t block_bytes = q6                             ? 210
+                                  : xs                           ? 136
                                   : type == q::WeightType::kQ5_1 ? 24
                                                                  : 18;
   std::vector<std::uint8_t> packed(rows * cols / block * block_bytes);
@@ -219,7 +221,7 @@ std::vector<std::uint8_t> MakeDecodeRows(q::WeightType type, std::size_t rows,
     std::uint8_t* blk = packed.data() + b * block_bytes;
     const float d =
         (1.0F + static_cast<float>(NextRandom(&seed) % 64) / 320.0F) *
-        (q6 ? 2e-5F : 2e-3F);
+        (q6 || xs ? 2e-5F : 2e-3F);
     const __half dh = __float2half(d);
     std::memcpy(q6 ? blk + 208 : blk, &dh, 2);
     if (type == q::WeightType::kQ5_1) {
@@ -238,6 +240,8 @@ const char* FormatName(q::WeightType type) {
       return "Q5_1";
     case q::WeightType::kIQ4_NL:
       return "IQ4_NL";
+    case q::WeightType::kIQ4_XS:
+      return "IQ4_XS";
     default:
       return "Q8_0";
   }
@@ -556,7 +560,11 @@ int main() {
                             q::WeightType::kQ5_1);
       CheckFusedDecodeMixer(n, true, q::WeightType::kIQ4_NL,
                             q::WeightType::kIQ4_NL);
+      CheckFusedDecodeMixer(n, true, q::WeightType::kIQ4_XS,
+                            q::WeightType::kIQ4_NL);
     }
+    CheckFusedDecodeMixer(2, false, q::WeightType::kIQ4_XS,
+                          q::WeightType::kIQ4_NL);
     CheckFusedDecodeMixer(1, false);
     CheckFusedDecodeMixer(5, false);
     CheckFusedDecodeMixer(3, false, q::WeightType::kQ6_K, q::WeightType::kQ5_1);

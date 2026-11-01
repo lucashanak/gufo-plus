@@ -72,18 +72,20 @@ void* Q8Weights(std::size_t blocks, std::uint32_t seed) {
   return p;
 }
 
-/// Compact decode-format rows (Q6_K, Q5_1, IQ4_NL) of random codes, sane
-/// scales.
+/// Compact decode-format rows (Q6_K, Q5_1, IQ4_NL, IQ4_XS) of random codes,
+/// sane scales.
 void* DecodeWeights(q::WeightType type, std::size_t rows, std::size_t cols,
                     std::uint32_t seed) {
   const bool q6 = type == q::WeightType::kQ6_K;
   const bool q5 = type == q::WeightType::kQ5_1;
-  const std::size_t block_bytes = q6 ? 210 : q5 ? 24 : 18;
-  std::vector<std::uint8_t> host(rows * cols / (q6 ? 256 : 32) * block_bytes);
+  const bool xs = type == q::WeightType::kIQ4_XS;
+  const std::size_t block_bytes = q6 ? 210 : q5 ? 24 : xs ? 136 : 18;
+  std::vector<std::uint8_t> host(rows * cols / (q6 || xs ? 256 : 32) *
+                                 block_bytes);
   for (auto& b : host)
     b = static_cast<std::uint8_t>(Next(&seed) & 0xFF);
   for (std::size_t b = 0; b < host.size() / block_bytes; ++b) {
-    const float d = q6 ? 2e-5F : 2e-3F;
+    const float d = q6 || xs ? 2e-5F : 2e-3F;
     const __half dh = __float2half_rn(d);
     std::memcpy(host.data() + b * block_bytes + (q6 ? 208 : 0), &dh, 2);
     if (q5) {
@@ -181,12 +183,13 @@ int main(int argc, char** argv) {
     // The mixers chain through one inject buffer, as a decode step does;
     // block_out stays tiny so the residual stays bounded across replays.
     void* state = Device(q::HcMixQ8FusedStateBytes());
-    // Q8_0 mixers, the v3 recipe's Q6_K down / Q5_1 up compact rows, and
-    // IQ4_NL mixers.
-    const q::WeightType formats[3][2] = {
+    // Q8_0 mixers, the v3 recipe's Q6_K down / Q5_1 up compact rows, IQ4_NL
+    // mixers and Swift 1.5 IQ4_XS's IQ4_XS down / IQ4_NL up.
+    const q::WeightType formats[4][2] = {
         {q::WeightType::kQ8_0, q::WeightType::kQ8_0},
         {q::WeightType::kQ6_K, q::WeightType::kQ5_1},
-        {q::WeightType::kIQ4_NL, q::WeightType::kIQ4_NL}};
+        {q::WeightType::kIQ4_NL, q::WeightType::kIQ4_NL},
+        {q::WeightType::kIQ4_XS, q::WeightType::kIQ4_NL}};
     for (const auto& format : formats) {
       const q::WeightType down_type = format[0];
       const q::WeightType up_type = format[1];
@@ -212,6 +215,8 @@ int main(int argc, char** argv) {
                   q8 ? "Q8_0 down / Q8_0 up"
                   : down_type == q::WeightType::kQ6_K
                       ? "Q6_K down / Q5_1 up"
+                  : down_type == q::WeightType::kIQ4_XS
+                      ? "IQ4_XS down / IQ4_NL up"
                       : "IQ4_NL down / IQ4_NL up");
       for (std::uint32_t n = 1; n <= kMaxTokens; ++n) {
         const auto old_exec = Capture(stream, [&] {

@@ -7687,6 +7687,78 @@ struct FusedFormat<WeightType::kIQ4_NL> {
   }
 };
 
+/// ggml's block_iq4_xs: d, the six-bit sub-block scales (high bits, low
+/// nibbles), then 256 codes as in block_iq4_nl's 32-element halves.
+struct IQ4XSBlock {
+  __half d;
+  std::uint16_t scales_h;
+  std::uint8_t scales_l[4];
+  std::uint8_t qs[128];
+};
+static_assert(sizeof(IQ4XSBlock) == 136, "block_iq4_xs must be 136 bytes");
+
+template<>
+struct FusedFormat<WeightType::kIQ4_XS> {
+  using Block = IQ4XSBlock;
+  static constexpr int kQk = 256;
+  static constexpr int kQi = 32;  // QI4_XS
+  static constexpr int kVdr = 4;
+  struct Lane {
+    int q4[4];
+    int ls;
+    float d;
+  };
+  static __device__ __forceinline__ Lane Load(const Block* b, int iqs) {
+    Lane w;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      w.q4[j] = FusedIntB4(b->qs, iqs + j);
+    }
+    w.ls = (((b->scales_l[iqs / 8] >> (iqs & 0x04)) & 0x0F) |
+            (((b->scales_h >> (iqs / 2)) & 0x03) << 4)) -
+           32;
+    w.d = __half2float(b->d);
+    return w;
+  }
+  struct Input {
+    int u[8];
+    float d8;
+  };
+  static __device__ __forceinline__ Input Activations(const Q8_1Block* y,
+                                                      int iqs) {
+    const Q8_1Block* q = y + iqs / 4;
+    Input x;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      x.u[j] = FusedIntB4(q->qs, j);
+    }
+    x.d8 = __low2float(q->ds);
+    return x;
+  }
+  /// acc + vec_dot_iq4_xs_q8_1 as mul_mat_vec_dense_kq compiles it (see
+  /// MoeFragment<GGML_TYPE_IQ4_XS>::DotAcc): the integer sum times the
+  /// sub-block scale, dd = d * d8 rounded, then one FMA into the sum.
+  static __device__ __forceinline__ float Add(float acc, const Lane& w,
+                                              const Input& x) {
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int vx =
+          static_cast<int>(IQ4NLBytes(static_cast<std::uint32_t>(w.q4[j])));
+      const int vy = static_cast<int>(
+          IQ4NLBytes(static_cast<std::uint32_t>(w.q4[j]) >> 4));
+      sumi = __builtin_amdgcn_sudot4(true, vx, true, x.u[j], sumi, false);
+      sumi = __builtin_amdgcn_sudot4(true, vy, true, x.u[j + 4], sumi, false);
+    }
+    sumi *= w.ls;
+    float d8 = x.d8;
+    asm("" : "+v"(d8));
+    float dd = __fmul_rn(w.d, d8);
+    asm("" : "+v"(dd));
+    return __fmaf_rn(dd, static_cast<float>(sumi), acc);
+  }
+};
+
 /// Blocks a down tile's lanes load ahead: the largest divisor of the row's
 /// `iters` blocks per lane whose operands (`regs` per block) fit about 180
 /// registers. hc_mix_bench, Q6_K down at one token: 8 blocks 38.6 us, 20
@@ -8398,19 +8470,22 @@ std::size_t HcMixQ8FusedStateBytes() {
 bool HcFusedFormats(WeightType down, WeightType up) {
   return (down == WeightType::kQ8_0 && up == WeightType::kQ8_0) ||
          (down == WeightType::kQ6_K && up == WeightType::kQ5_1) ||
-         (down == WeightType::kIQ4_NL && up == WeightType::kIQ4_NL);
+         (down == WeightType::kIQ4_NL && up == WeightType::kIQ4_NL) ||
+         (down == WeightType::kIQ4_XS && up == WeightType::kIQ4_NL);
 }
 
 std::uint32_t HcFusedMaxTokens(WeightType down, WeightType up) {
   // Graph-replayed hc_mix_bench, five launches -> one: Q8_0 1.05-1.11x at
   // 1-8 tokens; with the down tiles' blocks loaded ahead, Q6_K/Q5_1
   // 1.07-1.42x to 5 tokens, 0.88-0.95x at 6-8; IQ4_NL 1.04-1.28x to 4
-  // tokens, 0.77-0.96x from 5.
+  // tokens, 0.77-0.96x from 5; IQ4_XS down / IQ4_NL up 1.15/1.16/1.08x at
+  // 1-3 tokens, 0.87-0.92x at 4-7.
   if (!HcFusedFormats(down, up))
     return 0;
-  return down == WeightType::kQ8_0   ? kFusedMaxTokens
-         : down == WeightType::kQ6_K ? 5
-                                     : 4;
+  return down == WeightType::kQ8_0     ? kFusedMaxTokens
+         : down == WeightType::kQ6_K   ? 5
+         : down == WeightType::kIQ4_XS ? 3
+                                       : 4;
 }
 
 template<WeightType kDown, WeightType kUp, int kTokens = 1>
@@ -8443,6 +8518,9 @@ bool HcMixQ8Fused(void* state, const HcFusedMix& mix, std::uint32_t n_tokens,
                                                              n_tokens, stream);
   } else if (mix.down_type == WeightType::kIQ4_NL) {
     LaunchHcMixQ8Fused<WeightType::kIQ4_NL, WeightType::kIQ4_NL>(
+        mix, fused, n_tokens, stream);
+  } else if (mix.down_type == WeightType::kIQ4_XS) {
+    LaunchHcMixQ8Fused<WeightType::kIQ4_XS, WeightType::kIQ4_NL>(
         mix, fused, n_tokens, stream);
   } else {
     LaunchHcMixQ8Fused<WeightType::kQ8_0, WeightType::kQ8_0>(mix, fused,
