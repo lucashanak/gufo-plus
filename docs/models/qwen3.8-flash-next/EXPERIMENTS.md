@@ -67,6 +67,41 @@ Every greedy output, alone, staggered and eight-way, is byte-identical.
 | --- | --- |
 | Register-resident routed down projection over 128-token tiles (`RoutedDownF16Kernel`, Q5_1/Q8_0) and a rewritten paired gate/up (`RoutedPairF16Kernel`, Q4_K/Q5_K) sharing one 128-token map | Retained. gfx1151 WMMA reads row r's A operand from one lane only (r for even rows, r + 16 for odd; the other copy is ignored, verified with garbage in the unread lanes), so each lane decodes one K16 half and one `v_permlanex16` per dword supplies the other: no duplicate decode, no selects. Down keeps each wave's 16 rows' codes in registers (activations are the only LDS stage, 155 VGPRs); the pair loads superblocks raw and decodes them at commit, removing a full memory wait every fourth stage. Loop VALU per WMMA: down 11 → 4.6, pair 6.8 → 3.9. Every row is bit-identical across 16/48/128-row tiles, paired vs separate, and 1/7/9/33/95/96-row passes (`CheckPassRoutes`). `routed_gemm_bench` (synthetic skewed top-10, Q4_K gate/up, Q5_1 down) on main `34ebb5fe`, two rounds, ms per layer at 4,096 / 26,541 rows: gate/up 10.61, 11.06 → 10.30, 10.34 / 54.43, 59.42 → 52.30, 56.35; down 6.58, 6.77 → 5.72, 6.16 / 32.83, 37.83 → 28.29, 31.50. On the production fork (quiet GPU, alternating medians), TFLOPS at 4,096 / 26,541 rows: down Q5_1 21.1 → 23.8 / 25.1 → 30.6, Q8_0 17.8 → 20.4 / 23.6 → 29.0; gate/up Q4_K 26.7 → 28.3 / 32.6 → 33.1, Q5_K 24.1 → 25.3 / 30.2 → 30.7. The GPU runs these kernels power-limited near 1.9 GHz (~110 W), so the measured WMMA ceiling is about 39–48 TFLOPS. `gufo bench` UD-Q4_K_XL pp16384, two rounds: 1,590 / 1,583 → 1,624 / 1,629 tok/s. Rejected (all exact): prefetching two stages ahead, the next token tile's B fragments (199 VGPRs), double-buffered activation stages with one barrier (BK 1 or 2), and 256-row × 64-token down tiles; none beat the version kept. Ablation at 26.5K rows: without WMMA the down kernel takes 16 of 30 ms, without decode −5%, without B fragment reads −3%, without stores −2%. |
 | Weighted top-10 combine folded into the down epilogue | Not done: a token's ten slot rows come from ten experts' tiles spread over the whole launch, so an exact slot-order sum needs every partial first; integer atomics would be order-independent but cost more than the 51 KB/token read and would change every route. The combine already streams about 190 GB/s. |
+## Wide prompt-lookup verification (November 1, 2026)
+
+Strix Halo gfx1151, ROCm 7.2.4, Swift 1.5 IQ4_XS with the Q8_0 MTP head,
+`--sessions 8`, 120 W package limit. HTTP streaming, thinking off, one fresh
+server per build, production `addeb30c` and the candidate alternating in one
+block. Rewrites re-emit a file from the prompt: a 220-line Python module with a
+rename, added docstrings or return hints (2,222–2,238 tokens), a 150-line C++
+header with a rename (1,675), SEARCH/REPLACE blocks (1,122) and lines 60–160 of
+a line-numbered tool-read listing (1,099). Client decode tok/s:
+
+| Workload | Production | Candidate | Verifications |
+| --- | ---: | ---: | ---: |
+| Python rename, greedy | 124.1 | 187.9 | 280 → 53 |
+| Python docstrings, greedy | 122.4 | 186.9 | 286 → 54 |
+| Python return hints, greedy | 123.5 | 194.4 | 279 → 41 |
+| C++ rename, greedy | 124.1 | 186.5 | 212 → 41 |
+| SEARCH/REPLACE blocks, greedy | 106.4 | 119.9 | 159 → 104 |
+| Line-numbered listing, greedy | 88.9 | 89.0 | 185 → 185 |
+| Prose / code / Czech, greedy (512 tokens) | 66.5 / 83.6 / 57.6 | 66.3 / 83.4 / 57.6 | unchanged |
+| Python rename, temperature 1 | 123.9 | 182.9 | 280 → 58 |
+| C++ rename, temperature 1 | 126.0 | 191.7 | 211 → 39 |
+| Python rename, second request joins after 6 s (aggregate) | 135.0 | 158.0 | |
+| C++ rename, second request joins after 6 s (aggregate) | 132.0 | 171.8 | |
+| Python rename, eight requests (aggregate) | 206.0 | 205.7 | unchanged |
+
+Every greedy output, alone, staggered and eight-way, is byte-identical to
+production. The sampled requests are unseeded, so their texts may differ run
+to run; 98–100 % of their copied tokens were accepted, as in production.
+
+| Variant | Outcome |
+| --- | --- |
+| 32-row limit | Rejected: rename/docstrings/hints/C++ 157.3/168.4/174.4/170.9 tok/s, against 188.1/187.0/195.0/185.9 at 64 in the same block. At 64 the Python rename's cycles average 42 tokens in 223 ms; production's 7.9 tokens in 64 ms. |
+| Double the width after one whole copy | Rejected: the line-numbered listing breaks every copy at the next line number, so each doubled copy wasted rows (87.9 → 85.1 tok/s). Two whole copies in a row: 89.0–89.2. |
+| Ordinary verification widened past eight rows | Not tried: the eight-row trunk kernels are what the single-token arithmetic is checked against; the wide pass reuses the batched route, which already decodes 64 rows exactly. |
+
 ## Upstream 0.27.0 merge (October 29, 2026)
 
 Merged build on Strix Halo (ROCm 7.2.4, v3 recipe + MTP) against production

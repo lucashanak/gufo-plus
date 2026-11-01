@@ -1134,6 +1134,9 @@ bool Session::SyncImpl(std::span<const std::int32_t> prompt,
   lookup_.BeginRequest();
   copy_rows_ = 0;
   copy_streak_ = 0;
+  // Each request measures its own draft sources: code and prose favour
+  // different ones.
+  draft_source_.Reset();
   if (!valid_)
     Reset();
   // Recurrent state cannot be rewound, so any divergence restarts the
@@ -1419,6 +1422,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   // Sampled requests qualify when nothing replays them (no seed) and their
   // rows verify compactly on the device.
   pending->wide = !defer_head && pending->lookup_cap != 0 &&
+                  !DFlashAvailable() &&
                   (gpu_greedy || (sampled && sampler.config().seed < 0 &&
                                   rocm::Executor::CanCompactWideVerification(
                                       sampler, exec.max_copy_rows())));

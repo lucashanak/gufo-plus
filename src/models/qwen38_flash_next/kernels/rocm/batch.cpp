@@ -1335,6 +1335,21 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
           return false;
         }
       }
+      if (wide) {
+        // Later segments read their own positions; their controls stage in
+        // the batch slots a single-session pass leaves unused.
+        const auto segs = segments_of(0);
+        for (std::size_t s = 1; s < segs.size(); ++s) {
+          batch_controls_[s] = batch_controls_[0];
+          batch_controls_[s].position = segs[s].start;
+          batch_controls_[s].blocks = segs[s].blocks;
+          if (!Check(hipMemcpyAsync(wide_controls_ + s, batch_controls_ + s,
+                                    sizeof(Session::Control),
+                                    hipMemcpyHostToDevice, stream_),
+                     error))
+            return false;
+        }
+      }
       if (!Check(hipMemcpyAsync(base.tokens, tokens_host_,
                                 rows * sizeof(std::int32_t),
                                 hipMemcpyHostToDevice, stream_),

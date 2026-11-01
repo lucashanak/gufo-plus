@@ -6,6 +6,7 @@
 #include <hipblas/hipblas.h>
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
