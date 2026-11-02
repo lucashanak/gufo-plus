@@ -936,8 +936,14 @@ __global__ void HcCombineVec4Kernel(
       if constexpr (!kDefer) {
         *reinterpret_cast<float4*>(dst + e) = v[c];
       }
-      const float sq =
-          v[c].x * v[c].x + v[c].y * v[c].y + v[c].z * v[c].z + v[c].w * v[c].w;
+      // Pinned to the order ROCm 7.2's compiler gave every instantiation
+      // (w, y, z, x as one FMA chain). Left to fast-math, ROCm 10.1 sums
+      // x, y, z, w instead, which moves the stream norms by an ulp and
+      // changes greedy output.
+      const float sq = __fmaf_rn(
+          v[c].x, v[c].x,
+          __fmaf_rn(v[c].z, v[c].z,
+                    __fmaf_rn(v[c].y, v[c].y, __fmul_rn(v[c].w, v[c].w))));
 #pragma unroll
       for (std::uint32_t k = 0; k < kStreams; ++k) {
         ss[k] += (k == s) ? sq : 0.0F;
