@@ -156,7 +156,27 @@ void CheckPreparation(std::uint32_t n, std::uint32_t start,
   HipBuffer<std::uint8_t> k_out(cache_rows * kKvRowBytes),
       v_out(cache_rows * kKvRowBytes);
   HipBuffer<std::uint32_t> pos(1);
-  Upload(&packed, MakeValues(static_cast<std::size_t>(n) * stride, 17, 4.0F));
+  const auto packed_host =
+      MakeValues(static_cast<std::size_t>(n) * stride, 17, 4.0F);
+  Upload(&packed, packed_host);
+  // The same rows from separate projections: interleaved Q/gate heads only,
+  // and contiguous K and V rows.
+  constexpr std::uint32_t qg_stride = 2 * kQWidth;
+  std::vector<float> qg_host(std::size_t(n) * qg_stride),
+      k_host(std::size_t(n) * kKvWidth), v_host(std::size_t(n) * kKvWidth);
+  for (std::uint32_t t = 0; t < n; ++t) {
+    const float* row = packed_host.data() + std::size_t(t) * stride;
+    std::copy_n(row, qg_stride, qg_host.data() + std::size_t(t) * qg_stride);
+    std::copy_n(row + qg_stride, kKvWidth,
+                k_host.data() + std::size_t(t) * kKvWidth);
+    std::copy_n(row + qg_stride + kKvWidth, kKvWidth,
+                v_host.data() + std::size_t(t) * kKvWidth);
+  }
+  HipBuffer<float> qg_rows(qg_host.size()), k_rows(k_host.size()),
+      v_rows(v_host.size());
+  Upload(&qg_rows, qg_host);
+  Upload(&k_rows, k_host);
+  Upload(&v_rows, v_host);
   auto qg = MakeValues(kDim, 37, 0.5F);
   auto kg = MakeValues(kDim, 91, 0.5F);
   for (auto& x : qg)
@@ -272,6 +292,39 @@ void CheckPreparation(std::uint32_t n, std::uint32_t start,
          window, "key cache", replay);
     same(v_ref.get() + first * kKvRowBytes, v_out.get() + first * kKvRowBytes,
          window, "value cache", replay);
+    // Separate K/V projections (decode and prefill launch shapes) write the
+    // same queries, gates and cache rows; poison first so a skipped write
+    // shows. The stacked cache stays as it was for the next replay.
+    std::vector<std::uint8_t> k_keep(k_out.bytes()), v_keep(v_out.bytes());
+    CheckHip(hipMemcpy(k_keep.data(), k_out.get(), k_keep.size(),
+                       hipMemcpyDeviceToHost),
+             "keep k");
+    CheckHip(hipMemcpy(v_keep.data(), v_out.get(), v_keep.size(),
+                       hipMemcpyDeviceToHost),
+             "keep v");
+    for (const bool prefill : {false, true}) {
+      CheckHip(hipMemset(q_out.get(), 0xA5, q_out.bytes()), "poison q");
+      CheckHip(hipMemset(gate_out.get(), 0xA5, gate_out.bytes()),
+               "poison gate");
+      CheckHip(hipMemset(k_out.get(), 0xA5, k_out.bytes()), "poison k");
+      CheckHip(hipMemset(v_out.get(), 0xA5, v_out.bytes()), "poison v");
+      if (!q::PrepareAttention(
+              qg_rows.get(), qg_stride, q_gamma.get(), k_gamma.get(),
+              q_out.get(), gate_out.get(), k_out.get(), v_out.get(), n, kHeads,
+              kKvHeads, kDim, rotary, pos.get(), 1e7F, 1e-6F, nullptr, nullptr,
+              prefill, yarn, k_rows.get(), v_rows.get()))
+        throw std::runtime_error("separate K/V preparation rejected geometry");
+      CheckHip(hipDeviceSynchronize(), "separate preparation ready");
+      const std::size_t own = std::size_t(start + replay) * kKvRowBytes;
+      same(q_ref.get(), q_out.get(), count, "separate queries", replay);
+      same(gate_ref.get(), gate_out.get(), count, "separate gates", replay);
+      same(k_ref.get() + own, k_out.get() + own, std::size_t(n) * kKvRowBytes,
+           "separate key cache", replay);
+      same(v_ref.get() + own, v_out.get() + own, std::size_t(n) * kKvRowBytes,
+           "separate value cache", replay);
+    }
+    Upload(&k_out, k_keep);
+    Upload(&v_out, v_keep);
   }
   if (n >= 32) {
     // Each small prefill piece must match the full preparation, including
@@ -1138,6 +1191,8 @@ int main() {
     CheckPreparation(8, 4096, 64);
     CheckPreparation(65, 131069, 64);
     CheckPreparation(7, 131069, 256);
+    CheckPreparation(9, 17, 64);
+    CheckPreparation(33, 1000, 64);
     CheckPreparation(8, 4096, 64, Yarn(1.5625F));
     CheckPreparation(65, 300000, 64, Yarn(2.5F));
     CheckYarnPhase(1.0F, 262143);  // off: sincosf accuracy at native depth

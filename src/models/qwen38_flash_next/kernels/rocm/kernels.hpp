@@ -528,7 +528,9 @@ void UnpackQGate(const float* qg, std::uint32_t qg_stride, float* q,
 /// and writes the 8-bit caches (kv_cache_format.hpp). Returns false for heads
 /// wider than 256 or not a multiple of kKvBlock. With zero query heads, packed
 /// contains only K/V and q/gate may be null. With yarn enabled, applies static
-/// YaRN (see rope_scaling.hpp).
+/// YaRN (see rope_scaling.hpp). With non-null `k_rows` and `v_rows`
+/// ([t][kv_heads*d] each, from separate K and V projections), packed rows
+/// hold only the interleaved Q/gate heads and K/V are read from those.
 bool PrepareAttention(const float* packed, std::uint32_t stride,
                       const float* q_gamma, const float* k_gamma, float* q,
                       float* gate, std::uint8_t* k_cache, std::uint8_t* v_cache,
@@ -537,7 +539,9 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
                       std::uint32_t rotary_dim, const std::uint32_t* start_pos,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr,
-                      bool prefill = false, const YarnRope& yarn = {});
+                      bool prefill = false, const YarnRope& yarn = {},
+                      const float* k_rows = nullptr,
+                      const float* v_rows = nullptr);
 
 /// NEOX partial rotary on x [t][heads][d] at positions start_pos + t.
 /// Positions are read from device memory (`start_pos` points at the
