@@ -3,6 +3,7 @@
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <hipcub/block/block_radix_sort.hpp>
@@ -1838,29 +1839,84 @@ __global__ void GdnKernel(const float* conv_out, const float* qn,
   }
 }
 
-__global__ void RestoreGdnStateKernel(float* state, RollbackRows snapshots,
-                                      std::uint32_t keep, std::uint32_t k_heads,
-                                      std::uint32_t v_heads) {
+struct GdnRestoreArgs {
+  GdnRestoreLayer layer[kGdnRestoreLayers];
+};
+
+/// Rollback of up to kGdnRestoreLayers layers, one per blockIdx.y. The first
+/// `state_blocks` blocks rebuild the state, four consecutive elements of a
+/// state row per thread (k = 4m..4m+3 share the row's decay, beta and error),
+/// each element with the replay's exact products and FMAs in order. The
+/// remaining blocks copy the convolution history.
+template<bool kVec>
+__global__ void RestoreGdnLayersKernel(GdnRestoreArgs args, std::uint32_t keep,
+                                       std::uint32_t k_heads,
+                                       std::uint32_t v_heads,
+                                       std::uint32_t conv_elems,
+                                       std::uint32_t state_blocks) {
   constexpr std::uint32_t d = kGdnDim;
-  const std::size_t i = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
-  if (i >= std::size_t{v_heads} * d * d)
+  const GdnRestoreLayer& layer = args.layer[blockIdx.y];
+  if (blockIdx.x >= state_blocks) {
+    const std::size_t i =
+        std::size_t{blockIdx.x - state_blocks} * blockDim.x + threadIdx.x;
+    if (layer.conv != nullptr && i < conv_elems)
+      layer.conv[i] = layer.conv_row[i];
     return;
+  }
+  const std::size_t quad = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+  if (layer.state == nullptr || quad >= std::size_t{v_heads} * d * d / 4)
+    return;
+  const std::size_t i = quad * 4;
   const auto h = i / (d * d);
   const auto j = (i / d) % d;
   const auto k = i % d;
-  float value = snapshots.rows[0][i];
+  const float* first = layer.rows.rows[0] + i;
+  float v[4];
+  if constexpr (kVec) {
+    const float4 s = *reinterpret_cast<const float4*>(first);
+    v[0] = s.x;
+    v[1] = s.y;
+    v[2] = s.z;
+    v[3] = s.w;
+  } else {
+#pragma unroll
+    for (unsigned e = 0; e < 4; ++e)
+      v[e] = first[e];
+  }
   for (std::uint32_t t = 1; t < keep; ++t) {
-    const auto* update = snapshots.rows[t];
-    const float key = update[(h % k_heads) * d + k];
+    const float* update = layer.rows.rows[t];
+    const float* keys = update + (h % k_heads) * d + k;
+    float key[4];
+    if constexpr (kVec) {
+      const float4 k4 = *reinterpret_cast<const float4*>(keys);
+      key[0] = k4.x;
+      key[1] = k4.y;
+      key[2] = k4.z;
+      key[3] = k4.w;
+    } else {
+#pragma unroll
+      for (unsigned e = 0; e < 4; ++e)
+        key[e] = keys[e];
+    }
     const float decay = update[k_heads * d + h];
     const float beta = update[k_heads * d + v_heads + h];
     const float error = update[k_heads * d + 2 * v_heads + h * d + j];
-    const float correction = __fmul_rn(error, key);
-    value = (k + 1) % (d / kGdnLanes) == 0
-                ? GdnLastUpdate(value, decay, error, key, beta)
-                : __fmaf_rn(beta, correction, __fmul_rn(value, decay));
+#pragma unroll
+    for (unsigned e = 0; e < 4; ++e) {
+      const float correction = __fmul_rn(error, key[e]);
+      v[e] = (k + e + 1) % (d / kGdnLanes) == 0
+                 ? GdnLastUpdate(v[e], decay, error, key[e], beta)
+                 : __fmaf_rn(beta, correction, __fmul_rn(v[e], decay));
+    }
   }
-  state[i] = value;
+  float* out = layer.state + i;
+  if constexpr (kVec) {
+    *reinterpret_cast<float4*>(out) = float4{v[0], v[1], v[2], v[3]};
+  } else {
+#pragma unroll
+    for (unsigned e = 0; e < 4; ++e)
+      out[e] = v[e];
+  }
 }
 
 /// Per-head RMSNorm and sigmoid output gate of one (token, head) row of the
@@ -10127,9 +10183,37 @@ void PleInject(float* res, const float* gated, const float* conv,
 void RestoreGdnState(float* state, RollbackRows snapshots, std::uint32_t keep,
                      std::uint32_t k_heads, std::uint32_t v_heads,
                      hipStream_t stream) {
-  const auto count = std::size_t{v_heads} * kGdnDim * kGdnDim;
-  RestoreGdnStateKernel<<<(count + 255) / 256, 256, 0, stream>>>(
-      state, snapshots, keep, k_heads, v_heads);
+  const GdnRestoreLayer layer{state, snapshots, nullptr, nullptr};
+  RestoreGdnLayers(&layer, 1, keep, k_heads, v_heads, 0, stream);
+}
+
+void RestoreGdnLayers(const GdnRestoreLayer* layers, std::size_t count,
+                      std::uint32_t keep, std::uint32_t k_heads,
+                      std::uint32_t v_heads, std::size_t conv_elems,
+                      hipStream_t stream) {
+  const auto quads = std::size_t{v_heads} * kGdnDim * kGdnDim / 4;
+  const auto state_blocks = static_cast<std::uint32_t>(Blocks(quads));
+  const auto conv_blocks = static_cast<std::uint32_t>(Blocks(conv_elems));
+  for (std::size_t first = 0; first < count; first += kGdnRestoreLayers) {
+    const std::size_t n = std::min(count - first, kGdnRestoreLayers);
+    GdnRestoreArgs args{};
+    // Whole float4 loads need every state row, first row and key row on a
+    // 16-byte boundary (true of the session's rollback allocations).
+    std::uintptr_t align = 0;
+    for (std::size_t l = 0; l < n; ++l) {
+      args.layer[l] = layers[first + l];
+      align |= reinterpret_cast<std::uintptr_t>(args.layer[l].state);
+      for (std::uint32_t t = 0; t < keep; ++t)
+        align |= reinterpret_cast<std::uintptr_t>(args.layer[l].rows.rows[t]);
+    }
+    const dim3 grid(state_blocks + conv_blocks, static_cast<std::uint32_t>(n));
+    const auto kernel = align % 16 == 0 && k_heads * kGdnDim % 4 == 0
+                            ? RestoreGdnLayersKernel<true>
+                            : RestoreGdnLayersKernel<false>;
+    hipLaunchKernelGGL(kernel, grid, dim3(kThreads), 0, stream, args, keep,
+                       k_heads, v_heads, static_cast<std::uint32_t>(conv_elems),
+                       state_blocks);
+  }
 }
 
 void HistoryPrefix(const float* in, std::uint32_t stride, const float* history,

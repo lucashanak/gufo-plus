@@ -37,6 +37,23 @@ void RestoreGdnState(float* state, RollbackRows snapshots, std::uint32_t keep,
                      std::uint32_t k_heads, std::uint32_t v_heads,
                      hipStream_t stream);
 
+/// One linear layer's rollback: its recurrent state rebuilt from the kept
+/// rows as RestoreGdnState does, and `conv_elems` floats of convolution
+/// history copied from `conv_row` to `conv` (both may be null).
+struct GdnRestoreLayer {
+  float* state{nullptr};
+  RollbackRows rows;
+  float* conv{nullptr};
+  const float* conv_row{nullptr};
+};
+/// Every layer of one rollback in as few launches as the kernel-argument
+/// budget allows (kGdnRestoreLayers per launch).
+inline constexpr std::size_t kGdnRestoreLayers = 18;
+void RestoreGdnLayers(const GdnRestoreLayer* layers, std::size_t count,
+                      std::uint32_t keep, std::uint32_t k_heads,
+                      std::uint32_t v_heads, std::size_t conv_elems,
+                      hipStream_t stream);
+
 /// GGUF type ids the runtime accepts for the small-matrix and lookup paths.
 enum class WeightType : std::uint32_t {
   kF32 = 0,
