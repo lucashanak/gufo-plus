@@ -726,7 +726,9 @@ private:
   mutable std::shared_ptr<SnapshotAllocator> snapshot_allocator_;
   mutable std::shared_ptr<void> checkpoint_storage_;
   /// The stream kernels are queued on. Overlapped work swaps in side_stream_
-  /// for its launches and joins back through side_done_ (JoinSide).
+  /// for its launches: a decode MoE queues its shared expert there (joined
+  /// through shexp_join_), a prompt pass its shared expert and checkpoint
+  /// copies (joined through side_done_, JoinSide).
   mutable hipStream_t stream_{nullptr};
   hipStream_t side_stream_{nullptr};
   hipEvent_t shexp_fork_{nullptr};
