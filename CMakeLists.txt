@@ -113,6 +113,14 @@ endif()
 
 if (ENGINE_ENABLE_HIP)
   enable_language(HIP)
+  # ROCm 7.2's clang compiles each source's device code in one -O3 pass.
+  # ROCm 10.1's clang defaults to the new offload driver, which emits bitcode
+  # and optimizes it again with full LTO in clang-linker-wrapper; under
+  # -ffast-math that second pipeline reorders arithmetic and changes greedy
+  # output. The old driver keeps 10.1 on 7.2's device pipeline.
+  if (NOT WIN32)
+    add_compile_options($<$<COMPILE_LANGUAGE:HIP>:--no-offload-new-driver>)
+  endif()
   # clang-cl compiles HIP like C++ on Windows, so ccache covers it there.
   if (GUFO_CCACHE_CLANG_CL)
     set(CMAKE_HIP_COMPILER_LAUNCHER "${GUFO_CCACHE_PROGRAM}")
