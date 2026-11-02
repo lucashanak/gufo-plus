@@ -19,6 +19,15 @@ namespace {
 
 constexpr unsigned kThreads = 256;
 
+/// sincosf outside the fused attention GEMM: inlined there, ROCm 10.1
+/// sometimes returns a quarter turn off for angles of 2^17 or more (the
+/// large-argument reduction), which a separate function does not.
+__device__ __noinline__ float2 AttentionSinCos(float x) {
+  float s = 0.0F, c = 0.0F;
+  sincosf(x, &s, &c);
+  return float2{s, c};
+}
+
 __device__ __forceinline__ float SigmoidF(float x) {
   return 1.0f / (1.0f + __expf(-x));
 }
@@ -9680,11 +9689,11 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
                               -2.0F * static_cast<float>(lane_id) / 64.0F);
             if constexpr (kYarn)
               freq = YarnFrequency(freq, lane_id, attention.yarn);
-            float sn = 0.0F, cs = 0.0F;
-            sincosf(qwen::vision::RopePosition(
-                        attention.rope, *attention.position + tok, lane_id) *
-                        freq,
-                    &sn, &cs);
+            const float2 sc = AttentionSinCos(
+                qwen::vision::RopePosition(attention.rope,
+                                           *attention.position + tok, lane_id) *
+                freq);
+            float sn = sc.x, cs = sc.y;
             if constexpr (kYarn)
               YarnScale(sn, cs, attention.yarn);
             const float lo = __fmaf_rn(v[0], cs, -__fmul_rn(v[1], sn));
