@@ -525,6 +525,9 @@ extern "C" int qfn_mmq_dense_kq_vec(int weight_type, const void* W,
     return -1;
   }
   const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+  ggml_hip_pool_alloc<char> q8(
+      qfn_pool_for_stream(ctx->device, stream),
+      (size_t)n_tokens * ne10_padded * sizeof(block_q8_1) / QK8_1);
   quantize_row_q8_1_hip(X_f32, nullptr, (void*)q8.get(), type, K, (int64_t)K,
                         (int64_t)K, (int64_t)K * n_tokens, ne10_padded, 1,
                         n_tokens, 1, stream);
