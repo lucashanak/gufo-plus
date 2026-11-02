@@ -42,6 +42,14 @@ inline bool GatedVecFormat(core::GgmlType type) {
          type == core::GgmlType::kQ5_K || type == core::GgmlType::kIQ4_XS;
 }
 
+/// Completion count of Executor::WaitAsleep's host functions.
+struct HostWake {
+  std::mutex mutex;
+  std::condition_variable ready;
+  std::uint64_t armed{0};  ///< host functions queued (waiting thread only)
+  std::uint64_t done{0};   ///< host functions run
+};
+
 class Executor;
 class SnapshotAllocator;
 struct ArgmaxCandidate;
@@ -732,6 +740,13 @@ private:
   /// the GPU (4% of prefill). A wait expected to last `expect_us` sleeps
   /// through that, then polls every millisecond; unpredicted waits poll at
   /// an eighth of the time waited so far, between 100 us and 1 ms.
+  /// Waits for `event` without spinning: the thread sleeps until a host
+  /// function queued behind the event runs on HIP's interrupt-driven
+  /// callback thread.
+  bool WaitAsleep(hipEvent_t event, const char* what,
+                  std::string* error_msg) const;
+  bool WaitRelaxed(hipEvent_t event, const char* what, std::string* error_msg,
+                   double expect_us = 0.0, double* waited_us = nullptr) const;
   /// Runs `body` eagerly, or replays its graph for `key`: shape words then
   /// the identity of every session whose buffers the commands name. A key
   /// runs eagerly once, then eagerly again while its graph is recorded.
@@ -774,6 +789,10 @@ private:
   hipEvent_t side_done_{nullptr};
   mutable bool side_pending_{false};  ///< side_done_ not yet waited on
   hipEvent_t counts_ready_{nullptr};
+  hipEvent_t pass_done_{nullptr};  ///< end of a relaxed Run
+  /// Runs WaitAsleep's host functions beside the work stream.
+  hipStream_t notify_stream_{nullptr};
+  mutable HostWake wake_;
   /// Relaxed expert-count waits of the current and the previous prompt pass,
   /// in microseconds per row, by layer: they predict the next waits.
   mutable std::vector<double> counts_wait_us_per_row_;
