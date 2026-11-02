@@ -1006,7 +1006,8 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
     std::span<const float> sample_uniforms, std::vector<float>* out_confidences,
     std::vector<tokenization::TokenId>* out_candidate_ids,
     std::vector<float>* out_candidate_probabilities, const DFlashTrace& trace,
-    const sampling::SamplerState* sampler) {
+    const sampling::SamplerState* sampler,
+    std::vector<float>* out_token_probabilities) {
   CheckContinuation();
   const auto& weights = model_->GetWeights();
   const auto& cfg = model_->GetConfig();

@@ -482,8 +482,11 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
                   session.mtp_.index_k, n, c.indexer_head_dim,
                   &session.control_->mtp_position, capacity, stream_);
         if (session.mtp_.position + n > c.indexer_top_k) {
-          const auto pool = (session.mtp_.position + n) / c.compress_ratio -
-                            session.mtp_.blocks;
+          // A graph covers the widest grid it allows (see ForwardBatch).
+          const auto pool =
+              graph ? n / c.compress_ratio + 1
+                    : (session.mtp_.position + n) / c.compress_ratio -
+                          session.mtp_.blocks;
           PoolIndexerBlocks(session.mtp_.index_k, l.indexer_k_norm.f32(),
                             session.mtp_.block_k, &session.control_->mtp_blocks,
                             &session.control_->mtp_position, n, pool,
@@ -518,8 +521,6 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
           return false;
         continue;
       }
-      ++session.mutation_epoch_;
-      session.mtp_.residual_valid = false;
       Session::AttentionState attention;
       attention.rope = session.vision_input_.rope();
       attention.k_cache = session.mtp_.k_cache;

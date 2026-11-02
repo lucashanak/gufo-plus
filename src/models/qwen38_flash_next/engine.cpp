@@ -1360,6 +1360,10 @@ bool Session::PrepareDecode(const DecodeRequest& request,
     return defer_head || DraftCatchUp(anchor, false, error_msg);
   }
   if (allow_subset && !SyncDraftVocab(error_msg))
+    const auto ids = dflash_->ForwardBlock(
+        static_cast<tokenization::TokenId>(anchor), base,
+        static_cast<std::uint32_t>(width - 1), 0.0F, {}, nullptr, nullptr,
+        nullptr, {}, nullptr, &probabilities);
     // Like a gated MTP chain, the block ends after its first unlikely
     // proposal: each verified row costs a fresh set of routed experts.
     for (std::size_t i = 0; i < ids.size(); ++i) {
@@ -1613,6 +1617,9 @@ bool Session::FinishDecode(const DecodeRequest& request,
   // proposals as failed predictions. DFlash2 proposals say nothing about
   // the MTP head.
   if (!pending.dflash)
+    draft_length_.Observe(
+        observed, result->stop || mtp_all ? observed : mtp_drafts, base,
+        pending.policy_concurrency, pending.sampled_subset_cost);
 
   // The next call knows the next sampled anchor. Defer draft catch-up until
   // then, retaining this session's target hidden rows across interleaving.

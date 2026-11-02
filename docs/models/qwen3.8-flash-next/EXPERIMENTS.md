@@ -42,6 +42,21 @@ reads z from its first token, so the Z overlap cannot hide anything, and
 both side streams contend with it (on the production fork's recipe + MTP at
 pp32768: 1,658-1,662 with either overlap, 1,693 without the shared-expert
 one, 1,741 without both). Their removal is left to a ROCm 10.1 measurement.
+## Upstream 0.23.0 merge (October 24, 2026)
+
+Where upstream and this branch built the same thing, the merge keeps the side
+that satisfies the route-invariance contract more widely and measured faster.
+
+| Overlap | Kept | Why |
+| --- | --- | --- |
+| BF16 indexer projections in K order (upstream #714) | Ours, with upstream's offset check added to `dense_gemm_bench` | Same kernel and launch; ours routes every BF16 `k == 2560` width (`BlasLt::RowIndependent`), upstream only m = 64/128/256/512 |
+| Small draft head for lone and penalized greedy requests (#733, #739) | Upstream's `MtpDraftSubsetAllowed(sampled, sessions, occupancy, planned)` | Same decision as ours (any greedy request decoding alone or in a planned batch) |
+| Unseeded sampled pricing at decoding occupancy (#703) | Upstream's `MtpPolicyConcurrency` | Not on this branch before |
+| C1 sampled small-head cycle costs (#742) | Upstream's curve for the controller's AR backoff only | The confidence gate already drafts to the budget, so the curve does not set the chain length |
+| Selector `#pragma unroll 1` on Clang 23+ (#742) | Not applicable | Applies to the scalar `SelectScoreKernel`, which the matrix-core scorer replaced |
+| KV-only predictor catch-up (#699) | Upstream's, inside our batched hipGraph | `kv_only` is part of the graph shape; pooling covers the widest grid as elsewhere; the cache-only path now passes YaRN |
+| DFlash2 `ForwardBlock` sampler argument (#705) | Both | Upstream's `sampler` comes before our `out_token_probabilities` |
+
 ## PLE rows of cold prompts (October 24, 2026)
 
 | Experiment | Outcome |
