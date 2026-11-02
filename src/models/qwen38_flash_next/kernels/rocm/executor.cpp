@@ -4332,8 +4332,6 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
   if (keep < n) {
     const std::size_t conv_elems =
         static_cast<std::size_t>(c.ssm_conv_kernel - 1) * c.SsmConvChannels();
-    const std::size_t state_elems = GdnRollbackRowFloats(
-        0, c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim);
     // A wide verification (ForwardWide) ran consecutive segments of at most
     // eight rows. Cut back within the segment holding the last kept row;
     // keeping a whole segment restores the next one's starting state.
