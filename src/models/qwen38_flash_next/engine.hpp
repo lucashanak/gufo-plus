@@ -308,11 +308,10 @@ private:
   Session(std::shared_ptr<Model> model, std::unique_ptr<rocm::Session> session);
   void ResetImpl(bool reuse_mtp);
 
-  /// Consumes an in-pass checkpoint, or null when the live session is at
-  /// the boundary.
-  using PrefillCapture = std::function<void(const rocm::PrefillCheckpoint*)>;
-  bool SyncThroughComponents(std::span<const std::int32_t>, std::uint32_t,
-                             const PrefillCapture&, std::string*);
+  /// Receives the index of a boundary and its in-pass checkpoint view, or
+  /// null when the live session is at the boundary.
+  using PrefillCapture =
+      std::function<void(std::size_t, const rocm::PrefillCheckpoint*)>;
   /// `next`, as for Sync, names the tokens the following step appends.
   bool SyncThroughComponents(std::span<const std::int32_t>,
                              std::span<const std::uint32_t>,

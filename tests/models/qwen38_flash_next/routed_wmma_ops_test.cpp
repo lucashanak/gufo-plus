@@ -200,6 +200,9 @@ Experts MakeQ3K(std::size_t e, std::size_t m, std::size_t k,
       const int l = j % 32;
       const int low = (qs[32 * (sb32 / 4) + l] >> (2 * (sb32 % 4))) & 3;
       const int q = low - (((hm[l] >> sb32) & 1) != 0 ? 0 : 4);
+      w.values[b * 256 + j] = df *
+                              static_cast<float>(sc[2 * sb32 + l / 16] - 32) *
+                              static_cast<float>(q);
     }
   }
   return w;
@@ -572,7 +575,8 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
                                     : type == q::WeightType::kQ4_K ? 144
                                                                    : 176;
     for (std::size_t b = 0; b < up.size(); b += block_bytes) {
-      for (std::size_t offset : {0U, 2U}) {
+      for (std::size_t offset : q3 ? std::vector<std::size_t>{108}
+                                   : std::vector<std::size_t>{0, 2}) {
         __half scale;
         std::memcpy(&scale, up.data() + b + offset, sizeof(scale));
         scale = __float2half(__half2float(scale) / 1024.0F);
@@ -732,20 +736,24 @@ void ReportVectorAccuracy() {
     const int cols = down ? 640 : 2560;
     const int used = down ? 1 : 2;
     const std::vector<Case> cases =
-        down ? std::vector<Case>{{q::WeightType::kQ5_1, false},
-                                 {q::WeightType::kQ5_1, true},
-                                 {q::WeightType::kQ8_0, false}}
-             : std::vector<Case>{{q::WeightType::kQ4_K, false},
-                                 {q::WeightType::kQ5_K, false},
-                                 {q::WeightType::kQ5_1, false},
-                                 {q::WeightType::kQ5_1, true},
-                                 {q::WeightType::kQ8_0, false}};
+        down
+            ? std::vector<Case>{{q::WeightType::kQ5_1, false},
+                                {q::WeightType::kQ5_1, true},
+                                {q::WeightType::kIQ4_NL, false},
+                                {q::WeightType::kQ8_0, false}}
+            : std::vector<Case>{
+                  {q::WeightType::kQ3_K, false}, {q::WeightType::kQ4_K, false},
+                  {q::WeightType::kQ5_K, false}, {q::WeightType::kQ5_1, false},
+                  {q::WeightType::kQ5_1, true},  {q::WeightType::kQ8_0, false}};
     for (const auto [type, quantized] : cases) {
       for (const int n : {1, 4, 8}) {
         const std::uint32_t seed =
             0x7EC70000U + 256U * static_cast<int>(type) + (down ? 64U : 0U) + n;
         const Experts w =
             quantized ? MakeQuantizedQ5_1(experts, rows, cols, seed)
+            : type == q::WeightType::kIQ4_NL
+                ? MakeIQ4NL(experts, rows, cols, seed)
+            : type == q::WeightType::kQ3_K ? MakeQ3K(experts, rows, cols, seed)
             : type == q::WeightType::kQ4_K ? MakeQ4K(experts, rows, cols, seed)
             : type == q::WeightType::kQ5_K ? MakeQ5K(experts, rows, cols, seed)
             : type == q::WeightType::kQ5_1

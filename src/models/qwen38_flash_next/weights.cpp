@@ -1,5 +1,6 @@
 #include "src/models/qwen38_flash_next/weights.hpp"
 
+#include <gufo/ext/experimental/ggml_dequant.hpp>
 #include <initializer_list>
 #include <string>
 #include <utility>
@@ -174,8 +175,8 @@ struct Binder {
     l.hc_ffn = Mixer(p + "hc_ffn", c, true);
 
     if (linear) {
-      l.ssm_qkv =
-          Get(p + "attn_qkv.weight", hidden, c.SsmConvChannels(), 1, dense);
+      l.ssm_qkv = Get(p + "attn_qkv.weight", hidden, c.SsmConvChannels(), 1,
+                      projection);
       l.ssm_gate =
           Get(p + "attn_gate.weight", hidden, c.SsmValueDim(), 1, projection);
       l.ssm_conv1d = Get(p + "ssm_conv1d.weight", c.ssm_conv_kernel,
@@ -190,14 +191,17 @@ struct Binder {
       l.ssm_a = Get(p + "ssm_a", c.ssm_num_v_heads, 1, 1, {GgmlType::kF32});
       l.ssm_norm =
           Get(p + "ssm_norm.weight", c.ssm_head_dim, 1, 1, {GgmlType::kF32});
-      l.ssm_out = Get(p + "ssm_out.weight", c.SsmValueDim(), hidden, 1, dense);
+      l.ssm_out =
+          Get(p + "ssm_out.weight", c.SsmValueDim(), hidden, 1, projection);
     } else {
-      l.attn_q =
-          Get(p + "attn_q.weight", hidden, 2 * c.AttentionQDim(), 1, dense);
-      l.attn_k = Get(p + "attn_k.weight", hidden, c.AttentionKvDim(), 1, dense);
-      l.attn_v = Get(p + "attn_v.weight", hidden, c.AttentionKvDim(), 1, dense);
-      l.attn_out =
-          Get(p + "attn_output.weight", c.AttentionQDim(), hidden, 1, dense);
+      l.attn_q = Get(p + "attn_q.weight", hidden, 2 * c.AttentionQDim(), 1,
+                     projection);
+      l.attn_k =
+          Get(p + "attn_k.weight", hidden, c.AttentionKvDim(), 1, projection);
+      l.attn_v =
+          Get(p + "attn_v.weight", hidden, c.AttentionKvDim(), 1, projection);
+      l.attn_out = Get(p + "attn_output.weight", c.AttentionQDim(), hidden, 1,
+                       projection);
       l.attn_q_norm =
           Get(p + "attn_q_norm.weight", c.head_dim, 1, 1, {GgmlType::kF32});
       l.attn_k_norm =
@@ -238,12 +242,12 @@ struct Binder {
                           c.num_experts, experts);
     l.shexp_gate_inp =
         Get(p + "ffn_gate_inp_shexp.weight", hidden, 1, 1, {GgmlType::kF32});
-    l.shexp_gate =
-        Get(p + "ffn_gate_shexp.weight", hidden, c.shared_expert_ff, 1, dense);
-    l.shexp_up =
-        Get(p + "ffn_up_shexp.weight", hidden, c.shared_expert_ff, 1, dense);
-    l.shexp_down =
-        Get(p + "ffn_down_shexp.weight", c.shared_expert_ff, hidden, 1, dense);
+    l.shexp_gate = Get(p + "ffn_gate_shexp.weight", hidden, c.shared_expert_ff,
+                       1, projection);
+    l.shexp_up = Get(p + "ffn_up_shexp.weight", hidden, c.shared_expert_ff, 1,
+                     projection);
+    l.shexp_down = Get(p + "ffn_down_shexp.weight", c.shared_expert_ff, hidden,
+                       1, projection);
 
     if (nextn) {
       l.nextn_enorm =

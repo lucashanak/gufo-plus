@@ -1231,6 +1231,10 @@ void CheckDenseKQuant(GgmlType type, int rows, int cols, std::uint32_t seed) {
                "K-quant output");
     }
     if (std::memcmp(f32.data(), preq.data(), out_count * sizeof(float)) != 0)
+      throw std::runtime_error(
+          "K-quant GEMV differs between F32 and Q8_1 "
+          "inputs: " +
+          shape + " N=" + std::to_string(n));
     for (std::size_t i = std::size_t(n) * rows; i < out_count; ++i) {
       if (std::bit_cast<std::uint32_t>(f32[i]) != 0xA5A5A5A5U)
         throw std::runtime_error("K-quant GEMV overwrote its guard: " + shape);

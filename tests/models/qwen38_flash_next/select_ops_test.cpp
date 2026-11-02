@@ -222,8 +222,8 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
     }
   }
   std::cout << "block selection n=" << n_tokens << " start=" << start_pos
-            << ": worst score error " << worst_score << ", mask mismatches "
-            << mismatches << '\n';
+            << " query scale " << query_scale << ": worst score error "
+            << worst_score << ", mask mismatches " << mismatches << '\n';
   (void)hipFree(d_q);
   (void)hipFree(d_blocks);
   (void)hipFree(d_pos);

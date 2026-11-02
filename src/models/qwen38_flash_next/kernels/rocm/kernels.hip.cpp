@@ -5666,6 +5666,10 @@ __device__ __forceinline__ std::uint32_t IQ4NLWord(int i) {
 /// The signed table values of the four nibbles in `nib` (one per byte).
 __device__ __forceinline__ std::uint32_t IQ4NLBytes(std::uint32_t nib) {
   const std::uint32_t sel = nib & 0x07070707U;
+  const std::uint32_t lo =
+      __builtin_amdgcn_perm(IQ4NLWord(1), IQ4NLWord(0), sel);
+  const std::uint32_t hi =
+      __builtin_amdgcn_perm(IQ4NLWord(3), IQ4NLWord(2), sel);
   return __builtin_amdgcn_perm(hi, lo,
                                0x03020100U | ((nib & 0x08080808U) >> 1U));
 }
@@ -6222,8 +6226,9 @@ __launch_bounds__(256) __global__
   uint4 f_codes_hi[kWaveRowTiles];  ///< Q8_0: the block's second 16 codes
   uint4 f_qh[kWaveRowTiles][2];     ///< Q5_K: the superblock's high bits
   std::uint32_t f_high[kWaveRowTiles];
-  std::uint32_t f_dm[kWaveRowTiles];  ///< Q8_0: d
-  int f_sb32[kWaveRowTiles];          ///< Q4_K: the K block in its superblock
+  std::uint32_t f_dm[kWaveRowTiles];     ///< Q8_0: d
+  std::uint32_t f_dm_hi[kWaveRowTiles];  ///< IQ2_XS: elements 16-31's scale
+  int f_sb32[kWaveRowTiles];  ///< Q4_K: the K block in its superblock
   constexpr int kActFetch = BN <= 64 ? 2 : 4;
   uint4 a_data[kActFetch];
   // Q5_1 chunk c is part c % kQ5Parts of row c / kQ5Parts.
@@ -6517,6 +6522,11 @@ __launch_bounds__(256) __global__
         const __half2 sb = __builtin_bit_cast(__half2, scale_bias);
         const __half2 scale2 = __low2half2(sb);
         const __half2 bias2 = __high2half2(sb);
+        // Q3_K: elements 16-31 carry the K block's second scale.
+        const __half2 scale2_hi =
+            kTwoScales ? __low2half2(__builtin_bit_cast(
+                             __half2, s_scale[(BK * BM) + (kb * BM) + row]))
+                       : scale2;
         std::uint32_t nib[8];
         if constexpr (kQ8) {
           // Q8_0: the block's 32 signed bytes are chunks 2 kb and 2 kb + 1;
@@ -6562,7 +6572,8 @@ __launch_bounds__(256) __global__
         __half2 h[16];
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-          CodesToHalves(nib[i], magic, scale2, bias2, h[2 * i], h[2 * i + 1]);
+          CodesToHalves(nib[i], magic, i < 4 ? scale2 : scale2_hi, bias2,
+                        h[2 * i], h[2 * i + 1]);
         }
         __builtin_memcpy(&a_lo[u], &h[0], 32);
         __builtin_memcpy(&a_hi[u], &h[8], 32);
@@ -8356,6 +8367,18 @@ __global__ void Q6KToIq4NlKernel(const Q6KBlock* __restrict__ src,
     const int is = l / 16;
     int v;
     switch (quarter) {
+      case 0:
+        v = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4);
+        break;
+      case 1:
+        v = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4);
+        break;
+      case 2:
+        v = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4);
+        break;
+      default:
+        v = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
+        break;
     }
     x[l] = d * static_cast<float>(sc[is + 2 * quarter]) *
            static_cast<float>(v - 32);

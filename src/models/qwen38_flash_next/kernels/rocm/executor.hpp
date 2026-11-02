@@ -11,7 +11,9 @@
 #include <cstdint>
 #include <functional>
 #include <gufo/ext/experimental/host_allocations.hpp>
+#include <gufo/ext/experimental/kv_memory.hpp>
 #include <gufo/ext/session_mode.hpp>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -323,14 +325,18 @@ public:
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
 
   enum class ForwardMode { kDecode, kVerify, kPrefill };
-  /// Commits the in-pass checkpoint arena on first use. False when the device
-  /// lacks headroom for it; the caller then captures at a pass boundary.
+  /// Commits checkpoint slot 0 on first use. False when the device lacks
+  /// headroom for it; the caller then captures at a pass boundary.
   [[nodiscard]] bool ReservePrefillCheckpoint(const Session& session) const;
   /// A view of `session` after `prefix` rows of the pass over `tokens`,
   /// filled by the Forward that runs it. Each of a pass's checkpoints takes
   /// its own `slot` (below kMaxPassCheckpoints) of executor storage, which
   /// the next pass overwrites: consume the view before it. `previous` is the
   /// prefix of the pass's preceding checkpoint (zero for the first), so the
+  /// view keeps the hidden rows a pass starting there would. Slot 0 requires
+  /// ReservePrefillCheckpoint and is counted in DeferredScratchBytes; the
+  /// others are allocated when a pass first needs them and fail (returning
+  /// null) without device headroom.
   [[nodiscard]] std::unique_ptr<PrefillCheckpoint> MakePrefillCheckpoint(
       Session& session, std::span<const std::int32_t> tokens,
       std::uint32_t prefix, std::string* error_msg, std::uint32_t slot = 0,
