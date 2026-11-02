@@ -87,6 +87,15 @@ struct QueuePlan {
 /// a hardware queue back.
 void ApplyQueuePlan(const QueuePlan& plan);
 
+/// Sets HIP runtime defaults this engine is tuned for, before the first HIP
+/// call reads them. ROCm 10.1 replays a graph through a segmented executor
+/// that cost Flash-Next about 8 % at eight concurrent MTP requests (its
+/// verify batches record and replay many short linear graphs); the classic
+/// topological executor that ROCm 7.2 used matches 7.2's throughput. A value
+/// the operator exported is never overridden, and runtimes without the
+/// variable ignore it.
+void ApplyRuntimeDefaults();
+
 /// Renders the plan as a log line for the queue-budget event.
 [[nodiscard]] std::string DescribeQueuePlan(std::string_view kind,
                                             const QueuePlan& plan);

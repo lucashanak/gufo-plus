@@ -11,6 +11,7 @@
 #include "src/cli/serve/serve.hpp"
 #include "src/cli/transcribe/transcribe.hpp"
 #include "src/cli/video/video.hpp"
+#include "src/core/diagnostics/gpu_queues.h"
 
 #ifndef GUFO_RELEASE_VERSION
 #define GUFO_RELEASE_VERSION "development"
@@ -173,6 +174,7 @@ int run(std::span<const char* const> args) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
+  gufo::diagnostics::ApplyRuntimeDefaults();
   const std::span<const char* const> args(argv, static_cast<std::size_t>(argc));
   return run(args);
 }

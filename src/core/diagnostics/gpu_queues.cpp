@@ -147,6 +147,13 @@ void ApplyQueuePlan(const QueuePlan& plan) {
   }
 }
 
+void ApplyRuntimeDefaults() {
+  constexpr const char* kClassicGraphs = "DEBUG_HIP_GRAPH_CLASSIC_PATH";
+  if (std::getenv(kClassicGraphs) == nullptr) {
+    (void)platform::SetEnv(kClassicGraphs, "1");
+  }
+}
+
 std::string DescribeQueuePlan(std::string_view kind, const QueuePlan& plan) {
   std::string message = "event=queue_budget kind=";
   message += kind;
