@@ -6,6 +6,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -83,6 +84,21 @@ constexpr std::uint32_t kVecBatch = 8;
 // Eager passes of at least this many rows wait for the GPU in WaitRelaxed:
 // a layer's shared expert alone keeps the GPU busy for longer than a poll.
 constexpr std::uint32_t kRelaxedWaitRows = 2048;
+// How long passes wait (A/B switch GUFO_QFN_PREFILL_WAIT): asleep (default)
+// sleeps until an interrupt-driven HIP host function signals the event,
+// relaxed sleeps through a predicted wait and polls, spin is HIP's own wait.
+enum class PrefillWait { kAsleep, kRelaxed, kSpin };
+PrefillWait PrefillWaitMode() {
+  static const PrefillWait mode = [] {
+    const char* v = std::getenv("GUFO_QFN_PREFILL_WAIT");
+    const std::string_view m = v != nullptr ? v : "asleep";
+    return m == "spin"      ? PrefillWait::kSpin
+           : m == "relaxed" ? PrefillWait::kRelaxed
+                            : PrefillWait::kAsleep;
+  }();
+  return mode;
+}
+constexpr auto kRelaxedWaitPoll = std::chrono::microseconds(100);
 // A predicted wait sleeps through most of it and then polls this often;
 // unpredicted waits poll at an eighth of the time waited, at most this often.
 constexpr auto kRelaxedWaitCoarsePoll = std::chrono::milliseconds(1);
@@ -1003,8 +1019,10 @@ Executor::~Executor() {
   if (blas_ != nullptr) {
     (void)hipblasDestroy(blas_);
   }
-  if (counts_ready_ != nullptr) {
-    (void)hipEventDestroy(counts_ready_);
+  if (notify_stream_ != nullptr) {
+    (void)hipStreamSynchronize(notify_stream_);
+    (void)hipStreamDestroy(notify_stream_);
+  }
   for (hipEvent_t event : {counts_ready_, pass_done_}) {
     if (event != nullptr)
       (void)hipEventDestroy(event);
@@ -3736,11 +3754,68 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
   return true;
 }
 
+namespace {
+
+void NotifyHost(void* data) {
+  auto* wake = static_cast<HostWake*>(data);
+  {
+    const std::lock_guard lock(wake->mutex);
+    ++wake->done;
+  }
+  wake->ready.notify_one();
+}
+
+}  // namespace
+
+bool Executor::WaitAsleep(hipEvent_t event, const char* what,
+                          std::string* error_msg) const {
+  hipError_t status = hipEventQuery(event);
+  if (status != hipErrorNotReady)
+    return Check(status, what, error_msg);
+  // HIP's event and stream waits spin a core unless the whole device runs
+  // in blocking-sync mode, and its marker signals raise no interrupt. A host
+  // function behind the event on a separate stream completes on the
+  // runtime's interrupt-driven callback thread; the work stream never waits
+  // for it.
+  // Only this executor's thread queues host functions: a ticket counts the
+  // ones actually queued, so a failed launch leaves no wait behind.
+  const std::uint64_t ticket = wake_.armed + 1;
+  if (!Check(hipStreamWaitEvent(notify_stream_, event, 0), what, error_msg) ||
+      !Check(hipLaunchHostFunc(notify_stream_, NotifyHost, &wake_), what,
+             error_msg)) {
+    return false;
+  }
+  wake_.armed = ticket;
+  std::unique_lock lock(wake_.mutex);
+  while (wake_.done < ticket) {
+    // A faulted device never runs the host function: look every second.
+    if (wake_.ready.wait_for(lock, std::chrono::seconds(1)) ==
+        std::cv_status::timeout) {
+      lock.unlock();
+      status = hipEventQuery(event);
+      if (status != hipErrorNotReady && status != hipSuccess)
+        return Check(status, what, error_msg);
+      lock.lock();
+    }
+  }
+  return true;
+}
+
+bool Executor::WaitRelaxed(hipEvent_t event, const char* what,
                            std::string* error_msg, double expect_us,
                            double* waited_us) const {
   using Clock = std::chrono::steady_clock;
   const auto start = Clock::now();
   const auto elapsed = [&] { return Clock::now() - start; };
+  if (const PrefillWait mode = PrefillWaitMode();
+      mode != PrefillWait::kRelaxed) {
+    const bool ok = mode == PrefillWait::kAsleep
+                        ? WaitAsleep(event, what, error_msg)
+                        : Check(hipEventSynchronize(event), what, error_msg);
+    if (waited_us != nullptr)
+      *waited_us = std::chrono::duration<double, std::micro>(elapsed()).count();
+    return ok;
+  }
   hipError_t status = hipEventQuery(event);
   if (status == hipErrorNotReady && expect_us > 0.0)
     std::this_thread::sleep_for(
