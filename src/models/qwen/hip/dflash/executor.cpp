@@ -878,9 +878,9 @@ bool QwenDFlashGpuExecutor::InjectTargetContextChunk(
 
   // Upload target features
   const std::size_t bytes = target_features.size() * sizeof(float);
-  const auto cpy_err =
-      hipMemcpyAsync(d_target_features_, target_features.data(), bytes,
-                     hipMemcpyHostToDevice, stream_);
+  const auto cpy_err = hipMemcpyAsync(
+      d_target_features_, target_features.data(), bytes,
+      device_source ? hipMemcpyDeviceToDevice : hipMemcpyHostToDevice, stream_);
   if (cpy_err != hipSuccess) {
     return false;
   }

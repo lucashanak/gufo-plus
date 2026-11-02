@@ -33,6 +33,12 @@ consteval auto ConcatControlText() {
   return text;
 }
 
+/// Qwen's documented early exit for a thinking budget: the model answers from
+/// its reasoning so far instead of stopping mid-thought.
+inline constexpr std::string_view kQwenReasoningWrapUp =
+    "\n\nConsidering the limited time by the user, I have to give the "
+    "solution based on the thinking directly now.";
+
 }  // namespace gufo::tokenization
 
 #endif  // GUFO_TOKENIZATION_QWEN_CONTROL_TOKENS_HPP_

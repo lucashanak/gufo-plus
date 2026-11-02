@@ -100,6 +100,13 @@ struct TextRunnerCapabilities {
   bool in_pass_checkpoint{false};
   bool partial_prefill_retention{false};
   bool prefill_rollback{false};
+  /// Prompt tokens between active decode rounds when `--prefill-chunk` is
+  /// not given. Zero keeps the server default.
+  std::size_t active_prefill_tokens{0};
+  /// Prefill continues a prompt exactly only from positions divisible by
+  /// this. Intermediate pass ends and published prompt checkpoints are
+  /// rounded down to it; one keeps every position.
+  std::size_t prefill_alignment{1};
 };
 
 struct TextRunnerPersistenceDescriptor {
@@ -162,6 +169,12 @@ struct TextDecodeStep {
   std::size_t draft_accepted_tokens{0};
   std::size_t lookup_tokens{0};
   std::size_t lookup_accepted_tokens{0};
+  /// Of draft_rounds/draft_tokens: rounds drafted by a DFlash2 model.
+  std::size_t dflash_rounds{0};
+  std::size_t dflash_tokens{0};
+  std::size_t dflash_accepted_tokens{0};
+  /// Rounds the draft-source chooser gave to MTP while DFlash2 was eligible.
+  std::size_t dflash_mtp_rounds{0};
   bool stop{false};
   std::optional<sampling::TokenLogprobs> terminal_logprobs;
   TextExecutionPlan execution_plan{};
@@ -349,12 +362,14 @@ public:
 
   using ReasoningTags = ext::ReasoningTags;
   [[nodiscard]] virtual ReasoningTags ReasoningBudgetTags() const {
-    return {"<think>", "</think>", {"</think>"}};
+    return {"<think>", "</think>", {"</think>"}, {}};
   }
   [[nodiscard]] virtual std::uint32_t VocabularySize() const { return 0; }
+  /// `wrap_up` prepends the tags' wrap-up text to the forced end.
   [[nodiscard]] std::shared_ptr<const sampling::ReasoningBudget>
   BuildReasoningBudget(std::size_t tokens,
-                       std::span<const TextRunnerToken> prompt) const;
+                       std::span<const TextRunnerToken> prompt,
+                       bool wrap_up = false) const;
 
   [[nodiscard]] virtual std::vector<TextRunnerToken> Tokenize(
       std::string_view text) const = 0;
@@ -434,15 +449,26 @@ public:
   [[nodiscard]] virtual TextPrefillStep Prefill(
       TextRunnerState& state, std::span<const TextRunnerToken> prompt,
       std::size_t offset, std::size_t max_input_tokens) const = 0;
+  /// Returns a claim only when this chunk covers the boundary, ending
+  /// beyond it, and can capture it in place. Admission happens before
+  /// allocating checkpoint state.
   [[nodiscard]] virtual std::optional<std::size_t> PrefillCheckpointBytes(
       const TextRunnerState&, std::span<const TextRunnerToken>, std::size_t,
       std::size_t, std::size_t) const {
     return std::nullopt;
   }
+  /// Prefills one chunk like Prefill, capturing each of the ascending
+  /// `boundaries` the chunk covers (each with a PrefillCheckpointBytes
+  /// claim) without ending a pass there. The runner invokes `consume` with
+  /// each boundary's index, synchronously while that boundary is readable
+  /// as the lease's component state (it must drain its captures before
+  /// returning), or with the boundary's own snapshot (native snapshot
+  /// runners).
+  using InPassConsumer =
+      std::function<void(std::size_t, std::unique_ptr<TextRunnerSnapshot>)>;
   [[nodiscard]] virtual TextPrefillStep PrefillThrough(
       TextRunnerState&, std::span<const TextRunnerToken>, std::size_t,
-      std::size_t, std::size_t, std::unique_ptr<TextRunnerSnapshot>*,
-      const std::function<std::unique_ptr<TextRunnerSnapshot>()>& = {}) const {
+      std::size_t, std::span<const std::size_t>, const InPassConsumer&) const {
     throw std::logic_error("runner does not support in-pass checkpoints");
   }
   [[nodiscard]] virtual TextDecodeSelection SelectNext(
@@ -574,6 +600,11 @@ struct TextRunnerOptions {
   TextDiskCacheConfig disk_cache{};
   TextRunnerRamCacheOptions ram_cache{};
   bool enable_yarn{false};
+  /// Device bytes of K/V rows all sessions may hold at once, for runners
+  /// whose sessions grow their K/V with the tokens they hold (Qwen3.8
+  /// Flash-Next). Zero leaves every session its full context; other runners
+  /// ignore it.
+  std::size_t kv_cache_bytes{0};
 };
 
 struct TextBenchOptions {
