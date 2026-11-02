@@ -20,6 +20,7 @@ include/gufo/ext/experimental/hip_graph_decode_executor.hpp
 include/gufo/ext/experimental/hip_utils.hpp
 include/gufo/ext/experimental/hipblaslt_plan_database.hpp
 include/gufo/ext/experimental/host_allocations.hpp
+include/gufo/ext/experimental/kv_memory.hpp
 include/gufo/ext/experimental/managed_alloc.hpp
 include/gufo/ext/experimental/snapshot_copy.hpp
 include/gufo/ext/experimental/snapshot_transfer.hpp
@@ -80,6 +81,7 @@ src/core/hip/detail/hipblaslt_plan_database.hpp
 src/core/hip/heap_placement.hpp
 src/core/hip/hip_utils.hpp
 src/core/hip/host_allocations.hpp
+src/core/hip/kv_memory.hpp
 src/core/hip/managed_alloc.hpp
 src/core/hip/snapshot_copy.hpp
 src/core/hip/snapshot_transfer.hpp

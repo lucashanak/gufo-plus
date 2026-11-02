@@ -791,7 +791,10 @@ public:
   // llama.cpp's Qwen3-Coder format forces "\n</think>" and also ends
   // reasoning at a tool call.
   [[nodiscard]] ReasoningTags ReasoningBudgetTags() const override {
-    return {"<think>", "\n</think>", {"</think>", "<tool_call>"}};
+    return {"<think>",
+            "\n</think>",
+            {"</think>", "<tool_call>"},
+            tokenization::kQwenReasoningWrapUp};
   }
 
   [[nodiscard]] std::vector<TextRunnerToken> Tokenize(

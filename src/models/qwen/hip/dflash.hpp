@@ -106,6 +106,15 @@ public:
       std::shared_ptr<const QwenGpuModel> target_model,
       std::string* error_msg = nullptr);
 
+  /// Binds a draft to a target that is not a QwenGpuModel: its config and the
+  /// device copies of its token embedding and (GGUF-layout) output head.
+  [[nodiscard]] static std::shared_ptr<const QwenDFlashGpuModel>
+  CreateForTarget(std::shared_ptr<const core::GgufReader> dflash_reader,
+                  const core::ModelConfig& target_config,
+                  models::QwenTensorRef token_embedding,
+                  models::QwenTensorRef output,
+                  std::string* error_msg = nullptr);
+
   [[nodiscard]] const speculative::QwenDFlashWeights& GetWeights()
       const noexcept {
     return weights_;
