@@ -67,6 +67,32 @@ Every greedy output, alone, staggered and eight-way, is byte-identical.
 | --- | --- |
 | Register-resident routed down projection over 128-token tiles (`RoutedDownF16Kernel`, Q5_1/Q8_0) and a rewritten paired gate/up (`RoutedPairF16Kernel`, Q4_K/Q5_K) sharing one 128-token map | Retained. gfx1151 WMMA reads row r's A operand from one lane only (r for even rows, r + 16 for odd; the other copy is ignored, verified with garbage in the unread lanes), so each lane decodes one K16 half and one `v_permlanex16` per dword supplies the other: no duplicate decode, no selects. Down keeps each wave's 16 rows' codes in registers (activations are the only LDS stage, 155 VGPRs); the pair loads superblocks raw and decodes them at commit, removing a full memory wait every fourth stage. Loop VALU per WMMA: down 11 → 4.6, pair 6.8 → 3.9. Every row is bit-identical across 16/48/128-row tiles, paired vs separate, and 1/7/9/33/95/96-row passes (`CheckPassRoutes`). `routed_gemm_bench` (synthetic skewed top-10, Q4_K gate/up, Q5_1 down) on main `34ebb5fe`, two rounds, ms per layer at 4,096 / 26,541 rows: gate/up 10.61, 11.06 → 10.30, 10.34 / 54.43, 59.42 → 52.30, 56.35; down 6.58, 6.77 → 5.72, 6.16 / 32.83, 37.83 → 28.29, 31.50. On the production fork (quiet GPU, alternating medians), TFLOPS at 4,096 / 26,541 rows: down Q5_1 21.1 → 23.8 / 25.1 → 30.6, Q8_0 17.8 → 20.4 / 23.6 → 29.0; gate/up Q4_K 26.7 → 28.3 / 32.6 → 33.1, Q5_K 24.1 → 25.3 / 30.2 → 30.7. The GPU runs these kernels power-limited near 1.9 GHz (~110 W), so the measured WMMA ceiling is about 39–48 TFLOPS. `gufo bench` UD-Q4_K_XL pp16384, two rounds: 1,590 / 1,583 → 1,624 / 1,629 tok/s. Rejected (all exact): prefetching two stages ahead, the next token tile's B fragments (199 VGPRs), double-buffered activation stages with one barrier (BK 1 or 2), and 256-row × 64-token down tiles; none beat the version kept. Ablation at 26.5K rows: without WMMA the down kernel takes 16 of 30 ms, without decode −5%, without B fragment reads −3%, without stores −2%. |
 | Weighted top-10 combine folded into the down epilogue | Not done: a token's ten slot rows come from ten experts' tiles spread over the whole launch, so an exact slot-order sum needs every partial first; integer atomics would be order-independent but cost more than the 51 KB/token read and would change every route. The combine already streams about 190 GB/s. |
+## Draft head and IQ4_XS mixers (November 2, 2026)
+
+Workload: Swift 1.5 IQ4_XS + ft2 MTP at the production flags (8 × 262,144,
+`--kv-cache-bytes 21474836480`), `gufo serve`, greedy unless noted, 256
+tokens per request: C1 English prose, Czech prose, code, code at T 0.7
+(seed 1234), one request after a cold 16.7K prompt, C4 and two C8 mixes
+(prose, code, Czech). Arms alternate base/candidate/candidate/base in one
+GPU hold at the 120 W limit. Greedy replies are byte-identical to the base
+in every scenario. A C1 MTP profile of the base put the 98,304-row draft
+head at 0.90 ms per draft step (about 45% of draft time on code); Czech
+text drafted every step through the 248,320-row head (2.27 ms), and at
+C4/C8 about half of all draft steps did, because greedy requests in
+unplanned batches kept the full head.
+
+| Experiment | Outcome |
+| --- | --- |
+| The small draft head for every request, also greedy requests in unplanned batches | Retained. Greedy proposals never change the output. With the IQ4_NL full-vocabulary rows below, decode tok/s base → candidate (sum of rates; wall aggregate): C4 117.0/117.6 → 118.6/118.3 (wall 92.4/91.0 → 92.8/92.7), C8 136.7/135.8 → 137.5/137.6 (wall 107.7/108.5 → 110.2/110.3), second C8 mix 139.9/141.8 → 141.8/141.6. |
+| Full-vocabulary draft steps through an IQ4_NL requantization of the Q6_K head (`Q6KToIq4Nl`, ggml's `quantize_row_iq4_nl`) | Retained: 357 MB resident, 31% fewer bytes per such step. C1 Czech 50.1/50.7 → 52.4/52.4 tok/s; English, code, T 0.7 and 16K unchanged (they draft through the prefix). `head_ops` checks the requantization (deterministic, worst relative RMS error per row under 9% on random Q6_K rows) and IQ4_NL GEMV widths 1–8 at K 2560. |
+| The 98,304-row prefix through the same IQ4_NL rows | Rejected: acceptance 83.7 → 78.8% on code at T 0.7 and 79.9 → 77.1% after 16.7K; those lost 2–4% while English/code/Czech gained 1–3%. |
+| One fused launch for IQ4_XS-down / IQ4_NL-up mixers (`FusedFormat<kIQ4_XS>`) | Retained for 1–3 tokens. Swift's mixers ran five launches each (96 per token). `hc_mix_bench` µs per mixer, five launches → one: 35.65 → 30.99, 35.96 → 31.02, 36.72 → 34.17 at 1–3 tokens; 34.6 → 38.0 at 4 and 0.87–0.92× at 5–7, so `HcFusedMaxTokens` is 3. `hc_mix_ops` is bitwise at 1–8 tokens with and without inject. C1 MTP within noise (the trunk often verifies four or more rows). |
+| Four rows per wave in the single-token gated IQ4_XS expert GEMV | Rejected: `routed_vec_bench` hashes identical, one-row gate/up 4.19 → 4.12 ms per 48 layers, nothing at 2–5 rows. |
+
+`session_test --batch-only` and `--sampling-only` fail on the base too
+(`batched next draw or deferred residual differs`, `scalar EOS checkpoint
+did not replay exactly without prefill`); not caused by these changes.
+
 ## Wide prompt-lookup verification (November 1, 2026)
 
 Strix Halo gfx1151, ROCm 7.2.4, Swift 1.5 IQ4_XS with the Q8_0 MTP head,
