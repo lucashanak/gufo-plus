@@ -4386,6 +4386,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     const std::uint32_t* __restrict__ mask, std::uint32_t mask_words,
     float* __restrict__ out, std::uint32_t start_pos, std::uint32_t n_tokens,
     std::uint32_t first_query_group = 0) {
+#pragma clang fp reassociate(off)
   // The launcher accepts only four-token selection blocks. Keep that
   // geometry constant throughout the key sweep.
   constexpr std::uint32_t ratio = kWmmaRatio;
