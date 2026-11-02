@@ -4352,35 +4352,31 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
     const WideSegment* rows =
         !whole && segment != 0 ? &wide_segments_[segment - 1] : nullptr;
     const std::size_t slot = local - 1;
+    // Every linear layer's state and convolution history in one launch per
+    // kGdnRestoreLayers layers. A whole kept segment is a plain copy of the
+    // next segment's starting state (a one-row replay).
+    std::vector<GdnRestoreLayer> restore;
+    restore.reserve(session.linear_.size());
     for (std::size_t il = 0; il < session.linear_.size(); ++il) {
       auto& l = session.linear_[il];
       if (l.state == nullptr) {
         continue;
       }
+      GdnRestoreLayer layer{l.state, {}, l.conv_state, nullptr};
       if (start != nullptr) {
-        if (!Check(hipMemcpyAsync(l.state, start->state_start[il],
-                                  state_elems * sizeof(float),
-                                  hipMemcpyDeviceToDevice, stream_),
-                   "state rollback", error_msg) ||
-            !Check(hipMemcpyAsync(l.conv_state, start->conv_start[il],
-                                  conv_elems * sizeof(float),
-                                  hipMemcpyDeviceToDevice, stream_),
-                   "conv rollback", error_msg))
-          return false;
-        continue;
+        layer.rows.rows[0] = start->state_start[il];
+        layer.conv_row = start->conv_start[il];
+      } else {
+        layer.rows = rows ? rows->state[il] : l.state_snapshots;
+        layer.conv_row = (rows ? rows->conv[il] : l.conv_snapshots).rows[slot];
       }
-      const auto& state_rows = rows ? rows->state[il] : l.state_snapshots;
-      const auto& conv_rows = rows ? rows->conv[il] : l.conv_snapshots;
-      RestoreGdnState(l.state, state_rows, local, c.ssm_num_k_heads,
-                      c.ssm_num_v_heads, stream_);
-      if (!Check(hipGetLastError(), "state rollback", error_msg) ||
-          !Check(hipMemcpyAsync(l.conv_state, conv_rows.rows[slot],
-                                conv_elems * sizeof(float),
-                                hipMemcpyDeviceToDevice, stream_),
-                 "conv rollback", error_msg)) {
-        return false;
-      }
+      restore.push_back(layer);
     }
+    RestoreGdnLayers(restore.data(), restore.size(),
+                     start != nullptr ? 1 : local, c.ssm_num_k_heads,
+                     c.ssm_num_v_heads, conv_elems, stream_);
+    if (!Check(hipGetLastError(), "state rollback", error_msg))
+      return false;
     if (session.ple_history_ != nullptr) {
       const std::size_t hist =
           static_cast<std::size_t>(c.PleConvHistory()) * c.HcDim();

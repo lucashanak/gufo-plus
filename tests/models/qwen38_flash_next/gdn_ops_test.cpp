@@ -856,8 +856,91 @@ void CheckSplitPasses(std::uint32_t tokens, SplitOutput mode,
 
 }  // namespace
 
+/// RestoreGdnLayers over more layers than one launch takes, every kept
+/// prefix, aligned (float4) and misaligned (scalar) rows, and a ragged
+/// convolution history: each state element against the host FMA oracle,
+/// each copy byte-exact, and nothing written past either output.
+void CheckRestoreLayers(bool aligned) {
+  constexpr std::size_t kLayers = q::kGdnRestoreLayers + 3;
+  constexpr std::size_t kState = std::size_t{kVHeads} * kDim * kDim;
+  constexpr std::size_t kUpdate =
+      q::GdnRollbackRowFloats(1, kKHeads, kVHeads, kDim);
+  constexpr std::size_t kRows = 7;
+  constexpr std::size_t kConv = 3 * 1031;  // not a multiple of the block
+  constexpr std::size_t kGuard = 8;
+  constexpr float kSentinel = 12345.0F;
+  const std::size_t skew = aligned ? 0 : 1;
+  // Per layer: first row, kRows - 1 update rows, conv row; outputs apart.
+  // Both strides are multiples of four floats, so `skew` alone decides
+  // whether the rows are 16-byte aligned.
+  const std::size_t in_layer = kState + (kRows - 1) * kUpdate + kConv + 7;
+  const std::size_t out_layer = kState + kConv + 3 * kGuard + 7;
+  static_assert((kState + (kRows - 1) * kUpdate + kConv + 7) % 4 == 0 &&
+                (kState + kConv + 3 * kGuard + 7) % 4 == 0);
+  const auto input = MakeValues(kLayers * in_layer + skew, 0x5EED1234U, 1.0F);
+  HipBuffer<float> d_in(input.size()), d_out(kLayers * out_layer + skew);
+  Upload(&d_in, input);
+  std::vector<q::GdnRestoreLayer> layers(kLayers);
+  for (std::size_t l = 0; l < kLayers; ++l) {
+    float* base = d_in.get() + skew + l * in_layer;
+    layers[l].rows.rows[0] = base;
+    for (std::size_t t = 1; t < kRows; ++t)
+      layers[l].rows.rows[t] = base + kState + (t - 1) * kUpdate;
+    layers[l].conv_row = base + kState + (kRows - 1) * kUpdate;
+    float* out = d_out.get() + skew + l * out_layer;
+    layers[l].state = out + kGuard;
+    layers[l].conv = out + kGuard + kState + kGuard;
+  }
+  const auto product = [](float a, float b) {
+    volatile float rounded = a * b;
+    return rounded;
+  };
+  for (std::uint32_t keep = 1; keep <= kRows; ++keep) {
+    Upload(&d_out, std::vector<float>(kLayers * out_layer + skew, kSentinel));
+    q::RestoreGdnLayers(layers.data(), kLayers, keep, kKHeads, kVHeads, kConv,
+                        nullptr);
+    CheckHip(hipGetLastError(), "restore layers launch");
+    const auto out = Download(&d_out, kLayers * out_layer + skew);
+    for (std::size_t l = 0; l < kLayers; ++l) {
+      const float* in = input.data() + skew + l * in_layer;
+      const float* got = out.data() + skew + l * out_layer;
+      for (std::size_t i = 0; i < kGuard; ++i)
+        if (got[i] != kSentinel || got[kGuard + kState + i] != kSentinel ||
+            got[2 * kGuard + kState + kConv + i] != kSentinel)
+          throw std::runtime_error("restore wrote past its outputs");
+      if (std::memcmp(got + 2 * kGuard + kState,
+                      in + kState + (kRows - 1) * kUpdate,
+                      kConv * sizeof(float)))
+        throw std::runtime_error("restore changed the convolution history");
+      for (std::size_t index = 0; index < kState; ++index) {
+        const auto h = index / (kDim * kDim);
+        const auto j = (index / kDim) % kDim;
+        const auto k = index % kDim;
+        float value = in[index];
+        for (std::uint32_t t = 1; t < keep; ++t) {
+          const float* update = in + kState + (t - 1) * kUpdate;
+          const float key = update[(h % kKHeads) * kDim + k];
+          const float decay = update[kKHeads * kDim + h];
+          const float beta = update[kKHeads * kDim + kVHeads + h];
+          const float error =
+              update[kKHeads * kDim + 2 * kVHeads + h * kDim + j];
+          const float correction = product(error, key);
+          value = (k + 1) % 32 == 0
+                      ? std::fma(value, decay, product(beta, correction))
+                      : std::fma(beta, correction, product(value, decay));
+        }
+        if (std::memcmp(&value, got + kGuard + index, sizeof(float)))
+          throw std::runtime_error(
+              "restore changed its rounded-product contract");
+      }
+    }
+  }
+}
+
 int main() {
   try {
+    CheckRestoreLayers(true);
+    CheckRestoreLayers(false);
     // Short batches cover every rollback prefix and the no-snapshot case.
     // Longer batches exercise full and ragged recurrence windows.
     for (std::uint32_t n : {1u, 8u, 37u, 99u}) {
