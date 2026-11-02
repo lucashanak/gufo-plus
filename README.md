@@ -30,6 +30,21 @@ A fork of [Gufo](https://github.com/gufo-org/gufo) for AMD Strix Halo (`gfx1151`
 | [#875](https://github.com/gufo-org/gufo/pull/875) | Prefill rows independent of the pass route | merged |
 | [#876](https://github.com/gufo-org/gufo/pull/876) | Dense sweep of pre-budget rows in budget-crossing chains | merged |
 | [#877](https://github.com/gufo-org/gufo/pull/877) | Four-token prefill alignment | open |
+| [#881](https://github.com/gufo-org/gufo/pull/881) | Idle-spill polling backoff | merged |
+| [#882](https://github.com/gufo-org/gufo/pull/882) | Confidence-gated MTP chains | merged |
+| [#884](https://github.com/gufo-org/gufo/pull/884) | Q8_0 PLE n-gram tables | merged |
+| [#890](https://github.com/gufo-org/gufo/pull/890) | Register-resident routed prefill experts | merged |
+| [#893](https://github.com/gufo-org/gufo/pull/893) | 8-bit growing K/V | open |
+| [#894](https://github.com/gufo-org/gufo/pull/894) | One-launch decode HC mixer | merged |
+| [#895](https://github.com/gufo-org/gufo/pull/895) | Fused prefill DeltaNet | merged |
+| [#930](https://github.com/gufo-org/gufo/pull/930) | Every GGML block format in core | merged |
+| [#933](https://github.com/gufo-org/gufo/pull/933) | 16,384-row prefill passes with grouped GEMM rasters | merged (passes later back to 4,096 upstream, #954; this fork keeps 16,384) |
+| [#950](https://github.com/gufo-org/gufo/pull/950) | BF16 HC inject rows widened to F32 | open |
+| [#961](https://github.com/gufo-org/gufo/pull/961) | Wide verification of long prompt-lookup copies | open |
+| [#962](https://github.com/gufo-org/gufo/pull/962) | Prefill waits asleep instead of spinning | open |
+| [#963](https://github.com/gufo-org/gufo/pull/963) | In-pass grid checkpoints | open |
+
+This branch is rebased onto upstream `main` after the extension migration (#935). Building, running and model documentation are the same as upstream; the original README follows.
 
 ---
 
