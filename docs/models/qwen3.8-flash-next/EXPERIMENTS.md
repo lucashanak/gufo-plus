@@ -1,5 +1,31 @@
 # Qwen3.8 Flash-Next experiments
 
+## Draft head and IQ4_XS mixers (November 2, 2026)
+
+Workload: Swift 1.5 IQ4_XS + ft2 MTP at the production flags (8 × 262,144,
+`--kv-cache-bytes 21474836480`), `gufo serve`, greedy unless noted, 256
+tokens per request: C1 English prose, Czech prose, code, code at T 0.7
+(seed 1234), one request after a cold 16.7K prompt, C4 and two C8 mixes
+(prose, code, Czech). Arms alternate base/candidate/candidate/base in one
+GPU hold at the 120 W limit. Greedy replies are byte-identical to the base
+in every scenario. A C1 MTP profile of the base put the 98,304-row draft
+head at 0.90 ms per draft step (about 45% of draft time on code); Czech
+text drafted every step through the 248,320-row head (2.27 ms), and at
+C4/C8 about half of all draft steps did, because greedy requests in
+unplanned batches kept the full head.
+
+| Experiment | Outcome |
+| --- | --- |
+| The small draft head for every request, also greedy requests in unplanned batches | Retained. Greedy proposals never change the output. With the IQ4_NL full-vocabulary rows below, decode tok/s base → candidate (sum of rates; wall aggregate): C4 117.0/117.6 → 118.6/118.3 (wall 92.4/91.0 → 92.8/92.7), C8 136.7/135.8 → 137.5/137.6 (wall 107.7/108.5 → 110.2/110.3), second C8 mix 139.9/141.8 → 141.8/141.6. |
+| Full-vocabulary draft steps through an IQ4_NL requantization of the Q6_K head (`Q6KToIq4Nl`, ggml's `quantize_row_iq4_nl`) | Retained: 357 MB resident, 31% fewer bytes per such step. C1 Czech 50.1/50.7 → 52.4/52.4 tok/s; English, code, T 0.7 and 16K unchanged (they draft through the prefix). `head_ops` checks the requantization (deterministic, worst relative RMS error per row under 9% on random Q6_K rows) and IQ4_NL GEMV widths 1–8 at K 2560. |
+| The 98,304-row prefix through the same IQ4_NL rows | Rejected: acceptance 83.7 → 78.8% on code at T 0.7 and 79.9 → 77.1% after 16.7K; those lost 2–4% while English/code/Czech gained 1–3%. |
+| One fused launch for IQ4_XS-down / IQ4_NL-up mixers (`FusedFormat<kIQ4_XS>`) | Retained for 1–3 tokens. Swift's mixers ran five launches each (96 per token). `hc_mix_bench` µs per mixer, five launches → one: 35.65 → 30.99, 35.96 → 31.02, 36.72 → 34.17 at 1–3 tokens; 34.6 → 38.0 at 4 and 0.87–0.92× at 5–7, so `HcFusedMaxTokens` is 3. `hc_mix_ops` is bitwise at 1–8 tokens with and without inject. C1 MTP within noise (the trunk often verifies four or more rows). |
+| Four rows per wave in the single-token gated IQ4_XS expert GEMV | Rejected: `routed_vec_bench` hashes identical, one-row gate/up 4.19 → 4.12 ms per 48 layers, nothing at 2–5 rows. |
+
+`session_test --batch-only` and `--sampling-only` fail on the base too
+(`batched next draw or deferred residual differs`, `scalar EOS checkpoint
+did not replay exactly without prefill`); not caused by these changes.
+
 ## Wide prompt-lookup verification (November 1, 2026)
 
 Strix Halo gfx1151, ROCm 7.2.4, Swift 1.5 IQ4_XS with the Q8_0 MTP head,
