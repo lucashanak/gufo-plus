@@ -736,7 +736,12 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   assert(up.requested == measured);
   m->token_embd_ = uploaded.token_embd;
   m->output_ = uploaded.output;
-  m->output_bytes_ = w.output.SizeBytes();
+  // Row-addressed users (draft tables) read the head's Q8_0 rows when it
+  // also keeps K-quant decode rows.
+  m->output_bytes_ =
+      m->output_.decode != nullptr
+          ? std::size_t{m->output_.rows} * (m->output_.cols / 32 * 34)
+          : w.output.SizeBytes();
   m->hc_head_ = uploaded.hc_head;
   m->layers_ = std::move(uploaded.layers);
   m->mtp_ = uploaded.mtp;

@@ -578,8 +578,10 @@ cache::Completion ContinuationAdapter::CapturePrivatePiece(
     metadata.draft = native.mtp_.position;
     metadata.blocks = native.blocks_;
     metadata.draft_blocks = native.mtp_.blocks;
-    // A boundary capture stores the base a restore rebuilds from its kept
-    // rows (none without MTP), whether it reads the arena or the live session.
+    // The base a restore rebuilds from the rows a frontier keeps (none
+    // without MTP), whichever pass produced it: a split pass, an in-pass
+    // checkpoint, a live boundary capture and a native restore record the
+    // same base.
     metadata.hidden_base =
         native.position_ - (state.checkpoint ? state.checkpoint->hidden_rows
                                              : session.KeptHiddenRows());

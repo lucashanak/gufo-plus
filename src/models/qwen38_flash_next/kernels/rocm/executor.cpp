@@ -803,9 +803,7 @@ PrefillCheckpoint::~PrefillCheckpoint() {
   state->snapshots_.reset();
 }
 
-bool Executor::ReservePrefillCheckpoint(const Session& session) const {
-  if (checkpoint_storage_)
-    return true;
+std::size_t Executor::CheckpointSlotBytes(const Session& session) const {
   const auto& c = config();
   std::size_t floats =
       has_mtp() ? std::size_t{options_.max_speculative} * c.HcDim() : 0;
@@ -816,12 +814,18 @@ bool Executor::ReservePrefillCheckpoint(const Session& session) const {
           std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
   if (c.ple_layer >= 0)
     floats += std::size_t{c.PleConvHistory()} * c.HcDim();
+  return floats * sizeof(float);
+}
+
+bool Executor::ReservePrefillCheckpoint(const Session& session) const {
+  if (checkpoint_storage_[0])
+    return true;
   try {
     // Forward scratch is shared by the executor. The checkpoint is frozen
     // into private snapshot storage before another session can reuse it.
     // DeferredScratchBytes reserved it, so it may take its own reservation.
-    checkpoint_storage_ =
-        GetSnapshotAllocator()->AllocateReserved(floats * sizeof(float));
+    checkpoint_storage_[0] =
+        GetSnapshotAllocator()->AllocateReserved(CheckpointSlotBytes(session));
   } catch (const SnapshotDeviceExhausted&) {
     return false;
   }
@@ -896,7 +900,7 @@ std::unique_ptr<PrefillCheckpoint> Executor::MakePrefillCheckpoint(
   const auto conv = std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels();
   const auto recurrent =
       std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
-  if (!checkpoint_storage_) {
+  if (slot == 0 && !checkpoint_storage_[0]) {
     AssignError(error_msg, "prefill checkpoint arena is not reserved");
     return nullptr;
   }
@@ -3713,9 +3717,9 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
                                  ? prefix + speculative::kDraftVocabExtraRows
                                  : model_->output().rows;
   if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg) ||
-      !(draft != nullptr
-            ? DraftLogits(*draft, s_.mixed, s_.logits, error_msg)
-            : Dense(model_->output(), s_.mixed, s_.logits, 1, error_msg))) {
+      !(draft != nullptr ? DraftLogits(*draft, s_.mixed, s_.logits, error_msg)
+                         : Dense(model_->draft_full_output(), s_.mixed,
+                                 s_.logits, 1, error_msg))) {
     return false;
   }
   const auto count = std::min<std::uint32_t>(rows, kMtpCandidates);

@@ -91,6 +91,8 @@ gufo_extension_target(
     gufo_qwen38_flash_next
     gufo_cache_hip
     gufo_qwen_vision
+    # DFlash2 drafts next to MTP reuse the Qwen DFlash2 runtime.
+    gufo_qwen_hip
     gufo_qwen_draft_vocab
     gufo_qwen38_flash_next_mmq
     gufo_compare

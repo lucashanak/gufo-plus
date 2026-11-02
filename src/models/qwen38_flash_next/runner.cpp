@@ -176,7 +176,10 @@ public:
   }
   [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
       const noexcept override {
-    return {.per_request_state_bytes = session_->AllocatedBytes(),
+    // K/V rows grow with the tokens held and are bounded by the model's K/V
+    // budget; the claim charges each state a share of it, not its rows.
+    return {.per_request_state_bytes =
+                session_->AllocatedBytes() - session_->KvBytes(),
             .temporary_scratch_bytes = 0};
   }
 
@@ -296,6 +299,9 @@ public:
                 .prefix_reuse = true,
                 .in_pass_checkpoint = true,
                 .partial_prefill_retention = true,
+                // Each pass reads every routed expert, so a short budget
+                // beside decoders repeats that read per few hundred tokens.
+                .active_prefill_tokens = model_->PrefillCapacity(),
                 // Sparse prefill tiles group four queries from each pass
                 // start: one selection block (compress ratio).
                 .prefill_alignment =
@@ -358,7 +364,10 @@ public:
   // llama.cpp's Qwen3-Coder format forces "\n</think>" and also ends
   // reasoning at a tool call.
   [[nodiscard]] ReasoningTags ReasoningBudgetTags() const override {
-    return {"<think>", "\n</think>", {"</think>", "<tool_call>"}};
+    return {"<think>",
+            "\n</think>",
+            {"</think>", "<tool_call>"},
+            tokenization::kQwenReasoningWrapUp};
   }
 
   [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
@@ -481,8 +490,7 @@ public:
     const auto& qfn = RequireQwenFlashNextState(state);
     const auto consumed = std::min<std::size_t>(
         {budget, prompt.size() - offset, model_->PrefillThroughCapacity()});
-    if (boundary <= offset + 1 || boundary >= offset + consumed ||
-        offset + consumed - boundary > model_->PrefillCheckpointTail())
+    if (boundary <= offset + 1 || boundary >= offset + consumed)
       return std::nullopt;
     const auto bytes = qfn.session().PrefillCheckpointBytes(
         static_cast<std::uint32_t>(boundary));
@@ -491,33 +499,39 @@ public:
 
   [[nodiscard]] TextPrefillStep PrefillThrough(
       TextRunnerState& state, std::span<const TextRunnerToken> prompt,
-      std::size_t offset, std::size_t budget, std::size_t boundary,
-      std::unique_ptr<TextRunnerSnapshot>* checkpoint,
-      const std::function<std::unique_ptr<TextRunnerSnapshot>()>& capture)
-      const override {
+      std::size_t offset, std::size_t budget,
+      std::span<const std::size_t> boundaries,
+      const InPassConsumer& consume) const override {
     auto& qfn = RequireQwenFlashNextState(state);
-    if (!checkpoint || !capture || offset != qfn.position())
+    if (!consume || boundaries.empty() || offset != qfn.position())
       throw std::logic_error("invalid component in-pass checkpoint request");
     const auto consumed = std::min<std::size_t>(
         {budget, prompt.size() - offset, model_->PrefillThroughCapacity()});
     const auto next_position = offset + consumed;
     const auto prefix = QwenFlashNextEngineTokens(prompt.first(next_position));
+    // As in Prefill: the next step's n-gram rows are read during this one.
+    const auto rest = next_position == prompt.size()
+                          ? state.prefill_lookahead()
+                          : prompt.subspan(next_position);
+    const std::size_t after = rest.size();
+    const auto next = QwenFlashNextEngineTokens(rest.subspan(
+        0, std::min<std::size_t>({budget, after,
+                                  after <= model_->PrefillThroughCapacity()
+                                      ? model_->PrefillThroughCapacity()
+                                      : model_->PrefillCapacity()})));
+    std::vector<std::uint32_t> points(boundaries.begin(), boundaries.end());
     double capture_ms = 0;
     try {
       qfn.adapter().PrefillThrough(
-          qfn.slot(), prefix, static_cast<std::uint32_t>(boundary), [&] {
+          qfn.slot(), prefix, points,
+          [&](std::size_t index) {
             const auto started = std::chrono::steady_clock::now();
-            try {
-              *checkpoint = capture();
-            } catch (...) {
-              // Optional retention may refuse; the complete live prefill is
-              // valid.
-              checkpoint->reset();
-            }
+            consume(index, nullptr);
             capture_ms += std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - started)
                               .count();
-          });
+          },
+          next);
     } catch (...) {
       qfn.set_position(0);
       throw;
@@ -628,6 +642,12 @@ public:
     step.lookup_tokens = stats_after.lookup - stats_before.lookup;
     step.lookup_accepted_tokens =
         stats_after.lookup_accepted - stats_before.lookup_accepted;
+    step.dflash_rounds = stats_after.dflash_cycles - stats_before.dflash_cycles;
+    step.dflash_tokens =
+        stats_after.dflash_drafted - stats_before.dflash_drafted;
+    step.dflash_accepted_tokens =
+        stats_after.dflash_accepted - stats_before.dflash_accepted;
+    step.dflash_mtp_rounds = stats_after.mtp_chosen - stats_before.mtp_chosen;
     return step;
   }
 
@@ -720,6 +740,11 @@ public:
       step.lookup_tokens = stats.lookup - before[i].lookup;
       step.lookup_accepted_tokens =
           stats.lookup_accepted - before[i].lookup_accepted;
+      step.dflash_rounds = stats.dflash_cycles - before[i].dflash_cycles;
+      step.dflash_tokens = stats.dflash_drafted - before[i].dflash_drafted;
+      step.dflash_accepted_tokens =
+          stats.dflash_accepted - before[i].dflash_accepted;
+      step.dflash_mtp_rounds = stats.mtp_chosen - before[i].mtp_chosen;
     }
     return steps;
   }
@@ -824,6 +849,7 @@ std::shared_ptr<ext::TextModelRunner> CreateQwenFlashNextTextRunner(
           .decode_concurrency =
               DecodeConcurrencyForSessions(options.session_count),
           .rope_scaling = rope_scaling,
+          .kv_cache_bytes = options.kv_cache_bytes,
       },
       &load_error);
   if (!model) {

@@ -985,18 +985,11 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
         prefill && off + n < tokens.size() && end % ratio != 0 &&
         n > end % ratio)
       n -= end % ratio;
-    const bool captures = (checkpoint || consume) && boundary > tokens_.size();
-    // Extended-context attention can fall back from WMMA to the per-token
-    // kernel. Its checkpoint must end a pass: the fused in-pass path requires
-    // WMMA for both query groups. Preserve ordinary split-pass arithmetic on
-    // either side of the boundary. Use the actual launch capability rather
-    // than the model's independently configured native context length.
-    if (captures && boundary < tokens_.size() + n &&
-        tokens_.size() + n >
-            rocm::WmmaCausalAttentionContextLimit(
-                model_->config().num_heads, model_->config().num_kv_heads,
-                model_->config().head_dim, model_->config().compress_ratio)) {
-      n = boundary - tokens_.size();
+    // This pass captures boundaries [next_boundary, last_boundary) in place.
+    std::size_t last_boundary = next_boundary;
+    // True when the pass ends at its only boundary and the live session is
+    // captured there, without an in-pass checkpoint.
+    bool live = false;
     if (capturing) {
       while (last_boundary < boundaries.size() &&
              boundaries[last_boundary] <= tokens_.size() + n)
@@ -1022,6 +1015,16 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
         n = boundaries[next_boundary] - tokens_.size();
         last_boundary = next_boundary + 1;
       }
+      // Without device room for the checkpoint arena, end the pass at the
+      // first boundary and capture the live session there instead:
+      // split-pass rows are the same as in-pass rows.
+      if (last_boundary > next_boundary &&
+          !exec.ReservePrefillCheckpoint(*session_)) {
+        n = boundaries[next_boundary] - tokens_.size();
+        last_boundary = next_boundary + 1;
+        live = true;
+      }
+    }
     if (ramp != 0) {
       const double grown =
           (kRampPassSeconds + static_cast<double>(n) / kRampTokensPerSecond) *
