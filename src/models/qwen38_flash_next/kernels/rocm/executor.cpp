@@ -3090,8 +3090,17 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
          !Dense(l.attn_v, xq, s_.v, error_msg))) {
       return false;
     }
-    UnpackQGate(s_.qg, 2 * c.AttentionQDim(), s_.q, s_.attn_gate, nullptr,
-                nullptr, n_tokens, c.num_heads, c.head_dim, 0, stream_);
+    // Separate K/V projections: the same fused preparation, reading K and V
+    // from their own rows.
+    prepared = PrepareAttention(
+        s_.qg, 2 * c.AttentionQDim(), l.attn_q_norm.f32(), l.attn_k_norm.f32(),
+        s_.q, s_.attn_gate, s.k_cache, s.v_cache, n_tokens, c.num_heads,
+        c.num_kv_heads, c.head_dim, c.rotary_dim, pos, c.rope_theta, c.rms_eps,
+        stream_, s.rope, prefill_phase, yarn_, s_.k, s_.v);
+    if (!prepared) {
+      UnpackQGate(s_.qg, 2 * c.AttentionQDim(), s_.q, s_.attn_gate, nullptr,
+                  nullptr, n_tokens, c.num_heads, c.head_dim, 0, stream_);
+    }
   }
   if (!prepared) {
     RmsNormRows(s_.q, l.attn_q_norm.f32(), s_.q, n_tokens * c.num_heads,
