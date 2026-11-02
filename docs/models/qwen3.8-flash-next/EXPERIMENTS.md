@@ -1,5 +1,46 @@
 # Qwen3.8 Flash-Next experiments
 
+## Small trunk kernels and prefill energy (November 2, 2026)
+
+Strix Halo gfx1151, ROCm 7.2.4, Swift 1.5 IQ4_XS with the Q8_0 MTP head,
+production flags (`--sessions 8`), 120 W package limit. Base `452a03bf` (c7).
+The profile behind it: the router `SmallGemm` at 113 GB/s and the rollback
+restores at 3–3.4 % of an MTP C1 token, the HC combines at 10 % of prefill.
+HTTP streaming, greedy, thinking off, 256 tokens; A/B/B/A blocks, one fresh
+server per block, two repetitions each; decode is the sum of per-request rates,
+prefill the server's prompt rate.
+
+| Phase | c7 | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| C1 prose (EN) | 63.25 | 64.11 | +1.4 % |
+| C1 code | 87.87 | 88.91 | +1.2 % |
+| C1 Czech | 51.80 | 52.46 | +1.3 % |
+| C4 sum of rates / wall aggregate | 119.84 / 91.70 | 121.37 / 93.10 | +1.3 % / +1.5 % |
+| C8 sum of rates / wall aggregate | 138.97 / 108.66 | 140.25 / 110.24 | +0.9 % / +1.5 % |
+| pp8k | 1,529 | 1,546 | +1.1 % |
+| pp32k | 1,609 | 1,632 | +1.4 % |
+| pp8k / pp32k at the stock 132/150 W limits (three repetitions per block) | 1,628 / 1,746 | 1,674 / 1,773 | +2.9 % / +1.5 % |
+
+A second session (A/B/C/C/B/A, c7 / restores alone / both) separates them:
+restores alone C1 prose/code/Czech +0.7/+0.6/+1.0 %, an 8K-token prompt +0.6 %,
+C4 +0.1 %, C8 +0.7 % (wall aggregate ±0); both C1 +0.8/+0.9/+1.4 %, 8K +1.0 %,
+C4 +0.6 %, C8 +1.2 % (wall +1.3 %).
+
+Every C1, C4 and C8 text hashes identically in all four blocks; greedy CLI
+outputs (prose, code and Czech in MTP mode, code in AR mode) are
+byte-identical to production `addeb30c`, and the 8K-token prompt's 256 tokens
+hash identically for all three builds. `gdn_ops`, `attention_ops`,
+`batch_graph`, `hc_mix_ops`, `hc_route_ops`, `moe_epilogue_ops`,
+`projection_ops`, the in-pass checkpoints and the deep snapshot test pass.
+
+| Experiment | Outcome |
+| --- | --- |
+| Rollback restores of every linear layer in one launch, four state elements per thread | Retained. A rejected cycle ran 36 `RestoreGdnStateKernel` launches (one thread per element, 113 GB/s) and 36 `hipMemcpyAsync` convolution copies. `RestoreGdnLayersKernel` takes 18 layers per launch (state and convolution history) and replays four consecutive elements of a state row per thread: they share the row's decay, beta and error, so a step loads one float4 of keys and three scalars instead of sixteen loads. Each element keeps its products and FMA in order (`gdn_ops` against the host oracle at every kept prefix, 21 layers, aligned and misaligned rows, a ragged history). Per layer, weights rotated past the MALL, keep 1/2/4/7: 29.5/36.9/50.4/70.1 → 29.6/30.2/33.9/40.2 µs. |
+| Fused attention preparation for separate Q/K/V projections | Retained. Swift's GGUF has separate `attn_q`/`attn_k`/`attn_v`, so every full-attention layer ran `UnpackQGate`, two `RmsNormRows`, two `Rope` and two `StoreKv` (decode ~25 µs per layer, prefill 2 % of pp32k) instead of the bit-exact `PrepareAttention` the stacked projection uses. `PrepareAttention` now also reads K and V from their own rows. `attention_ops`: queries, gates and both 8-bit caches byte-identical to the separate kernels at 1/7/8/9/33/65 tokens, decode and prefill launch shapes, with and without YaRN. |
+| Router `SmallGemm`: two or four rows per wave sharing the activation loads, three to five steps in flight | Rejected. Isolated with rotated weights the production kernel already streams 2.6 MB in 14.9–17.0 µs at 1–8 tokens (155–177 GB/s); the profile's 113 GB/s was AR, where the forked shared expert overlaps it. The best exact variant (two rows, four steps) was 3–7 % faster per launch, about 0.1 % of a token; four rows at eight tokens 0.60×. |
+| HC combines fused into the neighbouring GEMM epilogues | Not built. The MoE combine streams about 182 KB per token per layer at 190 GB/s and the attention-side combine about 80 KB at 160 GB/s; every byte left is needed bit-exactly (F32 residual read twice and written once, ten F16 expert rows, the shared expert, F16 and tiled-Q8 norms). A GEMM tile holds 128 of the 10,240 normalized elements, so a fused epilogue would still need a cross-tile pass for the norm. Removing the inject partials bounds the remaining gain below 1 % of prefill. |
+| Restores folded into the next GDN step | Not built. After the vectorized restore a rejected cycle still rewrites 36 × 3 MB of state (about 1.1 ms at C1). Folding needs a device-side pending replay that every reader of the state honours: decode, batched and prefill GDN, snapshot and checkpoint copies. |
+
 ## Draft head and IQ4_XS mixers (November 2, 2026)
 
 Workload: Swift 1.5 IQ4_XS + ft2 MTP at the production flags (8 × 262,144,
