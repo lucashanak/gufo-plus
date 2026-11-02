@@ -6845,7 +6845,12 @@ __launch_bounds__(256) __global__
           kQ5 ? w_head[S][kb] : (row_live ? w_head[S][kb] : 0U);
       const __half2 sb = __builtin_bit_cast(__half2, scale_bias);
       const __half2 scale2 = __low2half2(sb);
-      const __half2 bias2 = __high2half2(sb);
+      __half2 bias2 = __high2half2(sb);
+      if constexpr (!kQ5) {
+        // Keep the known-zero bias an FMA operand, as in RoutedF16GEMMKernel:
+        // ROCm 10.1 would fold x * d + 0 into x * d.
+        asm volatile("" : "+v"(bias2));
+      }
       const uint4 c = w_codes[S][kb];
       const std::uint32_t words[4] = {c.x, c.y, c.z, c.w};
       __half2 h[8];
@@ -7216,7 +7221,12 @@ __launch_bounds__(256) __global__
                    : f_c == kb ? own_scale
                                : peer_scale);
       const __half2 scale2 = __low2half2(sb);
-      const __half2 bias2 = __high2half2(sb);
+      __half2 bias2 = __high2half2(sb);
+      if constexpr (kOwnScales) {
+        // The zero bias stays an operand, so the affine stays an FMA as in
+        // RoutedF16GEMMKernel: ROCm 10.1 would fold x * s + 0 into x * s.
+        asm volatile("" : "+v"(bias2));
+      }
       const std::uint32_t high =
           kQ5K ? ((f_c == kb ? own_high : peer_high) >> (16U * f_c)) : 0U;
       __half2 h[8];
@@ -7614,9 +7624,21 @@ struct FusedFormat<WeightType::kQ6_K> {
       const int vil = (w.vl >> (4 * i)) & 0x0F0F0F0F;
       const int vih = ((w.vh >> (4 * i)) << 4) & 0x30303030;
       const int vi = FusedSubSat4((vil | vih), 0x20202020);
+      // vec_dot_q6_K_q8_1_impl_mmvq's pinned order: one product, then FMA.
+      const float p = static_cast<float>(
+          __builtin_amdgcn_sudot4(true, vi, true, u[i], 0, false) * sc);
+      sumf = i == 0 ? __fmul_rn(d8[i], p) : __fmaf_rn(d8[i], p, sumf);
+    }
+    return sumf;
+  }
+  static __device__ __forceinline__ float Dot(const Lane& w, const Input& x) {
+    return w.d * Sum(w, x);
   }
   static __device__ __forceinline__ float Add(float acc, const Lane& w,
                                               const Input& x) {
+    // mmvq's tmp += d * sumf as ROCm 7.2 compiled it: one FMA per block, in
+    // block order. ROCm 10.1 may reassociate the unrolled chain instead.
+    return __fmaf_rn(w.d, Sum(w, x), acc);
   }
 };
 
@@ -9381,7 +9403,9 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
   };
 
   const __half2 magic = __floats2half2_rn(-1152.0F, -1152.0F);
-  const __half2 zero2 = __floats2half2_rn(0.0F, 0.0F);
+  __half2 zero2 = __floats2half2_rn(0.0F, 0.0F);
+  // An FMA operand, not a constant ROCm 10.1 folds the FMA away with.
+  asm volatile("" : "+v"(zero2));
   // Preserve this stage's rounded fragments before prefetch overwrites
   // the raw Q8 codes. Each SSM wave owns both of its 16-row output tiles.
   v16h own_a_lo[BK];

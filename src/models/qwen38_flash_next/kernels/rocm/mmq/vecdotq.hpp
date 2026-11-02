@@ -595,7 +595,10 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
 
         const int vi = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
 
-        sumf += d8[i] * (ggml_hip_dp4a(vi, u[i], 0) * sc); // SIMD dot product
+        // Pinned to ROCm 7.2's order (one product, then an FMA); fast-math
+        // may contract either product into the other.
+        const float p = static_cast<float>(ggml_hip_dp4a(vi, u[i], 0) * sc); // SIMD dot product
+        sumf = i == 0 ? __fmul_rn(d8[i], p) : __fmaf_rn(d8[i], p, sumf);
     }
 
     return d*sumf;
