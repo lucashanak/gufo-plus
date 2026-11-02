@@ -556,6 +556,9 @@ void RerotateKeys(const __half* source, __half* destination,
 /// Queries retain F32 precision (an F16 head plus its F16 remainder on the
 /// matrix cores); pooled cache keys are F16. Scores accumulate in FP32 in
 /// one order per (query, block), whatever the launch width or position.
+/// `scores` holds n_tokens * max_blocks floats; blocks past max_blocks are
+/// neither scored nor selected, whatever the device position (`mask_words`
+/// * 32 must cover max_blocks).
 /// `live_blocks`, when nonzero, bounds the complete blocks of the last
 /// query (eager launches only: a captured graph must cover max_blocks).
 void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,

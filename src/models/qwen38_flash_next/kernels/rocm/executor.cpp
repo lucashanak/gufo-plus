@@ -1030,6 +1030,11 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
              "pass event", error_msg) ||
       !Check(hipStreamCreateWithFlags(&e->notify_stream_, hipStreamNonBlocking),
              "notify stream", error_msg) ||
+      // One side stream serves the decode shared-expert fork and the prompt
+      // passes' overlap (shared expert, checkpoint copies); both join it
+      // through events.
+      !Check(hipStreamCreateWithFlags(&e->side_stream_, hipStreamNonBlocking),
+             "side stream", error_msg) ||
       !Check(hipEventCreateWithFlags(&e->shexp_fork_, hipEventDisableTiming),
              "shared expert fork event", error_msg) ||
       !Check(hipEventCreateWithFlags(&e->shexp_join_, hipEventDisableTiming),
