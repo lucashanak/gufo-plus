@@ -536,7 +536,9 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
                       std::uint32_t rotary_dim, const std::uint32_t* start_pos,
                       float theta, float eps, hipStream_t stream,
                       const qwen::vision::DeviceRope* rope = nullptr,
-                      bool prefill = false, const YarnRope& yarn = {});
+                      bool prefill = false, const YarnRope& yarn = {},
+                      const float* k_rows = nullptr,
+                      const float* v_rows = nullptr);
 
 /// NEOX partial rotary on x [t][heads][d] at positions start_pos + t.
 /// Positions are read from device memory (`start_pos` points at the
