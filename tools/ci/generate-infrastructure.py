@@ -27,6 +27,7 @@ GUIDE_LABELS = {
     "qwen-image-2.1": "Usage",
     "qwen3-asr": "Usage",
     "qwen3-tts": "Voice modes",
+    "qwen3.6-35b-a3b": "Usage and modes",
     "qwen3.8-27b": "Usage and modes",
     "qwen3.8-flash-next": "Usage and modes",
 }

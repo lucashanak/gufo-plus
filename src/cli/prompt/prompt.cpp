@@ -220,11 +220,8 @@ std::optional<PromptOptions> ParseTextOptions(std::span<const char* const> args,
     return std::nullopt;
   }
 
-  if (opt.speculative_backend == "mtp" && opt.mtp_model_path.empty()) {
-    if (error_msg != nullptr)
-      *error_msg = "MTP requires --mtp-model";
-    return std::nullopt;
-  }
+  // A model's MTP block may live in the target GGUF (Qwen3.6); the model
+  // that needs a sidecar reports a missing --mtp-model when it loads.
   if (opt.speculative_backend == "dflash2" && opt.dflash_model_path.empty()) {
     if (error_msg != nullptr)
       *error_msg = "DFlash2 requires --dflash-model";

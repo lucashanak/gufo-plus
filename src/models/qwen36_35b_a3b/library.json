@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "name": "qwen36_35b_a3b",
+  "target": "gufo_qwen36_35b_a3b",
+  "kind": "static",
+  "purpose": "Qwen3.6-35B-A3B (qwen35moe) CPU reference and ROCm runtime with native MTP.",
+  "consumers": []
+}

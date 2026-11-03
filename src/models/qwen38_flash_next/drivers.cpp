@@ -199,6 +199,10 @@ std::shared_ptr<models::qwen38_flash_next::Model> LoadFlashNextModel(
     std::cerr << "Unsupported Flash-Next chat template: " << error << '\n';
     return nullptr;
   }
+  if (opt.speculative_backend == "mtp" && opt.mtp_model_path.empty()) {
+    std::cerr << "Flash-Next MTP requires --mtp-model\n";
+    return nullptr;
+  }
   auto model = models::qwen38_flash_next::Model::Load(
       opt.model_path,
       {.max_context = kDefaultContext,
