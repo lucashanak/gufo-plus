@@ -99,6 +99,11 @@ if(TARGET gufo_qwen36_35b_a3b_hip)
   )
   set_source_files_properties(${Q36_ROCM_DIR}/w8a8_wave64.hip
     PROPERTIES COMPILE_OPTIONS "-mwavefrontsize64")
+  # ROCm 10.1 spills 32 VGPRs inside the dense causal attention key loop
+  # (ROCm 7.2: 18), which cost 8 % of a 16K prefill; sinking instructions
+  # into the loop leaves 7 spills. Scheduling only: results are unchanged.
+  set_source_files_properties(${Q36_ROCM_DIR}/kernels.hip.cpp
+    PROPERTIES COMPILE_OPTIONS "-Xarch_device;-mllvm=-sink-insts-to-avoid-spills")
   target_compile_definitions(gufo_qwen36_35b_a3b_hip PUBLIC ENGINE_ENABLE_HIP=1)
   target_compile_options(gufo_qwen36_35b_a3b_hip PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O2>
