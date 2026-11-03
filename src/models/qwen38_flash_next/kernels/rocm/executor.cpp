@@ -5538,6 +5538,9 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     const bool bf16 = w.type == GgmlType::kBF16;
     if (w.type == GgmlType::kQ8_0 ||
         ((bf16 || w.type == GgmlType::kF16) &&
+         BlasLt::UsesOwnKernel(bf16 ? HIP_R_16BF : HIP_R_16F,
+                               static_cast<int>(w.rows),
+                               static_cast<int>(w.cols))))
       return Dense(w, x, out, rows, error_msg);
     SmallGemm(w.data, SmallType(w.type), x, out, rows, w.rows, w.cols, stream_);
     return true;
