@@ -801,8 +801,9 @@ void PrintServeHelp(std::string_view program_name,
         "Scheduling", &max_buffered_output_bytes_total);
     parser.AddOption(
         "", "--kv-cache-bytes", "N",
-        "Flash-Next and Qwen3.8-27B: device bytes of K/V rows shared by all "
-        "sessions; each session's rows grow with the tokens it holds "
+        "Flash-Next, Qwen3.8-27B and Qwen3.6-35B-A3B: device bytes of K/V "
+        "rows shared by all sessions; each session's rows grow with the tokens "
+        "it holds "
         "(default: 0 = every session's full context)",
         "Cache", &kv_cache_bytes);
     AddCacheRamOption(parser, &cache_ram);
@@ -1485,8 +1486,9 @@ int RunServe(std::span<const char* const> args) {
         "Scheduling", &max_buffered_output_bytes_total);
     llm_parser.AddOption(
         "", "--kv-cache-bytes", "N",
-        "Flash-Next and Qwen3.8-27B: device bytes of K/V rows shared by all "
-        "sessions; each session's rows grow with the tokens it holds "
+        "Flash-Next, Qwen3.8-27B and Qwen3.6-35B-A3B: device bytes of K/V "
+        "rows shared by all sessions; each session's rows grow with the tokens "
+        "it holds "
         "(default: 0 = every session's full context)",
         "Cache", &kv_cache_bytes);
     AddCacheRamOption(llm_parser, &cache_ram);

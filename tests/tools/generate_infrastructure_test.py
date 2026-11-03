@@ -31,6 +31,7 @@ class GenerateInfrastructureTest(unittest.TestCase):
             "embedding_gemma2",
             "minimax_h3",
             "qwen",
+            "qwen36_35b_a3b",
             "qwen38_flash_next",
             "qwen3_asr",
             "qwen3_tts",
