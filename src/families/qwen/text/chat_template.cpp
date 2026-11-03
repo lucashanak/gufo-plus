@@ -95,15 +95,7 @@ bool IsQwen36Template(std::string_view value) {
          // the official template; only merges a second system/developer turn.
          hash ==
              "f55f52930aa8bf44ab5cb85f99370fcc3c56e9a85640b812086d5330bce5d86"
-             "b" ||
-         // Ornith-1.5-122B: the official template with every turn's
-         // reasoning kept (serve it with --preserve-thinking on).
-         hash ==
-             "8b4d21a1e70ccbc8849e5e5e6dd32f3acfb2e2060739475909edc6e9b27c716"
-             "5" ||
-         // The same template without its final newline (Unsloth's GGUFs).
-         hash ==
-             "9dd2fbd270feaa1fbef2d4f634d7887c9c506e3bde140f8e7351c8944e8fd235";
+             "b";
 }
 
 bool IsQwen36Artifact(const core::GgufReader& reader) {

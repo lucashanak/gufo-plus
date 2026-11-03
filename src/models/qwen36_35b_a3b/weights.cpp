@@ -135,10 +135,7 @@ struct Binder {
           Get(p + "attn_gate.weight", hidden, c.SsmValueDim(), 1, dense);
       l.ssm_conv1d = Get(p + "ssm_conv1d.weight", c.ssm_conv_kernel,
                          c.SsmConvChannels(), 1, norm);
-      // K-quants (122B GGUFs) are widened to F16 at upload.
-      const auto gdn_gates = {GgmlType::kF32,  GgmlType::kBF16,
-                              GgmlType::kQ8_0, GgmlType::kQ4_K,
-                              GgmlType::kQ5_K, GgmlType::kQ6_K};
+      const auto gdn_gates = {GgmlType::kF32, GgmlType::kBF16, GgmlType::kQ8_0};
       l.ssm_alpha =
           Get(p + "ssm_alpha.weight", hidden, c.ssm_num_v_heads, 1, gdn_gates);
       l.ssm_beta =

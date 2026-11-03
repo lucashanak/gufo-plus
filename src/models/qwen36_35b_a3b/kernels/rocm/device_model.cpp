@@ -241,11 +241,8 @@ struct Uploader {
   /// `cols`. An F32 or BF16 stack (router logits, GDN alpha/beta: the only
   /// unquantized projections) is narrowed to F16, which the wide-batch GEMM
   /// tier runs at speed. A Q8_0 stack merges projections of one input into
-  /// a single decode GEMV. With `widen`, a K-quant stack is dequantized on
-  /// the host and narrowed to F16 like the F32 stacks (GDN alpha/beta of the
-  /// 122B GGUFs, quantized there with the trunk).
-  DeviceTensor Stack(std::initializer_list<const TensorRef*> parts,
-                     bool widen = false) {
+  /// a single decode GEMV.
+  DeviceTensor Stack(std::initializer_list<const TensorRef*> parts) {
     DeviceTensor d;
     if (!ok) {
       return d;
@@ -253,7 +250,6 @@ struct Uploader {
     std::size_t rows = 0;
     std::size_t size = 0;
     const core::GgmlType type = (*parts.begin())->type;
-    const bool widen_quant = widen && KQuant(type);
     for (const TensorRef* t : parts) {
       if (t->empty() || t->type != type || t->cols != (*parts.begin())->cols ||
           (type != core::GgmlType::kF32 && type != core::GgmlType::kBF16 &&
@@ -264,8 +260,8 @@ struct Uploader {
         return d;
       }
       rows += t->rows;
-      // 16-bit and widened inputs become F32 before narrowing to F16.
-      size += (type == core::GgmlType::kQ8_0 || KQuant(type)) && !widen_quant
+      // 16-bit inputs are widened to F32 before narrowing to F16.
+      size += type == core::GgmlType::kQ8_0 || KQuant(type)
                   ? t->SizeBytes()
                   : t->ElementCount() * sizeof(float);
     }
@@ -279,18 +275,6 @@ struct Uploader {
     std::size_t offset = 0;
     for (const TensorRef* t : parts) {
       auto* dst = static_cast<std::uint8_t*>(ptr) + offset;
-      if (widen_quant) {
-        std::vector<_Float16> half_rows(t->ElementCount());
-        DequantHalf(*t, half_rows.data());
-        std::vector<float> wide(half_rows.begin(), half_rows.end());
-        if (hipMemcpy(dst, wide.data(), wide.size() * sizeof(float),
-                      hipMemcpyHostToDevice) != hipSuccess) {
-          Fail("upload failed for " + std::string(t->name));
-          return d;
-        }
-        offset += wide.size() * sizeof(float);
-        continue;
-      }
       if (type == core::GgmlType::kBF16) {
         // BF16 widens exactly to F32 on the host; the narrowing below then
         // treats it like the F32 routers.
@@ -314,7 +298,7 @@ struct Uploader {
       }
       offset += t->SizeBytes();
     }
-    if ((type == core::GgmlType::kQ8_0 || KQuant(type)) && !widen_quant) {
+    if (type == core::GgmlType::kQ8_0 || KQuant(type)) {
       (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + size, 0,
                            kTailMargin, nullptr);
       d.data = ptr;
@@ -385,7 +369,7 @@ struct Uploader {
     }
     d.ssm_conv1d = Copy(l.ssm_conv1d);
     if (l.linear) {
-      d.ssm_alpha_beta = Stack({&l.ssm_alpha, &l.ssm_beta}, true);
+      d.ssm_alpha_beta = Stack({&l.ssm_alpha, &l.ssm_beta});
     }
     d.ssm_dt = Copy(l.ssm_dt);
     d.ssm_a = Copy(l.ssm_a);

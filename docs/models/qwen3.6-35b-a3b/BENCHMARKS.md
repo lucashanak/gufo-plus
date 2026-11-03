@@ -114,7 +114,7 @@ prefill copies of the Q6_K matrices and the 8-bit K/V decode copy.
 
 ## Growing K/V rows
 
-Ornith-1.5 Q6dense (35B with the DFlash2 draft, and 122B), HTTP, greedy,
+Ornith-1.5 35B Q6dense with the DFlash2 draft, HTTP, greedy,
 thinking off, October 31, 2026, shared host. Prod is the preallocating build
 (`06e97015`); the candidate grows K/V rows in 2 MiB chunks. GTT is
 `mem_info_gtt_used` at readiness and its peak over the run.
@@ -132,14 +132,3 @@ thinking off, October 31, 2026, shared host. Prod is the preallocating build
 With `--kv-cache-bytes 12 GiB`, eight concurrent 93K-token needles answered
 8/8 and GTT peaked at 40.5 GiB (13.8 KiB per held token, staging and chunk
 rounding included); greedy output afterwards was still identical.
-
-| 122B | Prod 4 × 65536 | Growing 4 × 65536 | Growing 8 × 262144, cap 16 GiB |
-| --- | ---: | ---: | ---: |
-| GTT at readiness (GiB) | 83.08 | 79.42 | 80.36 |
-| Greedy, 6 prompts | | identical | identical |
-| C1 / C4 / C8 aggregate (tok/s), mean of two | 33.6 / 48.6 / 49.3 | 33.8 / 49.1 / 51.8 | 31.6 / 49.0 / 59.5 |
-| pp 30,620 (tok/s) | 716 | 728 | |
-| Needles 56K / 112K / 187K, then 4 × 56K concurrent | | | 7/7, GTT peak 89.8 |
-
-At 89.8 GiB GTT the host kept 17 GB available; a 6 GiB cap keeps the 122B
-below about 88 GiB.
