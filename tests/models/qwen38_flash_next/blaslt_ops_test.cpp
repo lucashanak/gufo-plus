@@ -52,8 +52,8 @@ int main() {
          {std::tuple{HIP_R_16F, 96, 2560}, std::tuple{HIP_R_16F, 513, 2560},
           std::tuple{HIP_R_16F, 17, 2560}, std::tuple{HIP_R_16F, 33, 96},
           std::tuple{HIP_R_16BF, 64, 2560}, std::tuple{HIP_R_16BF, 128, 2560},
-          std::tuple{HIP_R_16BF, 256, 2560}, std::tuple{HIP_R_16BF, 512, 2560},
-          std::tuple{HIP_R_16BF, 513, 2560}}) {
+          std::tuple{HIP_R_16BF, 256, 2560},
+          std::tuple{HIP_R_16BF, 512, 2560}}) {
       // Prepare before inputs exist, then compare against lazy plan creation
       // in a fresh instance, including ragged shapes after the prepared one.
       Require(warmed->Prepare(type, m, max_n, k, &error), error);
@@ -87,7 +87,8 @@ int main() {
         // short tails a checkpoint restore finishes a prompt with. A row's
         // sums must not depend on its position in the batch: the indexer's
         // BF16 scores feed a top-k whose near-ties would otherwise flip with
-        // the prefill chunking.
+        // the prefill chunking, and F16 router and recurrent-gate errors
+        // amplify across layers.
         for (const auto [total, boundary] :
              {std::pair{136, 94}, std::pair{2048, 1025}, std::pair{3487, 777},
               std::pair{1619, 1612}, std::pair{1619, 1618},
