@@ -11,7 +11,7 @@ A fork of [Gufo](https://github.com/gufo-org/gufo) for AMD Strix Halo (`gfx1151`
 - **BF16 HC inject fix.** Models that store the HC inject rows in BF16 (for example Swift 1.5 GGUFs) produced garbage for prompts of 96+ tokens; inject rows are now widened to F32 at load.
 - **Fine-tuned MTP head for Swift 1.5.** Swift ships the base model's MTP head; a head trained on Swift's own outputs raises draft acceptance by 4–6 points (+3–5 % decode) with byte-identical outputs.
 - **Serving.** `--reasoning-budget-fraction` (thinking budget as a share of `max_tokens`, with Qwen's wrap-up), model-chosen prefill budget beside active decoders, cache checkpoints that do not split long passes.
-- **Qwen3.6-35B-A3B / Ornith 1.5** (35B and 122B) with native MTP, history drafting and DFlash2 next to MTP (extension `qwen36_35b_a3b`).
+- **Qwen3.6-35B-A3B / Ornith 1.5 35B** with native MTP, history drafting and DFlash2 next to MTP (extension `qwen36_35b_a3b`).
 
 ## Results
 
