@@ -492,11 +492,16 @@ __global__ void MoeAddRmsNormKernel(const ExpertT* expert_out,
     float sh[8], rv[8];
     Load8(shared_out + t * dim + i, sh);
     Load8(r + i, rv);
+    // Pinned to ROCm 7.2's code: each residual is fma(g, shared, experts)
+    // plus the old residual, and the square sum runs in the order 7.2 chose.
+    // ROCm 10.1 reassociates both, which changed Ornith's greedy output.
 #pragma unroll
-    for (int x = 0; x < 8; ++x) {
-      rv[x] += acc[x] + g * sh[x];
-      ss += rv[x] * rv[x];
-    }
+    for (int x = 0; x < 8; ++x)
+      rv[x] = __fadd_rn(__fmaf_rn(g, sh[x], acc[x]), rv[x]);
+    constexpr int kSquareOrder[8] = {7, 3, 5, 1, 6, 2, 4, 0};
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+      ss = __fmaf_rn(rv[kSquareOrder[j]], rv[kSquareOrder[j]], ss);
     *reinterpret_cast<float4*>(r + i) = make_float4(rv[0], rv[1], rv[2], rv[3]);
     *reinterpret_cast<float4*>(r + i + 4) =
         make_float4(rv[4], rv[5], rv[6], rv[7]);
