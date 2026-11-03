@@ -359,7 +359,7 @@ int main(int argc, char** argv) try {
       std::printf("%s-own", name);
       report("", MedianMs([&] { own(t); }, reps), 2.0 * tokens * m * k,
              Hash(y_own, bytes));
-      if (!q::BlasLt::RowIndependent(HIP_R_16BF, k))
+      if (!q::BlasLt::UsesOwnKernel(HIP_R_16BF, m, k))
         throw std::runtime_error(std::string(name) + " runs the library");
       lib(t);
       own(t);
