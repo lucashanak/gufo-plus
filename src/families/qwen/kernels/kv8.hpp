@@ -47,10 +47,31 @@ void QuantizeBlock(const float* values, std::int8_t* codes, float* scale,
   }
 }
 
-#if defined(ENGINE_ENABLE_HIP)
-/// f16(scale * code) as a float.
-__device__ __forceinline__ float Value(std::int32_t code, float scale) {
-  return __half2float(__float2half_rn(scale * static_cast<float>(code)));
+#if defined(ENGINE_ENABLE_HIP) && defined(__HIP__)
+/// Four codes (one 32-bit word) as two packed F16 pairs f16(scale * code).
+/// The F16 word 0x64XX is 1024 + XX, so a code with its sign bit flipped
+/// becomes exactly 1152 + code; one packed subtraction recovers the code and
+/// one packed multiply rounds its exact product with the scale once.
+__device__ __forceinline__ uint2 DequantWord(std::uint32_t word, __half scale) {
+  using Half2 = _Float16 __attribute__((ext_vector_type(2)));
+  const auto s = __builtin_bit_cast(_Float16, scale);
+  const Half2 scales = {s, s};
+  const Half2 bias = {static_cast<_Float16>(1152.0F),
+                      static_cast<_Float16>(1152.0F)};
+  const std::uint32_t flipped = word ^ 0x80808080U;
+  std::uint32_t out[2];
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    // Bytes 2i and 2i + 1 of the word, each under an 0x64 byte.
+    const std::uint32_t bits = __builtin_amdgcn_perm(
+        0x64646464U, flipped, i != 0 ? 0x04030402U : 0x04010400U);
+    Half2 value = __builtin_bit_cast(Half2, bits) - bias;
+    // Keep the exact subtraction apart from the rounded product.
+    asm volatile("" : "+v"(value));
+    value = value * scales;
+    out[i] = __builtin_bit_cast(std::uint32_t, value);
+  }
+  return make_uint2(out[0], out[1]);
 }
 
 /// Four consecutive values starting at `element` (a multiple of four) of a
@@ -60,13 +81,13 @@ __device__ __forceinline__ float4 LoadFloat4(const std::uint8_t* row,
                                              std::uint32_t element) {
   const std::uint32_t word =
       *reinterpret_cast<const std::uint32_t*>(row + element);
-  const float scale = __half2float(
-      reinterpret_cast<const __half*>(row + width)[element / kBlock]);
-  const auto code = [&](unsigned shift) {
-    return static_cast<std::int32_t>(static_cast<std::int8_t>(word >> shift));
-  };
-  return make_float4(Value(code(0), scale), Value(code(8), scale),
-                     Value(code(16), scale), Value(code(24), scale));
+  const __half scale =
+      reinterpret_cast<const __half*>(row + width)[element / kBlock];
+  const uint2 packed = DequantWord(word, scale);
+  const auto lo = __builtin_bit_cast(__half2, packed.x);
+  const auto hi = __builtin_bit_cast(__half2, packed.y);
+  return make_float4(__low2float(lo), __high2float(lo), __low2float(hi),
+                     __high2float(hi));
 }
 
 /// Eight consecutive values starting at `element` (a multiple of eight) as
@@ -75,22 +96,13 @@ __device__ __forceinline__ uint4 LoadHalf8(const std::uint8_t* row,
                                            std::uint32_t width,
                                            std::uint32_t element) {
   const uint2 codes = *reinterpret_cast<const uint2*>(row + element);
-  const float scale = __half2float(
-      reinterpret_cast<const __half*>(row + width)[element / kBlock]);
-  union {
-    uint4 packed;
-    __half halves[8];
-  } out;
-#pragma unroll
-  for (unsigned i = 0; i < 8; ++i) {
-    const std::uint32_t word = i < 4 ? codes.x : codes.y;
-    const auto code = static_cast<std::int32_t>(
-        static_cast<std::int8_t>(word >> ((i % 4) * 8)));
-    out.halves[i] = __float2half_rn(scale * static_cast<float>(code));
-  }
-  return out.packed;
+  const __half scale =
+      reinterpret_cast<const __half*>(row + width)[element / kBlock];
+  const uint2 lo = DequantWord(codes.x, scale);
+  const uint2 hi = DequantWord(codes.y, scale);
+  return make_uint4(lo.x, lo.y, hi.x, hi.y);
 }
-#endif  // defined(ENGINE_ENABLE_HIP)
+#endif  // defined(ENGINE_ENABLE_HIP) && defined(__HIP__)
 
 }  // namespace gufo::hip::kv8
 
