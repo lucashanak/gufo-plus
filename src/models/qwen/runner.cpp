@@ -34,6 +34,7 @@
 #include "src/models/qwen/continuation_identity.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/hip/kv_growth.hpp"
 #include "src/models/qwen/hip/qwen_speculative_verifier.hpp"
 
 namespace gufo::models::qwen {
@@ -600,13 +601,28 @@ public:
       speculative::DFlashDraftPolicy dflash_policy =
           speculative::DFlashDraftPolicy::kAdaptive,
       std::string artifact_fingerprint = {},
-      std::string draft_artifact_fingerprint = {})
+      std::string draft_artifact_fingerprint = {},
+      std::size_t kv_cache_bytes = 0, std::size_t session_count = 1)
       : model_(std::move(model)),
         dflash_model_(std::move(dflash_model)),
         max_context_(max_context),
         speculative_options_(speculative_options),
         dflash_policy_(dflash_policy),
-        execution_policy_(hip::QwenExecutionPolicy::Production()) {
+        execution_policy_(hip::QwenExecutionPolicy::Production()),
+        kv_session_count_(std::max<std::size_t>(session_count, 1)) {
+    // Sessions back attention rows as they hold them, under one budget. The
+    // address arena (64 sessions' full planes) is reserved before any
+    // session allocates or frees: see KvPool::ReserveArena.
+    if (hip::KvPool::Supported(nullptr)) {
+      const auto& c = model_->GetConfig();
+      const std::size_t session_planes = hip::QwenGrowableKv::FullBytes(
+          2 * std::size_t{c.FullAttentionLayerCount()},
+          std::size_t{c.num_key_value_heads} * c.head_dim *
+              sizeof(std::uint16_t),
+          max_context_);
+      kv_sessions_ = std::make_shared<hip::QwenKvSessions>(kv_cache_bytes,
+                                                           64 * session_planes);
+    }
     if (!artifact_fingerprint.empty()) {
       const bool speculative = dflash_model_ != nullptr;
       persistence_ = TextRunnerPersistenceDescriptor{
@@ -637,7 +653,7 @@ public:
                 .max_draft_tokens = speculative_options_.max_draft_tokens,
                 .policy = dflash_policy_,
                 .max_copy_rows = copy_rows_},
-            &ledger),
+            &ledger, kv_sessions_),
         ledger, HipComponentCacheHooks());
     // Qwen's 256-row chunks are small. Preserve a bounded group before
     // waiting, instead of synchronizing every half-MiB range individually.
@@ -713,6 +729,21 @@ public:
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
     auto usage = hip::QwenGpuExecutor::EstimateMemoryUsage(
         model_->GetConfig(), max_context_, execution_policy_);
+    if (kv_sessions_ && kv_sessions_->budget() != 0) {
+      // Attention rows grow with the tokens held: a session claims its fixed
+      // state plus an equal share of the K/V budget, not its full context.
+      const auto& c = model_->GetConfig();
+      const std::size_t full_kv = hip::QwenGrowableKv::FullBytes(
+          2 * std::size_t{c.FullAttentionLayerCount()},
+          std::size_t{c.num_key_value_heads} * c.head_dim *
+              (execution_policy_.UsesFp16AttentionKv() ? sizeof(std::uint16_t)
+                                                       : sizeof(float)),
+          max_context_);
+      const std::size_t share = kv_sessions_->budget() / kv_session_count_;
+      usage.request_state_bytes = usage.request_state_bytes -
+                                  std::min(usage.request_state_bytes, full_kv) +
+                                  std::min(full_kv, share);
+    }
     usage.request_state_bytes += hip::QwenGpuArena::RecurrentStateBytes(
         model_->GetConfig(), execution_policy_);
     std::size_t resident_weights = model_->GetResidentBytes();
@@ -1085,6 +1116,8 @@ private:
   speculative::DFlashDraftPolicy dflash_policy_{
       speculative::DFlashDraftPolicy::kAdaptive};
   hip::QwenExecutionPolicy execution_policy_;
+  std::size_t kv_session_count_;
+  std::shared_ptr<hip::QwenKvSessions> kv_sessions_;
   /// Rows a lookup copy of a request decoding alone may verify (DFlash).
   std::uint32_t copy_rows_{static_cast<std::uint32_t>(
       hip::QwenGpuExecutor::kMaxWideVerificationRows)};
@@ -1233,7 +1266,8 @@ std::shared_ptr<ext::TextModelRunner> CreateQwenTextRunner(
   const bool speculative = dflash_model != nullptr;
   auto runner = std::make_shared<QwenTextRunner>(
       std::move(model), max_context, std::move(dflash_model),
-      speculative_options, dflash_policy, model_fingerprint, draft_fingerprint);
+      speculative_options, dflash_policy, model_fingerprint, draft_fingerprint,
+      options.kv_cache_bytes, options.session_count);
   // Each session's wide copies need a larger SSM replay ring (ResourceClaim).
   // Narrow the width until the configured sessions fit, rather than refusing
   // a session count the ordinary verifier width fits.

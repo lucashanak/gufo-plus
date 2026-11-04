@@ -603,8 +603,8 @@ struct TextRunnerOptions {
   bool enable_yarn{false};
   /// Device bytes of K/V rows all sessions may hold at once, for runners
   /// whose sessions grow their K/V with the tokens they hold (Qwen3.8
-  /// Flash-Next). Zero leaves every session its full context; other runners
-  /// ignore it.
+  /// Flash-Next and Qwen3.8-27B). Zero leaves every session its full context;
+  /// other runners ignore it.
   std::size_t kv_cache_bytes{0};
 };
 

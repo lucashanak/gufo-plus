@@ -50,6 +50,7 @@ gufo_extension_target(
     hip/decode.cpp
     hip/decode_step.cpp
     hip/executor.cpp
+    hip/kv_growth.cpp
     hip/model_loader.cpp
     hip/prefill.cpp
     hip/prefill_chunk.cpp
