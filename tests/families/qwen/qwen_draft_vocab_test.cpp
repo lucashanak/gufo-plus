@@ -109,7 +109,6 @@ int main() {
     CheckMissWindow();
     CheckCapacity();
     CheckReset();
-    CheckEligibility();
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';
     return 1;

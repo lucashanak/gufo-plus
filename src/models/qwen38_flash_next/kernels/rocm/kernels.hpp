@@ -525,9 +525,12 @@ void UnpackQGate(const float* qg, std::uint32_t qg_stride, float* q,
                  hipStream_t stream);
 
 /// Unpacks a stacked Q/gate/K/V projection, normalizes and rotates Q/K,
-/// and writes the F16 caches. Returns false for heads wider than 256.
-/// With zero query heads, packed contains only K/V and q/gate may be null.
-/// With yarn enabled, applies YaRN with its constants (see rope_scaling.hpp).
+/// and writes the 8-bit caches (kv_cache_format.hpp). Returns false for heads
+/// wider than 256 or not a multiple of kKvBlock. With zero query heads, packed
+/// contains only K/V and q/gate may be null. With yarn enabled, applies YaRN
+/// with its constants (see rope_scaling.hpp). With non-null `k_rows` and
+/// `v_rows` ([t][kv_heads*d] each, from separate K and V projections), packed
+/// rows hold only the interleaved Q/gate heads and K/V are read from those.
 bool PrepareAttention(const float* packed, std::uint32_t stride,
                       const float* q_gamma, const float* k_gamma, float* q,
                       float* gate, std::uint8_t* k_cache, std::uint8_t* v_cache,

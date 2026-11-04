@@ -739,11 +739,12 @@ void ContinuationAdapter::CopyNativeKeys(
   const bool draft = Draft(component.part);
   const auto* rows = reinterpret_cast<const __half*>(
       component.part == ContinuationPart::kKey
-          ? native.attention_[component.layer].k_cache
+          ? static_cast<const void*>(native.attention_[component.layer].k_cache)
       : component.part == ContinuationPart::kPooledKeys
-          ? native.attention_[component.layer].block_k
-      : component.part == ContinuationPart::kDraftKey ? native.mtp_.k_cache
-                                                      : native.mtp_.block_k);
+          ? static_cast<const void*>(native.attention_[component.layer].block_k)
+      : component.part == ContinuationPart::kDraftKey
+          ? static_cast<const void*>(native.mtp_.k_cache)
+          : static_cast<const void*>(native.mtp_.block_k));
   const auto* rope = draft ? native.vision_input_.rope()
                            : native.attention_[component.layer].rope;
   const auto copy = [&](__half* destination) {
