@@ -302,12 +302,13 @@ QwenDFlashGpuModel::QwenDFlashGpuModel(
       packed_weight_bytes_(packed_weight_bytes) {
   // The draft table copies head rows, so the head must be row-addressable.
   // A vocabulary with more special tokens than table rows drafts over the
-  // full head.
+  // full head. A draft created for a foreign target (CreateForTarget) has no
+  // target tokenizer and always drafts over the full head.
   const auto& config = weights_.config;
   const auto& head = weights_.output;
   const std::size_t row_bytes =
       quant::EncodedSizeBytes(head.type, config.hidden_size);
-  if (head.data == nullptr ||
+  if (target_model_ == nullptr || head.data == nullptr ||
       config.vocab_size <= speculative::kDraftVocabPrefix || row_bytes == 0 ||
       row_bytes % sizeof(std::uint32_t) != 0 ||
       quant::EncodedSizeBytes(head.type, head.num_elements) !=
@@ -326,7 +327,8 @@ QwenDFlashGpuModel::QwenDFlashGpuModel(
 }
 
 bool QwenDFlashGpuModel::InDraftSubset(tokenization::TokenId token) const {
-  return token < draft_prefix_rows_ || GetTokenizer().IsSpecialToken(token);
+  return token < draft_prefix_rows_ ||
+         (target_model_ != nullptr && GetTokenizer().IsSpecialToken(token));
 }
 
 QwenDFlashGpuModel::~QwenDFlashGpuModel() {
