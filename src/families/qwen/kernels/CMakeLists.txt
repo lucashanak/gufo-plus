@@ -78,3 +78,12 @@ set_property(
     ${CMAKE_CURRENT_SOURCE_DIR}/prefill_quant_wave64.hip
   TARGET_DIRECTORY gufo_qwen_kernels
   APPEND PROPERTY COMPILE_OPTIONS -fno-slp-vectorize)
+# ROCm 10.1's LLVM selects real 16-bit registers on gfx11. The 256x256 FP16
+# prefill GEMM then repacks the high halves of every LDS-loaded WMMA operand
+# with a shift and a 16-bit move (128 extra VALU per K step), which costs
+# 12-14 % of the 27B prefill. Packed 32-bit selection emits the same arithmetic.
+# The host compiler ignores the device feature with a notice.
+set_property(
+  SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/prefill_fp16.hip
+  TARGET_DIRECTORY gufo_qwen_kernels
+  APPEND PROPERTY COMPILE_OPTIONS "-Xclang=-target-feature;-Xclang=-real-true16")
