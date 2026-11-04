@@ -682,6 +682,9 @@ struct TextRunnerPool::Request::Impl {
   [[nodiscard]] std::size_t Aligned(std::size_t position) const noexcept {
     return position - position % alignment;
   }
+  /// The complete prompt's checkpoint: the exact prompt, which only an
+  /// unchanged retry restores (ComponentTextCache::Acquire).
+  [[nodiscard]] std::size_t PromptEnd() const noexcept { return prompt.size(); }
 
   ~Impl() {
     // The worker borrows this lease's state; join before any field is
