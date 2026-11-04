@@ -8,7 +8,7 @@
 int main() {
   using namespace gufo::hip;
   const auto production = QwenExecutionPolicy::Production();
-  assert(production.UsesFp16AttentionKv());
+  assert(production.UsesTokenMajorAttentionKv());
   assert(!production.UsesBf16RecurrentState());
   assert(QwenRecurrentStateElementBytes(QwenRecurrentStateStorage::kFp32) ==
          sizeof(float));

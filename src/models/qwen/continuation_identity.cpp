@@ -35,7 +35,7 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
         "Qwen DFlash disk cache requires a draft artifact fingerprint");
   }
   const std::string_view state_abi =
-      QwenStateAbi(speculative, execution_policy.UsesFp16AttentionKv(),
+      QwenStateAbi(speculative, execution_policy.UsesTokenMajorAttentionKv(),
                    execution_policy.UsesBf16RecurrentState());
   std::ostringstream identity;
   identity << "schema=gufo-text-continuation-v2\n"
@@ -46,7 +46,9 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
            << "chat_template=qwen38-reasoning-compiled-v3\n"
            << "chat_template_reference_sha256="
            << tokenization::QwenChatTemplate::OfficialTemplateSha256() << '\n'
-           << "state_abi=" << state_abi << "-component-v2\n"
+           << "state_abi=" << state_abi
+           << (execution_policy.UsesQ8AttentionKv() ? "-kv8" : "")
+           << "-component-v2\n"
            << "payload_layout=qwen-component-v2\n"
            << "checkpoint_frontier=complete-prefix-v1\n"
            << "numerics=qwen-bf16-fp32-prefill-v1\n"
@@ -57,7 +59,10 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
            << "attention_split_count="
            << hip::detail::kSplitKDecodeAttentionMaxSplits << '\n'
            << "kv_storage="
-           << (execution_policy.UsesFp16AttentionKv() ? "fp16" : "fp32") << '\n'
+           << (execution_policy.UsesQ8AttentionKv()           ? "q8-block16-f16"
+               : execution_policy.UsesTokenMajorAttentionKv() ? "fp16"
+                                                              : "fp32")
+           << '\n'
            << "recurrent_storage="
            << (execution_policy.UsesBf16RecurrentState() ? "bf16" : "fp32")
            << '\n'

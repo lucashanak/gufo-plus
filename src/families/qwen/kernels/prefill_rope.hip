@@ -187,14 +187,19 @@ void LaunchBatchedFusedQKNormRoPEKvWrite(
     std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim,
     std::uint32_t rotary_dim, float rope_theta, float eps, hipStream_t stream,
-    const models::qwen::vision::DeviceRope* rope) {
+    const models::qwen::vision::DeviceRope* rope, bool kv8) {
   const dim3 grid(num_heads + num_kv_heads,
                   static_cast<unsigned int>(batch_size));
   BatchedFusedQKNormRoPEKvWriteKernel<<<grid, 256, 0, stream>>>(
       q, k, v, q_weight, k_weight, q_out, k_out, k_cache, v_cache,
-      static_cast<__half*>(k_cache_f16), static_cast<__half*>(v_cache_f16),
-      layer_idx, start_pos, batch_size, max_context, num_heads, num_kv_heads,
-      head_dim, rotary_dim, rope_theta, eps, rope);
+      kv8 ? nullptr : static_cast<__half*>(k_cache_f16),
+      kv8 ? nullptr : static_cast<__half*>(v_cache_f16), layer_idx, start_pos,
+      batch_size, max_context, num_heads, num_kv_heads, head_dim, rotary_dim,
+      rope_theta, eps, rope);
+  if (kv8)
+    LaunchStoreKv8(k_out, v, k_cache_f16, v_cache_f16, layer_idx, start_pos,
+                   nullptr, batch_size, max_context, num_kv_heads * head_dim,
+                   stream);
 }
 
 __global__ void BatchedRoPEKernel(

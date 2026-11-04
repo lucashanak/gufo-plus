@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <span>
@@ -588,6 +589,15 @@ const QwenTextRunnerState& RequireQwenState(const TextRunnerState& state) {
 // `ext::DeviceProbe` (RFC step 6); the probe holds its buffer and private
 // stream from construction, with the 5 s bound the scheduler expects.
 
+// GUFO_QWEN_KV8=1 keeps the 27B's attention K/V in 8-bit rows.
+hip::QwenExecutionPolicy QwenServingPolicy() {
+  auto policy = hip::QwenExecutionPolicy::Production();
+  const char* kv8 = std::getenv("GUFO_QWEN_KV8");
+  if (kv8 != nullptr && std::string_view(kv8) == "1")
+    policy.kv_cache_storage = hip::QwenKvCacheStorage::kQ8;
+  return policy;
+}
+
 // === RUNNER ===
 class QwenTextRunner final : public HipTextModelRunner {
 public:
@@ -608,7 +618,7 @@ public:
         max_context_(max_context),
         speculative_options_(speculative_options),
         dflash_policy_(dflash_policy),
-        execution_policy_(hip::QwenExecutionPolicy::Production()),
+        execution_policy_(QwenServingPolicy()),
         kv_session_count_(std::max<std::size_t>(session_count, 1)) {
     // Sessions back attention rows as they hold them, under one budget. The
     // address arena (64 sessions' full planes) is reserved before any
@@ -698,11 +708,12 @@ public:
     const bool speculative_enabled = dflash_model_ != nullptr;
     return {
         .model_id = model_->GetConfig().model_name,
-        .state_abi =
-            std::string(QwenStateAbi(
-                speculative_enabled, execution_policy_.UsesFp16AttentionKv(),
-                execution_policy_.UsesBf16RecurrentState())) +
-            "-component-v2",
+        .state_abi = std::string(QwenStateAbi(
+                         speculative_enabled,
+                         execution_policy_.UsesTokenMajorAttentionKv(),
+                         execution_policy_.UsesBf16RecurrentState())) +
+                     (execution_policy_.UsesQ8AttentionKv() ? "-kv8" : "") +
+                     "-component-v2",
         .max_context = max_context_,
         .capabilities =
             TextRunnerCapabilities{
@@ -735,9 +746,8 @@ public:
       const auto& c = model_->GetConfig();
       const std::size_t full_kv = hip::QwenGrowableKv::FullBytes(
           2 * std::size_t{c.FullAttentionLayerCount()},
-          std::size_t{c.num_key_value_heads} * c.head_dim *
-              (execution_policy_.UsesFp16AttentionKv() ? sizeof(std::uint16_t)
-                                                       : sizeof(float)),
+          execution_policy_.AttentionKvRowBytes(
+              std::size_t{c.num_key_value_heads} * c.head_dim),
           max_context_);
       const std::size_t share = kv_sessions_->budget() / kv_session_count_;
       usage.request_state_bytes = usage.request_state_bytes -

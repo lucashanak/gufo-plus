@@ -18,7 +18,8 @@ void LaunchVerifySplitKAttentionHalfPartialsWave64(
     const float* q, const __half* k_cache, const __half* v_cache,
     float* scratch, std::uint32_t layer_idx, std::uint32_t start_pos,
     unsigned rows, std::uint32_t max_context, std::uint32_t num_heads,
-    std::uint32_t num_kv_heads, std::uint32_t splits, hipStream_t stream);
+    std::uint32_t num_kv_heads, std::uint32_t splits, hipStream_t stream,
+    bool kv8 = false);
 
 }  // namespace gufo::hip::detail
 #endif  // defined(ENGINE_ENABLE_HIP)
