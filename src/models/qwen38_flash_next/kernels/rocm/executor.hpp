@@ -799,7 +799,11 @@ private:
   /// Releases backed K/V rows past what idle sessions hold until `want`
   /// bytes are free or none are left. Returns the bytes released.
   std::size_t ReleaseIdleKv(std::size_t want,
-                            std::span<Session* const> busy) const;
+                            std::span<Session* const> busy,
+                            std::size_t* kept = nullptr) const;
+  /// One line per registered session (position, mapped K/V MiB, busy) for
+  /// the K/V exhaustion error.
+  [[nodiscard]] std::string KvHolders(std::span<Session* const> busy) const;
   void Unregister(const Session* session) const;
 
   const DeviceModel* model_{nullptr};

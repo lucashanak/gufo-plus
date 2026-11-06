@@ -1817,14 +1817,17 @@ bool Executor::ReserveKv(Session& session, std::uint32_t rows,
     return false;
   std::vector<Session*> keep(busy.begin(), busy.end());
   keep.push_back(&session);
+  std::size_t kept = 0;
   if (kv_pool_->Available() < growth)
-    (void)ReleaseIdleKv(growth - kv_pool_->Available(), keep);
+    (void)ReleaseIdleKv(growth - kv_pool_->Available(), keep, &kept);
   if (kv_pool_->Available() < growth) {
     AssignError(error_msg, "K/V memory exhausted: " + std::to_string(growth) +
                                " more bytes needed, " +
                                std::to_string(kv_pool_->mapped()) + " of " +
                                std::to_string(kv_pool_->budget()) +
-                               " budgeted bytes in use");
+                               " budgeted bytes in use; idle sessions kept " +
+                               std::to_string(kept) + "; holders " +
+                               KvHolders(keep));
     return false;
   }
   return plan([&](GrowableRows& buffer, std::size_t want) {
@@ -1837,8 +1840,28 @@ bool Executor::ReserveKv(Session& session, std::uint32_t rows,
   });
 }
 
+std::string Executor::KvHolders(std::span<Session* const> busy) const {
+  const std::lock_guard lock(sessions_mutex_);
+  std::string out;
+  for (const auto* session : sessions_) {
+    std::size_t bytes = 0;
+    if (session->kv_) {
+      for (const auto& buffer : session->kv_->target)
+        bytes += buffer.mapped_bytes();
+      for (const auto& buffer : session->kv_->draft)
+        bytes += buffer.mapped_bytes();
+    }
+    out += "[pos=" + std::to_string(session->position_) +
+           " mib=" + std::to_string(bytes >> 20) +
+           (std::ranges::find(busy, session) != busy.end() ? " busy" : "") +
+           "]";
+  }
+  return out;
+}
+
 std::size_t Executor::ReleaseIdleKv(std::size_t want,
-                                    std::span<Session* const> busy) const {
+                                    std::span<Session* const> busy,
+                                    std::size_t* kept) const {
   // Held throughout: a session being destroyed elsewhere waits in Unregister.
   const std::lock_guard lock(sessions_mutex_);
   const auto& c = config();
@@ -1881,6 +1904,8 @@ std::size_t Executor::ReleaseIdleKv(std::size_t want,
       }
       session->PreserveSnapshots(rows, draft_rows);
     } catch (const std::exception&) {
+      if (kept != nullptr)
+        ++*kept;
       continue;  // a pending transfer or failed slot keeps its rows
     }
     if (!drained) {
