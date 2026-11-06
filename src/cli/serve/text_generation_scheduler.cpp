@@ -160,6 +160,17 @@ struct ScheduledRequest {
   std::atomic<std::size_t> live_generated_tokens{0};
   std::exception_ptr failure;
   bool terminal{false};
+  // A request that found the model's K/V budget full while peers held it
+  // waits for a peer to finish instead of failing. Admission keeps the
+  // prompt so the request can be admitted again. Only the scheduler thread
+  // touches these.
+  std::vector<TextRunnerToken> retry_prompt;
+  std::shared_ptr<const TextPromptContext> retry_prompt_context;
+  std::exception_ptr kv_failure;
+  bool kv_waiting{false};
+  std::uint64_t kv_wait_epoch{0};
+  std::size_t kv_retries{0};
+  std::optional<TextGenerationScheduler::Clock::time_point> kv_wait_start;
 
   ~ScheduledRequest() {
     // A completed stream may be discarded without ever consuming its output.
@@ -204,6 +215,21 @@ void EndPublicationWait(const std::shared_ptr<ScheduledRequest>& request,
   } catch (...) {
     // Observability cannot prevent cancellation or failure completion.
   }
+}
+
+/// True for a model's K/V budget refusal, which another request finishing
+/// can resolve. Every engine reports it with the same message prefix.
+bool IsKvExhausted(const std::exception_ptr& failure) noexcept {
+  if (failure == nullptr)
+    return false;
+  try {
+    std::rethrow_exception(failure);
+  } catch (const std::exception& error) {
+    return std::string_view(error.what()).find("K/V memory exhausted") !=
+           std::string_view::npos;
+  } catch (...) {
+  }
+  return false;
 }
 
 bool IsTerminal(const std::shared_ptr<ScheduledRequest>& request) noexcept {
@@ -807,6 +833,7 @@ struct TextGenerationScheduler::Impl {
         request->result.cache_disk_enqueue_ms = retained.disk_enqueue_ms;
       }
       request->result.cancelled = true;
+      ++finished_requests;
       FinalizeResult(request, TextGenerationBackend::FinishReason::kCancelled);
       LogDecodeProgress(request, true);
       RecordRequestMetrics(request->result);
@@ -822,6 +849,7 @@ struct TextGenerationScheduler::Impl {
     EndPublicationWait(request, "failed");
     if (IsTerminal(request))
       return;
+    ++finished_requests;
     if (!classified)
       failure = ClassifyFailure(std::move(failure));
     if (request->runner_request) {
@@ -987,6 +1015,7 @@ struct TextGenerationScheduler::Impl {
     request->result.cache_shared_prefix_bytes =
         cache_commit.shared_prefix_bytes;
     request->result.cache_shared_prefix_ms = cache_commit.shared_prefix_ms;
+    ++finished_requests;
     FinalizeResult(request, finish_reason);
     LogDecodeProgress(request, true);
     // Recorded here rather than by the HTTP adapter, so a client that leaves
@@ -1107,12 +1136,35 @@ struct TextGenerationScheduler::Impl {
 
   /// Drops stopped parked requests and releases settled ones in arrival
   /// order. Released requests are admitted before newer queued ones.
-  void UpdateWaiting(std::deque<std::shared_ptr<ScheduledRequest>>& waiting) {
+  void UpdateWaiting(std::deque<std::shared_ptr<ScheduledRequest>>& waiting,
+                     std::size_t residents) {
+    bool kv_released = false;
     for (auto it = waiting.begin(); it != waiting.end();) {
       const auto& request = *it;
       if (CompleteIfStopped(request)) {
         it = waiting.erase(it);
         continue;
+      }
+      if (request->kv_waiting) {
+        // A peer finished (or none is left): retry the oldest refused
+        // request. Later ones wait for the next peer to finish.
+        if (kv_released) {
+          request->kv_wait_epoch = finished_requests;
+        } else if (residents == 0 ||
+                   request->kv_wait_epoch != finished_requests) {
+          request->kv_waiting = false;
+          kv_released = true;
+          if (Logger::Enabled(LogLevel::kInfo)) {
+            std::ostringstream line;
+            line << "event=kv_wait_ready id=" << request->id
+                 << " retries=" << request->kv_retries
+                 << " residents=" << residents << " wait_ms="
+                 << std::chrono::duration<double, std::milli>(
+                        Clock::now() - *request->kv_wait_start)
+                        .count();
+            Logger::Info("scheduler", line.str());
+          }
+        }
       }
       if (request->prefix_leader && SharedPrefixSettled(request)) {
         const double wait_ms = std::chrono::duration<double, std::milli>(
@@ -1169,7 +1221,7 @@ struct TextGenerationScheduler::Impl {
     const auto released =
         std::ranges::find_if(waiting, [](const auto& request) {
           return request->prefix_leader == nullptr &&
-                 !request->publication_waiting;
+                 !request->publication_waiting && !request->kv_waiting;
         });
     if (released == waiting.end())
       return {};
@@ -1183,7 +1235,8 @@ struct TextGenerationScheduler::Impl {
              std::deque<std::shared_ptr<ScheduledRequest>>& capturing,
              std::deque<std::shared_ptr<ScheduledRequest>>& waiting,
              const std::stop_token& stop_token) {
-    UpdateWaiting(waiting);
+    UpdateWaiting(waiting, prefilling.size() + decoding.size() +
+                               capturing.size());
     const std::array<const std::deque<std::shared_ptr<ScheduledRequest>>*, 2>
         residents{&prefilling, &capturing};
     // Captures retain their runner lease until decoding resumes.
@@ -1198,6 +1251,12 @@ struct TextGenerationScheduler::Impl {
         if (prefilling.size() + decoding.size() + capturing.size() +
                 waiting.size() >=
             runner_pool->capacity())
+          return;
+        // A request refused by the K/V budget goes first: a new arrival
+        // would take the rows it waits for.
+        if (std::ranges::any_of(waiting, [](const auto& parked) {
+              return parked->kv_waiting;
+            }))
           return;
         request = PopQueued();
       }
@@ -1228,6 +1287,10 @@ struct TextGenerationScheduler::Impl {
           }
         }
 
+        if (request->retry_prompt.empty()) {
+          request->retry_prompt = request->prompt;
+          request->retry_prompt_context = request->prompt_context;
+        }
         const std::weak_ptr<ScheduledRequest> weak_request = request;
         request->runner_request = runner_pool->Acquire(
             std::move(request->prompt), request->sampling,
@@ -1295,9 +1358,62 @@ struct TextGenerationScheduler::Impl {
           prefilling.insert(next, std::move(request));
         }
       } catch (...) {
-        CompleteFailure(request, std::current_exception());
+        const auto failure = std::current_exception();
+        if (!IsKvExhausted(failure) ||
+            !DeferForKv(request,
+                        prefilling.size() + decoding.size() + capturing.size(),
+                        waiting))
+          CompleteFailure(request, failure);
       }
     }
+  }
+
+  /// Parks a request the K/V budget refused while `peers` other requests
+  /// hold it. It is admitted again from its prompt once one of them
+  /// finishes; without a peer the refusal is final. Retained prefixes make
+  /// the retry cheap.
+  [[nodiscard]] bool DeferForKv(
+      const std::shared_ptr<ScheduledRequest>& request, std::size_t peers,
+      std::deque<std::shared_ptr<ScheduledRequest>>& waiting) noexcept {
+    if (peers == 0 || IsTerminal(request) || request->retry_prompt.empty() ||
+        !request->result.tokens.empty())
+      return false;
+    try {
+      request->runner_request.Invalidate();
+      request->prompt = request->retry_prompt;
+      request->prompt_context = request->retry_prompt_context;
+      request->kv_waiting = true;
+      request->kv_wait_epoch = finished_requests;
+      ++request->kv_retries;
+      if (!request->kv_wait_start)
+        request->kv_wait_start = Clock::now();
+      request->result.prefill_tokens = 0;
+      request->result.prefill_ms = 0.0;
+      request->result.prefill_chunks = 0;
+      request->live_prefill_tokens.store(0, std::memory_order_relaxed);
+      request->phase.store(TextRequestPhase::kQueued,
+                           std::memory_order_release);
+      if (Logger::Enabled(LogLevel::kInfo)) {
+        std::ostringstream line;
+        line << "event=kv_wait id=" << request->id
+             << " retries=" << request->kv_retries << " peers=" << peers
+             << " prompt_tokens=" << request->prompt.size();
+        Logger::Info("scheduler", line.str());
+      }
+      waiting.push_back(request);
+      return true;
+    } catch (...) {
+      return false;
+    }
+  }
+
+  /// Settles a prefill step the K/V budget refused: park or fail it.
+  void SettleKvFailure(const std::shared_ptr<ScheduledRequest>& request,
+                       std::size_t peers,
+                       std::deque<std::shared_ptr<ScheduledRequest>>& waiting) {
+    auto failure = std::exchange(request->kv_failure, nullptr);
+    if (!DeferForKv(request, peers, waiting))
+      CompleteFailure(request, std::move(failure));
   }
 
   void StepPrefill(const std::shared_ptr<ScheduledRequest>& request,
@@ -1361,7 +1477,12 @@ struct TextGenerationScheduler::Impl {
     } catch (...) {
       const auto failure = std::current_exception();
       if (!CompleteIfStopped(request)) {
-        CompleteFailure(request, failure);
+        // The caller knows whether peers hold the budget.
+        if (IsKvExhausted(failure) && request->result.tokens.empty() &&
+            !request->retry_prompt.empty())
+          request->kv_failure = failure;
+        else
+          CompleteFailure(request, failure);
       }
     }
   }
@@ -2071,7 +2192,12 @@ struct TextGenerationScheduler::Impl {
         auto request = std::move(prefilling.front());
         prefilling.pop_front();
         StepPrefill(request, true);
-        if (!IsTerminal(request)) {
+        if (request->kv_failure) {
+          SettleKvFailure(request,
+                          prefilling.size() + decoding.size() +
+                              capturing.size(),
+                          waiting);
+        } else if (!IsTerminal(request)) {
           if (request->runner_request.SnapshotPending()) {
             capturing.push_back(std::move(request));
           } else if (request->runner_request.prefill_complete()) {
@@ -2124,7 +2250,11 @@ struct TextGenerationScheduler::Impl {
                    prefill_policy.decode_active_tokens;
           });
       StepPrefill(request, false, !capturing.empty() || short_peer_waiting);
-      if (!IsTerminal(request)) {
+      if (request->kv_failure) {
+        SettleKvFailure(request,
+                        prefilling.size() + decoding.size() + capturing.size(),
+                        waiting);
+      } else if (!IsTerminal(request)) {
         if (request->runner_request.SnapshotPending()) {
           capturing.push_back(std::move(request));
         } else if (request->runner_request.prefill_complete()) {
@@ -2164,6 +2294,9 @@ struct TextGenerationScheduler::Impl {
   std::vector<std::shared_ptr<ScheduledRequest>> device_lost_requests;
   std::size_t consecutive_active_prefill_chunks{0};
   std::uint64_t last_prefill_request_id{0};
+  // Requests that reached a terminal state; a K/V-refused request waits for
+  // this to advance. Only the scheduler thread touches it.
+  std::uint64_t finished_requests{0};
   std::atomic<std::uint64_t> next_request_id{1};
   // Written by the scheduler thread and read by the stall monitor. `progress`
   // advances when a request is admitted, a work unit starts, a pending
