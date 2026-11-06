@@ -1362,27 +1362,35 @@ struct TextGenerationScheduler::Impl {
         if (!IsKvExhausted(failure) ||
             !DeferForKv(request,
                         prefilling.size() + decoding.size() + capturing.size(),
-                        waiting))
+                        waiting, failure))
           CompleteFailure(request, failure);
       }
     }
   }
 
-  /// Parks a request the K/V budget refused while `peers` other requests
-  /// hold it. It is admitted again from its prompt once one of them
-  /// finishes; without a peer the refusal is final. Retained prefixes make
-  /// the retry cheap.
+  /// Settles a request the K/V budget refused. Idle cached conversations
+  /// hold device rows until their slot is reused, so first reset those and
+  /// retry at once; otherwise park it while `peers` other requests hold the
+  /// budget, and admit it again from its prompt once one of them finishes.
+  /// Without either the refusal is final. Retained prefixes make the retry
+  /// cheap.
   [[nodiscard]] bool DeferForKv(
       const std::shared_ptr<ScheduledRequest>& request, std::size_t peers,
-      std::deque<std::shared_ptr<ScheduledRequest>>& waiting) noexcept {
-    if (peers == 0 || IsTerminal(request) || request->retry_prompt.empty() ||
+      std::deque<std::shared_ptr<ScheduledRequest>>& waiting,
+      const std::exception_ptr& failure) noexcept {
+    if (IsTerminal(request) || request->retry_prompt.empty() ||
         !request->result.tokens.empty())
       return false;
     try {
+      // The refused request's own slot is reset once it is invalidated.
       request->runner_request.Invalidate();
+      const bool immediate = request->kv_retries < kKvImmediateRetries &&
+                             runner_pool->ReleaseIdleStates() > 0;
+      if (!immediate && peers == 0)
+        return false;
       request->prompt = request->retry_prompt;
       request->prompt_context = request->retry_prompt_context;
-      request->kv_waiting = true;
+      request->kv_waiting = !immediate;
       request->kv_wait_epoch = finished_requests;
       ++request->kv_retries;
       if (!request->kv_wait_start)
@@ -1395,9 +1403,18 @@ struct TextGenerationScheduler::Impl {
                            std::memory_order_release);
       if (Logger::Enabled(LogLevel::kInfo)) {
         std::ostringstream line;
+        std::string reason;
+        try {
+          std::rethrow_exception(failure);
+        } catch (const std::exception& error) {
+          reason = error.what();
+        } catch (...) {
+        }
         line << "event=kv_wait id=" << request->id
              << " retries=" << request->kv_retries << " peers=" << peers
-             << " prompt_tokens=" << request->prompt.size();
+             << " immediate=" << immediate
+             << " prompt_tokens=" << request->prompt.size()
+             << " reason=" << reason;
         Logger::Info("scheduler", line.str());
       }
       waiting.push_back(request);
@@ -1412,7 +1429,7 @@ struct TextGenerationScheduler::Impl {
                        std::size_t peers,
                        std::deque<std::shared_ptr<ScheduledRequest>>& waiting) {
     auto failure = std::exchange(request->kv_failure, nullptr);
-    if (!DeferForKv(request, peers, waiting))
+    if (!DeferForKv(request, peers, waiting, failure))
       CompleteFailure(request, std::move(failure));
   }
 
@@ -2297,6 +2314,9 @@ struct TextGenerationScheduler::Impl {
   // Requests that reached a terminal state; a K/V-refused request waits for
   // this to advance. Only the scheduler thread touches it.
   std::uint64_t finished_requests{0};
+  // Retries right after resetting idle states; later refusals wait for a
+  // peer to finish.
+  static constexpr std::size_t kKvImmediateRetries = 3;
   std::atomic<std::uint64_t> next_request_id{1};
   // Written by the scheduler thread and read by the stall monitor. `progress`
   // advances when a request is admitted, a work unit starts, a pending

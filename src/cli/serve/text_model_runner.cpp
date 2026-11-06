@@ -2247,6 +2247,10 @@ std::optional<TextPendingPublication> TextRunnerPool::PendingPublication(
                                 : std::nullopt;
 }
 
+std::size_t TextRunnerPool::ReleaseIdleStates() {
+  return impl_->component_cache ? impl_->component_cache->ReleaseIdle() : 0;
+}
+
 std::size_t TextRunnerPool::CachedPrefixTokens(
     std::span<const TextRunnerToken> prompt,
     const TextPromptContext* context) const {

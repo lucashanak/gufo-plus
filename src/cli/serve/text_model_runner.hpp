@@ -182,6 +182,9 @@ public:
   [[nodiscard]] std::size_t CachedPrefixTokens(
       std::span<const TextRunnerToken> prompt,
       const TextPromptContext* context) const;
+  /// Resets idle component-cache states so their device rows can be freed
+  /// (see ComponentTextCache::ReleaseIdle). Zero without a component cache.
+  std::size_t ReleaseIdleStates();
   /// A disk job is still writing a prefix of prompt much deeper than any
   /// restorable checkpoint; admission may wait for it instead of prefilling.
   [[nodiscard]] std::optional<TextPendingPublication> PendingPublication(

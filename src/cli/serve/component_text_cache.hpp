@@ -93,6 +93,10 @@ public:
   [[nodiscard]] std::size_t CachedPrefixTokens(
       std::span<const ContinuationToken>, const TextPromptContext*,
       bool common = false) const;
+  /// Resets every idle slot used since its last reset, dropping its live
+  /// frontier, so the model can release the device rows it holds. Retained
+  /// checkpoints still restore those conversations. Returns the slots reset.
+  std::size_t ReleaseIdle();
   [[nodiscard]] std::size_t capacity() const noexcept;
 
 private:

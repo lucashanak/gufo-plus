@@ -178,6 +178,8 @@ struct ComponentTextCache::Impl {
     // Acquisition order; cold assignment replaces the oldest live frontier.
     std::uint64_t used{};
     bool busy{};
+    // Leased since its last reset, so the model may still hold its rows.
+    bool holds_rows{};
   };
   std::shared_ptr<TextModelRunner> runner;
   cache::ResourceLedger ledger;
@@ -1098,6 +1100,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     if (!entry)
       throw cache::SlotBusy();
     entry->busy = true;
+    entry->holds_rows = true;
     entry->used = ++impl_->clock;
     if (!live) {
       entry->branch = std::make_shared<const std::uint8_t>(0);
@@ -1378,6 +1381,48 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     }
     throw;
   }
+}
+
+std::size_t ComponentTextCache::ReleaseIdle() {
+  std::vector<Impl::Entry*> targets;
+  std::size_t frontiers = 0;
+  {
+    const std::lock_guard lock(impl_->mutex);
+    for (auto& entry : impl_->entries) {
+      if (entry->busy || !entry->holds_rows)
+        continue;
+      entry->busy = true;
+      entry->holds_rows = false;
+      if (entry->live) {
+        impl_->index.Erase(*entry->live);
+        entry->live.reset();
+        entry->live_tokens.clear();
+        ++frontiers;
+      }
+      entry->branch.reset();
+      entry->durable.reset();
+      targets.push_back(entry.get());
+    }
+  }
+  std::size_t reset = 0;
+  for (auto* entry : targets) {
+    try {
+      // A cold acquisition resets the slot; releasing the lease uncommitted
+      // leaves it invalid until the next request restores into it.
+      { auto slot = entry->slot->Acquire(); }
+      entry->history.reset();
+      ++reset;
+    } catch (...) {
+      // The slot stays as it was; a later request reassigns it.
+    }
+    const std::lock_guard lock(impl_->mutex);
+    entry->busy = false;
+  }
+  if (!targets.empty())
+    Logger::Info("cache", "schema=component-cache-v1 event=release_idle slots=" +
+                              std::to_string(reset) + " frontiers=" +
+                              std::to_string(frontiers));
+  return reset;
 }
 
 std::optional<TextPendingPublication> ComponentTextCache::PendingPublication(
