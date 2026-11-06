@@ -1397,6 +1397,37 @@ HttpResponse AnthropicCountTokens(const HttpRequest& req,
              "invalid_prompt");
 }
 
+// The prompt a Messages request renders to, without generating: the
+// Messages counterpart of /apply-template, for checking cache prefixes.
+HttpResponse AnthropicRender(const HttpRequest& req,
+                             TextGenerationBackend& b) try {
+  json::Value body;
+  try {
+    body = json::parse(req.body);
+  } catch (const std::exception& e) {
+    return Err(400, "Bad Request", e.what(), "invalid_request_error",
+               "parse_error");
+  }
+  ChatRequest chat;
+  std::size_t max_tokens = 0;
+  sampling::SamplingConfig sampling_config;
+  if (auto error =
+          ReadAnthropicChat(body, b, &chat, &max_tokens, &sampling_config))
+    return std::move(*error);
+  auto prompt = b.render_chat_prompt(chat);
+  if (!prompt)
+    return NotImplemented(req, b);
+  json::Value resp = json::Value::object();
+  resp["prompt"] = std::move(*prompt);
+  return Ok(resp);
+} catch (const std::length_error& error) {
+  return Err(400, "Bad Request", error.what(), "invalid_request_error",
+             "context_length_exceeded");
+} catch (const std::invalid_argument& error) {
+  return Err(400, "Bad Request", error.what(), "invalid_request_error",
+             "invalid_prompt");
+}
+
 HttpResponse LlamaCompletion(const HttpRequest& req,
                              TextGenerationBackend& b) try {
   json::Value body;
@@ -1955,6 +1986,7 @@ void HttpServer::register_routes() {
   // ---- Anthropic ----
   add("POST", "/v1/messages", AnthropicMessages);
   add("POST", "/v1/messages/count_tokens", AnthropicCountTokens);
+  add("POST", "/v1/messages/render", AnthropicRender);
 
   // ---- llama-server ----
   add("POST", "/v1/rerank", NotImplemented);
