@@ -72,6 +72,7 @@ endif()
 gufo_extension_target(
   NAME gufo_qwen36_35b_a3b_hip
   SOURCES
+    continuation_adapter.cpp
     kernels/rocm/blaslt.cpp
     kernels/rocm/device_model.cpp
     kernels/rocm/executor.cpp
