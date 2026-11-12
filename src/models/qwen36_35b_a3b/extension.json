@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "qwen36_35b_a3b",
   "version": "0.1.0",
-  "api_version": ">= 0.1.0",
+  "api_version": ">= 0.3.0",
   "entry": "qwen36_35b_a3b_register",
   "registration_target": "gufo_qwen36_35b_a3b",
   "depends": [
