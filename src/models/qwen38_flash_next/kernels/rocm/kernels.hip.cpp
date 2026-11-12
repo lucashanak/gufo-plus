@@ -1733,26 +1733,6 @@ __device__ __forceinline__ float GdnLastUpdate(float state, float decay,
   return value;
 }
 
-/// The recurrent state an in-pass checkpoint ending after `rows` rows of
-/// the pass receives, or null.
-__device__ __forceinline__ float* CheckpointState(const GdnCheckpoint& c,
-                                                  std::uint32_t rows) {
-  for (std::uint32_t i = 0; i < c.count; ++i)
-    if (c.tokens[i] == rows)
-      return c.state[i];
-  return nullptr;
-}
-
-/// True when pass row `tok` is one of the three raw rows before an in-pass
-/// checkpoint, which its convolution history copies.
-__device__ __forceinline__ bool CheckpointHistoryRow(const PassCheckpoints& c,
-                                                     std::size_t tok) {
-  for (std::uint32_t i = 0; i < c.count; ++i)
-    if (tok < c.tokens[i] && tok + 3 >= c.tokens[i])
-      return true;
-  return false;
-}
-
 template<bool kBatch>
 __global__ void GdnKernel(const float* conv_out, const float* qn,
                           const float* kn, const float* alpha_beta,
