@@ -263,13 +263,11 @@ public:
   }
   QwenMoeTextRunner(
       std::shared_ptr<typename Traits::Model> model, std::uint32_t max_context,
-      bool use_mtp, std::uint32_t max_draft_tokens,
-      std::optional<TextRunnerPersistenceDescriptor> persistence = std::nullopt)
+      bool use_mtp, std::uint32_t max_draft_tokens)
       : model_(std::move(model)),
         max_context_(max_context),
         use_mtp_(use_mtp),
-        max_draft_tokens_(max_draft_tokens),
-        persistence_(std::move(persistence)) {}
+        max_draft_tokens_(max_draft_tokens) {}
 
   // TODO(fork): the Qwen3.6 component-cache adapter replaces the native
   // snapshots upstream v0.34 removed; until it lands this runner cannot load.
@@ -399,7 +397,7 @@ public:
     return model_->tokenizer().Decode(tokens);
   }
 
-  [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
+  [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const {
     return std::make_unique<QwenMoeTextRunnerState<Traits>>(
         model_, max_context_, use_mtp_);
   }
@@ -641,7 +639,6 @@ private:
   std::uint32_t max_context_;
   bool use_mtp_;
   std::uint32_t max_draft_tokens_;
-  std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
 
 using Qwen36TextRunner = QwenMoeTextRunner<Qwen36RunnerTraits>;
@@ -729,32 +726,8 @@ std::shared_ptr<ext::TextModelRunner> CreateQwen36TextRunner(
   if (use_mtp && !model->HasMtp())
     return fail(
         "Qwen3.6-35B-A3B MTP requires a model loaded with its MTP block");
-  std::optional<TextRunnerPersistenceDescriptor> persistence;
-  if (!options.disk_cache.directory.empty()) {
-    std::string fingerprint = options.disk_cache.model_artifact_fingerprint;
-    if (fingerprint.empty()) {
-      try {
-        fingerprint = core::GgufIdentityHex(*reader);
-      } catch (const std::exception& e) {
-        return fail(
-            std::string("Qwen3.6-35B-A3B disk cache fingerprinting failed: ") +
-            e.what());
-      }
-    }
-    try {
-      persistence = TextRunnerPersistenceDescriptor{
-          .compatibility_identity = Qwen36CompatibilityIdentity(
-              fingerprint, use_mtp, max_context, speculative.max_draft_tokens,
-              model->DecodeConcurrency()),
-          .payload_version = Session::kSnapshotPayloadVersion,
-      };
-    } catch (const std::exception& e) {
-      return fail(e.what());
-    }
-  }
   return std::make_shared<Qwen36TextRunner>(
-      std::move(model), max_context, use_mtp, speculative.max_draft_tokens,
-      std::move(persistence));
+      std::move(model), max_context, use_mtp, speculative.max_draft_tokens);
 }
 
 }  // namespace gufo::models::qwen36_35b_a3b
