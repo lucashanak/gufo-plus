@@ -20,10 +20,15 @@
 
 #include "src/families/qwen/kernels/ops/token.hpp"
 #include "src/families/qwen/vision/device_input.hpp"
+#include "src/models/qwen36_35b_a3b/continuation_hooks.hpp"
 #include "src/models/qwen36_35b_a3b/kernels/rocm/blaslt.hpp"
 #include "src/models/qwen36_35b_a3b/kernels/rocm/device_model.hpp"
 #include "src/models/qwen36_35b_a3b/kernels/rocm/kernels.hpp"
 #include "src/models/qwen36_35b_a3b/mtp_sampling.hpp"
+
+namespace gufo::models::qwen36_35b_a3b {
+class ContinuationAdapter;
+}
 
 namespace gufo::models::qwen36_35b_a3b::rocm {
 
@@ -71,6 +76,7 @@ public:
 
 private:
   friend class Executor;
+  friend class gufo::models::qwen36_35b_a3b::ContinuationAdapter;
   Session() = default;
 
   struct LinearState {
@@ -145,6 +151,8 @@ private:
   std::function<bool()> is_cancelled_;
   std::vector<float*> rollback_allocations_;
   std::uint32_t rollback_depth_{0};
+  /// Set by the continuation adapter that owns this session, else null.
+  ContinuationHooks* continuation_hooks_{nullptr};
   void TrimRollback(std::uint32_t depth) noexcept;
 };
 
@@ -340,7 +348,10 @@ public:
                                      std::uint32_t next_drafts = 0) const;
 
   /// Rewinds the draft block's own context.
-  void MtpRewind(Session& session, std::uint32_t position) const noexcept {
+  void MtpRewind(Session& session, std::uint32_t position) const {
+    if (session.continuation_hooks_ && position < session.mtp_.position)
+      session.continuation_hooks_->BeforeWrite(true, position,
+                                               session.mtp_.position);
     if (session.mtp_.position != position)
       session.mtp_.residual_valid = false;
     session.mtp_.position = position;

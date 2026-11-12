@@ -170,6 +170,14 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
                    error, std::span(members.data(), items.size())))
       return false;
   }
+  for (const auto& item : items) {
+    auto& session = *item.session;
+    if (!session.Cancelled() && session.continuation_hooks_)
+      session.continuation_hooks_->BeforeWrite(
+          true, session.mtp_.position,
+          session.mtp_.position +
+              static_cast<std::uint32_t>(item.tokens.size()));
+  }
   if (!AllocateBatch(error) ||
       (batch_controls_ == nullptr &&
        !Check(hipHostMalloc(&batch_controls_,
@@ -682,6 +690,13 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     if (item.speculative &&
         !EnsureRollback(*item.session, item.tokens.size() - 1, error))
       return false;
+  }
+  for (const auto& item : items) {
+    auto& session = *item.session;
+    if (!session.Cancelled() && session.continuation_hooks_)
+      session.continuation_hooks_->BeforeWrite(
+          false, session.position_,
+          session.position_ + static_cast<std::uint32_t>(item.tokens.size()));
   }
   if (!AllocateBatch(error)) {
     return false;

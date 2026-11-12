@@ -730,6 +730,24 @@ std::size_t Executor::ReleaseIdleKv(std::size_t want,
       releasable += buffer.ShrinkBytes(draft_rows);
     if (releasable == 0)
       continue;
+    // Releasing rows is an overwrite for anything that borrowed them. A slot
+    // that is restoring or has transfers in flight refuses and keeps them.
+    if (session->continuation_hooks_) {
+      const auto mapped = [](const std::vector<GrowableRows>& buffers) {
+        std::size_t most = 0;
+        for (const auto& buffer : buffers)
+          most = std::max(most, buffer.rows());
+        return static_cast<std::uint32_t>(most);
+      };
+      try {
+        session->continuation_hooks_->BeforeWrite(false, rows,
+                                                  mapped(kv.target));
+        session->continuation_hooks_->BeforeWrite(true, draft_rows,
+                                                  mapped(kv.draft));
+      } catch (const std::exception&) {
+        continue;
+      }
+    }
     if (!drained) {
       // Unmapping is not ordered after queued work or snapshot copies.
       if (hipDeviceSynchronize() != hipSuccess) {
@@ -1767,6 +1785,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     return false;
   if (!ReserveKv(session, start_pos + n, session.mtp_.position, error_msg))
     return false;
+  if (session.continuation_hooks_)
+    session.continuation_hooks_->BeforeWrite(false, start_pos, start_pos + n);
   ++session.mutation_epoch_;
   session.spec_base_ = start_pos;
   session.spec_tokens_ = speculative ? n : 0;
@@ -1966,6 +1986,9 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
     AssignError(error_msg, "rollback outside the pending speculative batch");
     return false;
   }
+  if (session.continuation_hooks_ && keep < n)
+    session.continuation_hooks_->BeforeWrite(false, session.spec_base_ + keep,
+                                             session.position_);
   session.spec_tokens_ = 0;
   if (logits != nullptr &&
       !Check(hipMemcpyAsync(
@@ -2418,6 +2441,8 @@ bool Executor::MtpForward(Session& session,
   }
   if (!ReserveKv(session, session.position_, pos + n, error_msg))
     return false;
+  if (session.continuation_hooks_)
+    session.continuation_hooks_->BeforeWrite(true, pos, pos + n);
   ++session.mutation_epoch_;
   session.mtp_.residual_valid = false;
   std::copy(tokens.begin(), tokens.end(), tokens_host_);
@@ -2477,6 +2502,8 @@ bool Executor::MtpDraftChain(Session& session,
   // Step k > 0 writes draft row pos + n + k - 1.
   if (!ReserveKv(session, session.position_, pos + n + drafts - 1, error_msg))
     return false;
+  if (session.continuation_hooks_)
+    session.continuation_hooks_->BeforeWrite(true, pos, pos + n + drafts - 1);
   ++session.mutation_epoch_;
   session.mtp_.residual_valid = false;
   std::copy(replay.begin(), replay.end(), tokens_host_);

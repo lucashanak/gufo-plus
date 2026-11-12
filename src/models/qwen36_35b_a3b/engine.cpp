@@ -17,6 +17,7 @@
 #include <string_view>
 #include <type_traits>
 
+#include "src/models/qwen36_35b_a3b/continuation_hooks.hpp"
 #include "src/models/qwen36_35b_a3b/kernels/rocm/device_model.hpp"
 #include "src/models/qwen36_35b_a3b/kernels/rocm/executor.hpp"
 #include "src/models/qwen36_35b_a3b/kernels/rocm/kernels.hpp"
@@ -420,6 +421,8 @@ std::uint32_t Session::ContextSize() const noexcept {
 }
 
 void Session::Reset() {
+  if (continuation_hooks_)
+    continuation_hooks_->BeforeReset();
   valid_ = false;
   session_->Reset();
   tokens_.clear();
@@ -432,6 +435,8 @@ void Session::Reset() {
   hidden_base_ = 0;
   draft_length_.Reset();
   model_->executor_->MtpRewind(*session_, 0);
+  if (continuation_hooks_)
+    continuation_hooks_->AfterReset();
   valid_ = true;
 }
 
@@ -441,6 +446,8 @@ void Session::SetCancellationCheck(std::function<bool()> check) {
 
 void Session::ConfigureVision(
     std::shared_ptr<const qwen::vision::Prompt> prompt) {
+  if (continuation_hooks_)
+    continuation_hooks_->BeforeExecution();
   const auto identity = prompt ? prompt->IdentityForPrefix(tokens_.size())
                                : std::span<const std::uint8_t>{};
   if (!tokens_.empty() &&
@@ -529,6 +536,8 @@ bool Session::RestoreSnapshot(const SessionSnapshot& snapshot,
 
 bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
                               std::string* error_msg) {
+  if (continuation_hooks_)
+    continuation_hooks_->BeforeRestore();
   SessionSnapshotHeader header{};
   if (payload.size() < sizeof(header)) {
     AssignError(error_msg, "session snapshot is truncated");
@@ -736,6 +745,8 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
 
 bool Session::Sync(std::span<const std::int32_t> prompt,
                    std::string* error_msg) {
+  if (continuation_hooks_)
+    continuation_hooks_->BeforeExecution();
   if (prompt.empty()) {
     AssignError(error_msg, "prompt is empty");
     return false;
@@ -770,6 +781,8 @@ bool Session::Sync(std::span<const std::int32_t> prompt,
 }
 
 bool Session::Evaluate(std::int32_t token, std::string* error_msg) {
+  if (continuation_hooks_)
+    continuation_hooks_->BeforeExecution();
   if (!valid_) {
     AssignError(error_msg,
                 "session needs a successful Sync after a failed operation");
@@ -1162,6 +1175,8 @@ bool Session::FinishDecode(const DecodeRequest& request,
 bool Session::DecodeStep(std::size_t max_tokens,
                          sampling::SamplerState& sampler, DecodeResult* result,
                          std::string* error_msg, bool stop_at_eos) {
+  if (continuation_hooks_)
+    continuation_hooks_->BeforeExecution();
   if (!valid_) {
     AssignError(error_msg,
                 "session needs a successful Sync after a failed operation");
@@ -1263,6 +1278,13 @@ bool Session::RunIsolatedBatch(std::span<const Request> requests,
       valid = false;
     if (!valid) {
       outcome.error = "invalid or non-independent batch request";
+      continue;
+    }
+    try {
+      if (r.session->continuation_hooks_)
+        r.session->continuation_hooks_->BeforeExecution();
+    } catch (const std::exception& exception) {
+      outcome.error = exception.what();
       continue;
     }
     if (!r.session->session_->CheckCancellation(&outcome.error))
