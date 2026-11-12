@@ -71,7 +71,9 @@ Lower dense precision (Q5_K) gave no speed gain; see
 Model tests are in `tests/models/qwen36_35b_a3b`: CPU metadata checks, HIP
 operator tests against FP64 references, and the full-model `session_test` /
 `snapshot_test` (MTP versus AR, batching, rollback, prefill chunking, cache
-replay) and `growable_kv_test` (growing K/V rows against pregrown sessions
-across chunk boundaries, restore, cancellation, batching and the cap). `reference_probe` runs the CPU oracle; `gpu_probe` times single and
+replay), `growable_kv_test` (growing K/V rows against pregrown sessions
+across chunk boundaries, restore, cancellation, batching and the cap) and
+`continuation_adapter_test` (component-cache restores against uninterrupted
+sessions, borrowed-row guards and refused restores). `reference_probe` runs the CPU oracle; `gpu_probe` times single and
 multi-stream decoding. Retained result summaries belong in `artifacts/`;
 generated traces stay in the ignored top-level `artifacts/` tree.
