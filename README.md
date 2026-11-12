@@ -10,8 +10,8 @@ A fork of [Gufo](https://github.com/gufo-org/gufo) for AMD Strix Halo (`gfx1151`
 - **8-bit K/V that grows.** K/V rows in 8 bits with an F16 scale per 16 values, mapped in 2 MiB chunks as a session grows and capped by `--kv-cache-bytes`: 8 sessions × 262,144 tokens in a 20 GiB budget.
 - **BF16 HC inject fix.** Models that store the HC inject rows in BF16 (for example Swift 1.5 GGUFs) produced garbage for prompts of 96+ tokens; inject rows are now widened to F32 at load.
 - **Fine-tuned MTP head for Swift 1.5.** Swift ships the base model's MTP head; a head trained on Swift's own outputs raises draft acceptance by 4–6 points (+3–5 % decode) with byte-identical outputs.
-- **Serving.** `--reasoning-budget-fraction` (thinking budget as a share of `max_tokens`, with Qwen's wrap-up), model-chosen prefill budget beside active decoders, cache checkpoints that do not split long passes.
-- **Qwen3.6-35B-A3B / Ornith 1.5** (35B and 122B) with native MTP, history drafting and DFlash2 next to MTP.
+- **Serving.** `--reasoning-budget-fraction` (thinking budget as a share of `max_tokens`, with Qwen's wrap-up), model-chosen prefill budget beside active decoders.
+- **Qwen3.6-35B-A3B / Ornith 1.5** (35B) with native MTP, history drafting and DFlash2 next to MTP.
 
 ## Results
 
@@ -27,24 +27,31 @@ A fork of [Gufo](https://github.com/gufo-org/gufo) for AMD Strix Halo (`gfx1151`
 
 | PR | Change | State |
 | --- | --- | --- |
-| [#882](https://github.com/gufo-org/gufo/pull/882) | Confidence-gated MTP chains | merged |
-| [#875](https://github.com/gufo-org/gufo/pull/875) | Prefill rows independent of the pass route | merged |
-| [#876](https://github.com/gufo-org/gufo/pull/876) | Dense sweep of pre-budget rows in budget-crossing chains | open |
-| [#877](https://github.com/gufo-org/gufo/pull/877) | Four-token prefill alignment | open |
-| [#878](https://github.com/gufo-org/gufo/pull/878) | `--reasoning-budget-fraction` | open |
-| [#879](https://github.com/gufo-org/gufo/pull/879) | Model-chosen prefill budget | open |
-| [#880](https://github.com/gufo-org/gufo/pull/880) | Grid checkpoints keep long passes whole | open |
-| [#881](https://github.com/gufo-org/gufo/pull/881) | Idle-spill polling backoff | open |
-| [#883](https://github.com/gufo-org/gufo/pull/883) | Every GGML block format in core | open |
-| [#884](https://github.com/gufo-org/gufo/pull/884) | Q8_0 PLE n-gram tables | open |
-| [#890](https://github.com/gufo-org/gufo/pull/890) | Register-resident routed prefill experts | open |
-| [#891](https://github.com/gufo-org/gufo/pull/891) | 16,384-row prefill passes | open |
-| [#892](https://github.com/gufo-org/gufo/pull/892) | Prefill waits without busy-polling | open |
+| [#875](https://github.com/gufo-org/gufo/pull/875) | Prefill rows independent of the pass route | merged, v0.28.1 |
+| [#882](https://github.com/gufo-org/gufo/pull/882) | Confidence-gated MTP chains | merged, v0.28.1 |
+| [#876](https://github.com/gufo-org/gufo/pull/876) | Dense sweep of pre-budget rows in budget-crossing chains | merged, v0.29.0 |
+| [#877](https://github.com/gufo-org/gufo/pull/877) | Four-token prefill alignment, disk readahead progress | merged, v0.29.0 |
+| [#881](https://github.com/gufo-org/gufo/pull/881) | Idle-spill polling backoff | merged, v0.29.0 |
+| [#883](https://github.com/gufo-org/gufo/pull/883) | Every GGML block format in core | merged as [#930](https://github.com/gufo-org/gufo/pull/930), v0.29.0 |
+| [#884](https://github.com/gufo-org/gufo/pull/884) | Q8_0 PLE n-gram tables | merged, v0.29.0 |
+| [#890](https://github.com/gufo-org/gufo/pull/890) | Register-resident routed prefill experts | merged, v0.29.0 |
+| [#891](https://github.com/gufo-org/gufo/pull/891) | 16,384-row prefill passes | merged as [#933](https://github.com/gufo-org/gufo/pull/933), v0.29.0 |
+| [#894](https://github.com/gufo-org/gufo/pull/894) | One-launch decode HC mixer | merged, v0.29.0 |
+| [#895](https://github.com/gufo-org/gufo/pull/895) | Fused prefill DeltaNet | merged, v0.29.0 |
+| [#950](https://github.com/gufo-org/gufo/pull/950) | BF16 HC inject rows widened to F32 | merged, v0.29.0 |
+| [#961](https://github.com/gufo-org/gufo/pull/961) | Long prompt-lookup copies verified in one wide pass | merged, v0.29.0 |
+| [#990](https://github.com/gufo-org/gufo/pull/990) | IQ4 small-batch K-quant steps without ROCm 10.1 spills | merged, v0.29.0 |
+| [#992](https://github.com/gufo-org/gufo/pull/992) | Wide prompt-lookup verification for Qwen3.8-27B | merged, v0.29.0 |
+| [#993](https://github.com/gufo-org/gufo/pull/993) | Draft hidden row counted in session bytes | merged, v0.29.0 |
+| [#963](https://github.com/gufo-org/gufo/pull/963) | Prompt checkpoints inside prefill passes | merged, v0.30.0 |
 | [#893](https://github.com/gufo-org/gufo/pull/893) | 8-bit growing K/V | open |
-| [#894](https://github.com/gufo-org/gufo/pull/894) | One-launch decode HC mixer | open |
-| [#895](https://github.com/gufo-org/gufo/pull/895) | Fused prefill DeltaNet | open |
+| [#878](https://github.com/gufo-org/gufo/pull/878) | `--reasoning-budget-fraction` | closed (`--reasoning-budget` covers it upstream); kept here |
+| [#879](https://github.com/gufo-org/gufo/pull/879) | Model-chosen prefill budget | closed (upstream is redesigning the scheduler); kept here |
+| [#892](https://github.com/gufo-org/gufo/pull/892), [#962](https://github.com/gufo-org/gufo/pull/962) | Prefill waits without busy-polling | closed (~1 % slower serve prefill at stock ~141 W; upstream [#987](https://github.com/gufo-org/gufo/issues/987) tracks enabling it on power-limited hosts); kept here for a 120 W package limit |
+| [#880](https://github.com/gufo-org/gufo/pull/880) | Grid checkpoints keep long passes whole | closed (slower partial restores); replaced by #963 |
+| [#985](https://github.com/gufo-org/gufo/pull/985) | Four-token passes and checkpoints | closed as a duplicate of #877 |
 
-Upstream 0.28.1 includes #875 and #882. Building, running and model documentation are the same as upstream; the original README follows.
+Upstream v0.29.0 includes 16 of these changes and v0.30.0 adds #963. This fork is based on v0.29.0; upstream is now at v0.34.0. Building, running and model documentation are the same as upstream; the original README follows.
 
 ---
 
