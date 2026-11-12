@@ -39,9 +39,16 @@ if (ENGINE_ENABLE_HIP)
     growable_kv_test.cpp)
   target_link_libraries(qwen36_35b_a3b_growable_kv_test PRIVATE
     qwen36_35b_a3b_test_hip)
+  # Component-cache restores against uninterrupted sessions, AR and MTP.
+  # Needs the model: run it with --model MODEL.gguf.
+  add_executable(qwen36_35b_a3b_continuation_adapter_test EXCLUDE_FROM_ALL
+    continuation_adapter_test.cpp)
+  target_link_libraries(qwen36_35b_a3b_continuation_adapter_test PRIVATE
+    qwen36_35b_a3b_test_hip)
   add_custom_target(qwen36_35b_a3b_model_tests
     DEPENDS qwen36_35b_a3b_session_test qwen36_35b_a3b_snapshot_test
-      qwen36_35b_a3b_growable_kv_test)
+      qwen36_35b_a3b_growable_kv_test
+      qwen36_35b_a3b_continuation_adapter_test)
 
   add_executable(qwen36_35b_a3b_gpu_probe EXCLUDE_FROM_ALL gpu_probe.cpp)
   target_link_libraries(qwen36_35b_a3b_gpu_probe PRIVATE qwen36_35b_a3b_test_hip)

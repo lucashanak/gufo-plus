@@ -11,14 +11,13 @@
 #include <memory>
 #include <optional>
 #include <span>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
-#include "gufo/ext/continuation.hpp"
+#include "gufo/ext/component_cache_resources.hpp"
 #include "gufo/ext/gguf_identity.hpp"
 #include "gufo/ext/host_budget.hpp"
 #include "src/families/qwen/text/chat_template.hpp"
@@ -26,6 +25,8 @@
 #include "src/families/qwen/vision/encoder.hpp"
 #include "src/families/qwen/vision/image_cache.hpp"
 #include "src/families/qwen/vision/prompt.hpp"
+#include "src/models/qwen36_35b_a3b/continuation_adapter.hpp"
+#include "src/models/qwen36_35b_a3b/continuation_identity.hpp"
 #include "src/models/qwen36_35b_a3b/engine.hpp"
 
 namespace gufo::models::qwen36_35b_a3b {
@@ -33,46 +34,9 @@ namespace {
 
 using namespace gufo::ext;
 
-bool IsSha256Hex(std::string_view value) noexcept {
-  return value.size() == 64 && std::ranges::all_of(value, [](char character) {
-           return (character >= '0' && character <= '9') ||
-                  (character >= 'a' && character <= 'f');
-         });
-}
-
-// Qwen3.6-35B-A3B carries its MTP block in the main artifact, so the
-// artifact identity covers the draft weights too.
-std::vector<std::uint8_t> Qwen36CompatibilityIdentity(
-    std::string_view artifact_fingerprint, bool has_mtp,
-    std::uint32_t max_context, std::uint32_t max_draft_tokens,
-    std::uint32_t decode_concurrency) {
-  if (!IsSha256Hex(artifact_fingerprint)) {
-    throw std::invalid_argument(
-        "Qwen3.6-35B-A3B disk cache requires an artifact fingerprint");
-  }
-  std::ostringstream identity;
-  identity << "schema=gufo-text-continuation-v2\n"
-           << "model_kind=qwen36-35b-a3b\n"
-           << "artifact_id=" << ext::kGgufIdentityScheme << ':'
-           << artifact_fingerprint << '\n'
-           << "tokenizer=embedded-in-artifact\n"
-           << "chat_template=qwen36-compiled-v1\n"
-           << "chat_template_reference_sha256="
-           << tokenization::QwenChatTemplate::Qwen36OfficialTemplateSha256()
-           << '\n'
-           << "state_abi=qwen36-35b-a3b-rocm-session-v1\n"
-           << "payload_layout=q36-rocm-session-snapshot-v"
-           << Session::kSnapshotPayloadVersion << '\n'
-           << "context_tokens=" << max_context << '\n'
-           << "position_policy=absolute-v1\n"
-           << "adapters=none\n";
-  if (has_mtp) {
-    identity << "draft_backend=q36-native-mtp-v1\n"
-             << "draft_max_tokens=" << max_draft_tokens << '\n'
-             << "draft_cost_concurrency=" << decode_concurrency << '\n';
-  }
-  const std::string canonical = identity.str();
-  return {canonical.begin(), canonical.end()};
+[[nodiscard]] inline hip::ComponentCacheHooks HipComponentCacheHooks() {
+  return {[] { return ext::HostSnapshotCeilingBytes(); },
+          [](std::string_view) {}, [](std::string_view) {}};
 }
 
 struct QwenImageContext final : TextPromptContext {
@@ -160,12 +124,12 @@ std::shared_ptr<const models::qwen::vision::Prompt> QwenPrompt(
   return image->prompt;
 }
 
-// Qwen3.6-35B-A3B (NinjaPear engine): one runner per request state on the
-// snapshot continuation cache, as the Qwen 27B runner.
+// Qwen3.6-35B-A3B (NinjaPear engine): each request state is bound to a
+// component-cache slot, whose adapter owns the session.
 struct Qwen36RunnerTraits {
   using Model = models::qwen36_35b_a3b::Model;
   using Session = models::qwen36_35b_a3b::Session;
-  using Snapshot = models::qwen36_35b_a3b::SessionSnapshot;
+  using Adapter = models::qwen36_35b_a3b::ContinuationAdapter;
   static constexpr std::string_view kName = "Qwen3.6-35B-A3B";
   static constexpr std::string_view kShortName = "Qwen3.6";
   static constexpr std::string_view kStateAbi =
@@ -193,23 +157,13 @@ std::vector<std::int32_t> QwenMoeEngineTokens(
 template<class Traits>
 class QwenMoeTextRunnerState final : public TextRunnerState {
 public:
-  QwenMoeTextRunnerState(const std::shared_ptr<typename Traits::Model>& model,
-                         std::uint32_t max_context, bool use_mtp) {
-    std::string error;
-    session_ =
-        model->CreateSession(use_mtp ? gufo::core::SessionMode::kSpeculative
-                                     : gufo::core::SessionMode::kAutoregressive,
-                             max_context, &error);
-    if (session_ == nullptr) {
-      throw std::runtime_error("Failed to create " +
-                               std::string(Traits::kName) +
-                               " session: " + error);
-    }
-  }
+  QwenMoeTextRunnerState(typename Traits::Session& session,
+                         cache::Adapter& adapter, cache::Slot& slot)
+      : session_(&session), adapter_(&adapter), slot_(&slot) {}
 
   void Invalidate() noexcept override {
     session_->SetCancellationCheck({});
-    session_->Reset();
+    (void)adapter_->Invalidate(*slot_);
     position_ = 0;
   }
   void SetCancellationCheck(const CancellationCheck& check) override {
@@ -229,10 +183,11 @@ public:
   void set_position(std::size_t position) noexcept { position_ = position; }
 
 private:
-  std::unique_ptr<typename Traits::Session> session_;
+  typename Traits::Session* session_{};
+  cache::Adapter* adapter_{};
+  cache::Slot* slot_{};
   std::size_t position_{0};
 };
-
 
 template<class Traits>
 QwenMoeTextRunnerState<Traits>& RequireQwenMoeState(TextRunnerState& state) {
@@ -261,28 +216,45 @@ public:
   sampling::JsonConstraint::ToolFormat ToolFormat() const override {
     return sampling::JsonConstraint::ToolFormat::kQwen;
   }
-  QwenMoeTextRunner(
-      std::shared_ptr<typename Traits::Model> model, std::uint32_t max_context,
-      bool use_mtp, std::uint32_t max_draft_tokens)
+  // An empty artifact fingerprint keys continuations to this process's
+  // loaded model; durable (disk) caches require the fingerprint.
+  QwenMoeTextRunner(std::shared_ptr<typename Traits::Model> model,
+                    std::uint32_t max_context, bool use_mtp,
+                    std::uint32_t max_draft_tokens,
+                    std::string_view artifact_fingerprint = {})
       : model_(std::move(model)),
         max_context_(max_context),
         use_mtp_(use_mtp),
-        max_draft_tokens_(max_draft_tokens) {}
+        max_draft_tokens_(max_draft_tokens),
+        component_identity_(
+            artifact_fingerprint.empty()
+                ? Qwen36ProcessIdentity(model_.get(), max_context_, use_mtp_,
+                                        max_draft_tokens_,
+                                        model_->DecodeConcurrency())
+                : Qwen36CompatibilityIdentity(artifact_fingerprint, use_mtp_,
+                                              max_context_, max_draft_tokens_,
+                                              model_->DecodeConcurrency())) {}
 
-  // TODO(fork): the Qwen3.6 component-cache adapter replaces the native
-  // snapshots upstream v0.34 removed; until it lands this runner cannot load.
   [[nodiscard]] std::unique_ptr<ComponentCacheResources>
-  CreateComponentCacheResources(cache::ResourceLedger&,
+  CreateComponentCacheResources(cache::ResourceLedger& ledger,
                                 std::size_t) const override {
-    throw std::runtime_error(std::string(Traits::kName) +
-                             " needs its component-cache adapter (v0.34 port)");
+    return hip::CreateHipComponentCacheResources(
+        std::make_unique<typename Traits::Adapter>(
+            model_,
+            use_mtp_ ? gufo::core::SessionMode::kSpeculative
+                     : gufo::core::SessionMode::kAutoregressive,
+            max_context_, component_identity_),
+        ledger, HipComponentCacheHooks());
   }
   [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
-      cache::Adapter&, cache::Slot&) const override {
-    throw std::logic_error("Qwen3.6 component state is not bound yet");
+      cache::Adapter& adapter, cache::Slot& slot) const override {
+    auto& owner = dynamic_cast<typename Traits::Adapter&>(adapter);
+    return std::make_unique<QwenMoeTextRunnerState<Traits>>(
+        owner.GetSession(slot), adapter, slot);
   }
-  void ReconcileComponentState(TextRunnerState&, std::size_t) const override {
-    throw std::logic_error("Qwen3.6 component state is not bound yet");
+  void ReconcileComponentState(TextRunnerState& state,
+                               std::size_t position) const override {
+    RequireQwenMoeState<Traits>(state).set_position(position);
   }
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
@@ -395,11 +367,6 @@ public:
   [[nodiscard]] std::string Decode(
       std::span<const TextRunnerToken> tokens) const override {
     return model_->tokenizer().Decode(tokens);
-  }
-
-  [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const {
-    return std::make_unique<QwenMoeTextRunnerState<Traits>>(
-        model_, max_context_, use_mtp_);
   }
 
   void PreparePrefixReuse(
@@ -632,13 +599,13 @@ public:
     return RequireQwenMoeState<Traits>(state).position();
   }
 
-
 private:
   mutable models::qwen::vision::ImageCache image_cache_;
   std::shared_ptr<typename Traits::Model> model_;
   std::uint32_t max_context_;
   bool use_mtp_;
   std::uint32_t max_draft_tokens_;
+  std::vector<std::uint8_t> component_identity_;
 };
 
 using Qwen36TextRunner = QwenMoeTextRunner<Qwen36RunnerTraits>;
@@ -726,8 +693,23 @@ std::shared_ptr<ext::TextModelRunner> CreateQwen36TextRunner(
   if (use_mtp && !model->HasMtp())
     return fail(
         "Qwen3.6-35B-A3B MTP requires a model loaded with its MTP block");
-  return std::make_shared<Qwen36TextRunner>(
-      std::move(model), max_context, use_mtp, speculative.max_draft_tokens);
+  std::string fingerprint = options.disk_cache.model_artifact_fingerprint;
+  if (!options.disk_cache.directory.empty() && fingerprint.empty()) {
+    try {
+      fingerprint = core::GgufIdentityHex(*reader);
+    } catch (const std::exception& e) {
+      return fail(
+          std::string("Qwen3.6-35B-A3B disk cache fingerprinting failed: ") +
+          e.what());
+    }
+  }
+  try {
+    return std::make_shared<Qwen36TextRunner>(
+        std::move(model), max_context, use_mtp, speculative.max_draft_tokens,
+        fingerprint);
+  } catch (const std::exception& e) {
+    return fail(e.what());
+  }
 }
 
 }  // namespace gufo::models::qwen36_35b_a3b

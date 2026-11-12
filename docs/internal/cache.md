@@ -48,6 +48,14 @@ frontiers are private, as are logits and the DSpark windows, so a checkpoint
 carries a fixed private cost whatever its depth. Rows are copied at capture
 rather than borrowed, because compressed caches grow by reallocation.
 
+Qwen3.6-35B-A3B shares its token history and the 8-bit K/V and F16 scale rows
+of each attention layer; the MTP block's rows count its own, lagging frontier.
+Each DeltaNet layer's convolution and recurrent state, the last logits, the
+MTP residual and kept trunk rows, and the draft length policy are private.
+Borrowed device rows stay at their reserved addresses as the K/V pool backs
+them, and are preserved before a write, rollback, rewind or release of idle
+rows touches them.
+
 ## Why it exists
 
 Prefill cost scales with prompt length. Decode cost scales with tokens
