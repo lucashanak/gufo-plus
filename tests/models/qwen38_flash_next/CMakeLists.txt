@@ -24,6 +24,7 @@ function(add_qwen38_flash_next_test name library labels)
 endfunction()
 
 add_qwen38_flash_next_test(runner_options gufo_qwen38_flash_next "cpu")
+add_qwen38_flash_next_test(probe gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(config gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(continuation_layout gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(ngram gufo_qwen38_flash_next "cpu")
@@ -52,6 +53,12 @@ if (ENGINE_ENABLE_HIP)
       verification_sampling wide_verification)
     add_qwen38_flash_next_test(${name} qwen38_flash_next_test_hip "hip;gpu;gfx1151")
   endforeach()
+  # Reuse the synthetic model fixture, with short prompts around a reduced
+  # sparse budget. This exercises actual Executor capture/replay without GGUFs.
+  add_test(NAME qwen38_flash_next.decode_graph
+    COMMAND qwen38_flash_next_wide_verification_test --decode-graph-only)
+  set_tests_properties(qwen38_flash_next.decode_graph PROPERTIES
+    LABELS "qwen38_flash_next;hip;gpu;gfx1151")
   # The rope phase and RMS checks compare against the scalar CPU oracle.
   target_link_libraries(qwen38_flash_next_attention_ops_test PRIVATE
     gufo_qwen38_flash_next_reference)
@@ -69,9 +76,9 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(qwen38_flash_next_continuation_adapter_test PRIVATE
     qwen38_flash_next_test_hip ${CMAKE_DL_LIBS})
   # In-pass checkpoints through the component path against split passes, in
-  # AR and MTP modes. It needs the model: QWEN38_FLASH_NEXT_MODEL names the
-  # first GGUF shard and QWEN38_FLASH_NEXT_MTP_MODEL the MTP head. Without
-  # them the test is skipped.
+  # AR and MTP modes. Build it with qwen38_flash_next_model_tests. It needs
+  # the model: QWEN38_FLASH_NEXT_MODEL names the first GGUF shard and
+  # QWEN38_FLASH_NEXT_MTP_MODEL the MTP head. Without them it is skipped.
   add_test(NAME qwen38_flash_next.in_pass_checkpoints
     COMMAND qwen38_flash_next_continuation_adapter_test --in-pass-only)
   set_tests_properties(qwen38_flash_next.in_pass_checkpoints PROPERTIES
@@ -83,6 +90,20 @@ if (ENGINE_ENABLE_HIP)
     growable_kv_test.cpp)
   target_link_libraries(qwen38_flash_next_growable_kv_test PRIVATE
     qwen38_flash_next_test_hip)
+  # Layered prefill (SetPrefillYield) against lone runs, in AR and MTP modes.
+  # Built with qwen38_flash_next_model_tests; needs the same model variables
+  # and is skipped without them.
+  add_executable(qwen38_flash_next_layered_prefill_test EXCLUDE_FROM_ALL
+    layered_prefill_test.cpp)
+  target_link_libraries(qwen38_flash_next_layered_prefill_test PRIVATE
+    gufo_test_support qwen38_flash_next_test_hip)
+  add_test(NAME qwen38_flash_next.layered_prefill
+    COMMAND qwen38_flash_next_layered_prefill_test)
+  set_tests_properties(qwen38_flash_next.layered_prefill PROPERTIES
+    LABELS "qwen38_flash_next;hip;gpu;gfx1151;external-model"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    TIMEOUT 1800)
   add_executable(qwen38_flash_next_continuation_probe EXCLUDE_FROM_ALL
     continuation_probe.cpp)
   target_link_libraries(qwen38_flash_next_continuation_probe PRIVATE
@@ -90,7 +111,8 @@ if (ENGINE_ENABLE_HIP)
   add_custom_target(qwen38_flash_next_model_tests
     DEPENDS qwen38_flash_next_session_test qwen38_flash_next_snapshot_test
       qwen38_flash_next_continuation_adapter_test
-      qwen38_flash_next_growable_kv_test)
+      qwen38_flash_next_growable_kv_test
+      qwen38_flash_next_layered_prefill_test)
 
   add_executable(qwen38_flash_next_dense_gemm_bench EXCLUDE_FROM_ALL
     dense_gemm_bench.cpp)

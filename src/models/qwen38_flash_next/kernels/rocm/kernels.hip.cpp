@@ -1686,6 +1686,26 @@ constexpr int kGdnWindow = 4;
 constexpr int kGdnWindowsAhead = 3;
 constexpr int kGdnRows = 2;  // state rows per lane
 
+/// The recurrent state an in-pass checkpoint ending after `rows` rows of
+/// the pass receives, or null.
+__device__ __forceinline__ float* CheckpointState(const GdnCheckpoint& c,
+                                                  std::uint32_t rows) {
+  for (std::uint32_t i = 0; i < c.count; ++i)
+    if (c.tokens[i] == rows)
+      return c.state[i];
+  return nullptr;
+}
+
+/// True when pass row `tok` is one of the three raw rows before an in-pass
+/// checkpoint, which its convolution history copies.
+__device__ __forceinline__ bool CheckpointHistoryRow(const PassCheckpoints& c,
+                                                     std::size_t tok) {
+  for (std::uint32_t i = 0; i < c.count; ++i)
+    if (tok < c.tokens[i] && tok + 3 >= c.tokens[i])
+      return true;
+  return false;
+}
+
 /// grid (value heads, row groups): each block owns kGdnRowsPerBlock state
 /// rows of one head, kGdnLanes threads per row, each lane a contiguous
 /// slice of the key dimension. Rows of the delta rule are independent, so

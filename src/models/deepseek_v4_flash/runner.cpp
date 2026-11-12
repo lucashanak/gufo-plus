@@ -18,12 +18,17 @@
 #include <utility>
 #include <vector>
 
+#include "gufo/ext/component_cache_resources.hpp"
+#include "gufo/ext/experimental/admission_query.hpp"
 #include "gufo/ext/gguf_identity.hpp"
+#include "gufo/ext/host_budget.hpp"
 #include "gufo/ext/text.hpp"
 #include "src/models/deepseek_v4_flash/chat_template.hpp"
+#include "src/models/deepseek_v4_flash/continuation_adapter.hpp"
 #include "src/models/deepseek_v4_flash/continuation_identity.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/deepseek_v4_flash/probe.hpp"
 
 namespace gufo::models::deepseek_v4_flash {
 namespace {
@@ -32,18 +37,9 @@ using namespace gufo::ext;
 
 class DeepSeekTextRunnerState final : public TextRunnerState {
 public:
-  DeepSeekTextRunnerState(
-      const std::shared_ptr<models::deepseek_v4_flash::Model>& model,
-      std::uint32_t max_context, bool use_dspark) {
-    std::string error;
-    session_ = model->CreateSession(
-        use_dspark ? gufo::core::SessionMode::kSpeculative
-                   : gufo::core::SessionMode::kAutoregressive,
-        max_context, &error);
-    if (session_ == nullptr) {
-      throw std::runtime_error("Failed to create DeepSeek session: " + error);
-    }
-  }
+  DeepSeekTextRunnerState(models::deepseek_v4_flash::Session& session,
+                          cache::Adapter& adapter, cache::Slot& slot)
+      : session_(&session), adapter_(&adapter), slot_(&slot) {}
 
   void SetCancellationCheck(const CancellationCheck& is_cancelled) override {
     session_->SetCancellationCheck(is_cancelled);
@@ -51,7 +47,7 @@ public:
 
   void Invalidate() noexcept override {
     session_->SetCancellationCheck({});
-    session_->Invalidate();
+    (void)adapter_->Invalidate(*slot_);
     position_ = 0;
   }
 
@@ -75,32 +71,10 @@ public:
   void set_position(std::size_t position) noexcept { position_ = position; }
 
 private:
-  std::unique_ptr<models::deepseek_v4_flash::Session> session_;
+  models::deepseek_v4_flash::Session* session_{};
+  cache::Adapter* adapter_{};
+  cache::Slot* slot_{};
   std::size_t position_{0};
-};
-
-class DeepSeekTextRunnerSnapshot final : public TextRunnerSnapshot {
-public:
-  DeepSeekTextRunnerSnapshot(
-      std::shared_ptr<models::deepseek_v4_flash::Model> model,
-      std::unique_ptr<models::deepseek_v4_flash::SessionSnapshot> snapshot,
-      std::size_t position)
-      : model(std::move(model)),
-        snapshot(std::move(snapshot)),
-        position(position) {}
-
-  [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
-    if (snapshot == nullptr ||
-        snapshot->SizeBytes() > static_cast<std::uint64_t>(
-                                    std::numeric_limits<std::size_t>::max())) {
-      return 0;
-    }
-    return static_cast<std::size_t>(snapshot->SizeBytes());
-  }
-
-  std::shared_ptr<models::deepseek_v4_flash::Model> model;
-  std::unique_ptr<models::deepseek_v4_flash::SessionSnapshot> snapshot;
-  std::size_t position;
 };
 
 DeepSeekTextRunnerState& RequireDeepSeekState(TextRunnerState& state) {
@@ -119,6 +93,30 @@ const DeepSeekTextRunnerState& RequireDeepSeekState(
   }
   return *deepseek;
 }
+
+// Arms the session's layer hook from the host's yield for one prefill step.
+class PrefillYieldScope {
+public:
+  PrefillYieldScope(models::deepseek_v4_flash::Session& session,
+                    const TextRunnerState& state)
+      : session_(session) {
+    if (state.prefill_yield_groups() > 1)
+      session_.SetPrefillYield(state.prefill_yield_groups(),
+                               [&state] { state.YieldPrefill(); });
+  }
+  ~PrefillYieldScope() { session_.SetPrefillYield(1, {}); }
+  PrefillYieldScope(const PrefillYieldScope&) = delete;
+  PrefillYieldScope& operator=(const PrefillYieldScope&) = delete;
+
+private:
+  models::deepseek_v4_flash::Session& session_;
+};
+
+// Beside decoders, prompts keep the 4,096-row pass and split it into layer
+// groups: one pass takes about 8.2 s, a decode step about 56 ms.
+constexpr std::size_t kMaxPrefillLayerGroups = 16;
+// Batched AR decode and DSpark verification take two to eight sessions.
+constexpr std::size_t kMaxBatchWidth = 8;
 
 std::vector<TextRunnerToken> DeepSeekRunnerTokens(std::span<const int> tokens) {
   std::vector<TextRunnerToken> converted;
@@ -163,14 +161,42 @@ public:
         throw std::invalid_argument(
             "DSpark disk cache requires a support SHA-256 fingerprint");
       }
-      persistence_ = TextRunnerPersistenceDescriptor{
-          .compatibility_identity = DeepSeekCompatibilityIdentity(
-              artifact_fingerprint,
-              use_dspark_ ? support_fingerprint : std::string{}, max_context_,
-              max_draft_tokens_),
-          .payload_version = DS4_SESSION_PAYLOAD_VERSION,
-      };
+      component_identity_ = DeepSeekCompatibilityIdentity(
+          artifact_fingerprint,
+          use_dspark_ ? support_fingerprint : std::string{}, max_context_,
+          max_draft_tokens_);
+    } else {
+      // Without file fingerprints the loaded model is the identity; durable
+      // caches require the validated artifact identity above.
+      component_identity_ = DeepSeekProcessIdentity(
+          model_.get(), max_context_, use_dspark_, max_draft_tokens_);
     }
+  }
+
+  [[nodiscard]] std::unique_ptr<ComponentCacheResources>
+  CreateComponentCacheResources(cache::ResourceLedger& ledger,
+                                std::size_t ram) const override {
+    (void)ram;
+    return hip::CreateHipComponentCacheResources(
+        std::make_unique<models::deepseek_v4_flash::ContinuationAdapter>(
+            model_,
+            use_dspark_ ? gufo::core::SessionMode::kSpeculative
+                        : gufo::core::SessionMode::kAutoregressive,
+            max_context_, component_identity_),
+        ledger,
+        {[] { return ext::HostSnapshotCeilingBytes(); },
+         [](std::string_view) {}, [](std::string_view) {}});
+  }
+  [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
+      cache::Adapter& adapter, cache::Slot& slot) const override {
+    auto& deepseek =
+        dynamic_cast<models::deepseek_v4_flash::ContinuationAdapter&>(adapter);
+    return std::make_unique<DeepSeekTextRunnerState>(deepseek.GetSession(slot),
+                                                     adapter, slot);
+  }
+  void ReconcileComponentState(TextRunnerState& state,
+                               std::size_t position) const override {
+    RequireDeepSeekState(state).set_position(position);
   }
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
@@ -182,8 +208,6 @@ public:
         .capabilities =
             TextRunnerCapabilities{
                 .incremental_prefill = true,
-                .snapshot = true,
-                .fork = true,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
                 .multi_token_decode = dspark,
@@ -191,17 +215,25 @@ public:
                 .batched_multi_token_decode_max_width = 8u,
                 .prefix_reuse = true,
             },
-        .persistence = persistence_,
-        .sampling_preset = sampling::TextModelPreset::kDeepSeekV4Flash,
+        .sampling_defaults = DeepSeekSamplingDefaults(),
+        // Decodes between layer groups, batched ones and DSpark verification
+        // included, use their own batch workspace (rocm_graph_yield_prefill).
+        .scheduling =
+            TextSchedulingProfile{
+                .pass_tokens =
+                    models::deepseek_v4_flash::Session::PrefillCapacityFor(
+                        static_cast<int>(max_context_)),
+                .max_layer_groups = kMaxPrefillLayerGroups,
+                .max_yield_decode_width = kMaxBatchWidth,
+            },
     };
   }
 
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
-    std::size_t free_bytes = 0;
-    std::size_t total_bytes = 0;
     std::optional<std::size_t> capacity;
-    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
-      capacity = free_bytes;
+    if (const auto memory = gufo::hip::QueryAdmissionMemory()) {
+      capacity = memory->free_bytes;
+      gufo::hip::LogStateCapacity(*memory, *capacity, 0, 0);
     }
     return {
         .resident_weights_bytes = std::nullopt,
@@ -221,7 +253,7 @@ public:
             .physical_width = 1,
         },
     };
-    for (std::size_t width = 2; width <= 8; ++width) {
+    for (std::size_t width = 2; width <= kMaxBatchWidth; ++width) {
       plans.push_back({
           .kind = TextExecutionPlanKind::kBatched,
           .physical_width = width,
@@ -313,11 +345,6 @@ public:
     return text;
   }
 
-  [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
-    return std::make_unique<DeepSeekTextRunnerState>(model_, max_context_,
-                                                     use_dspark_);
-  }
-
   void PreparePrefixReuse(
       TextRunnerState& state,
       std::span<const TextRunnerToken> prefix) const override {
@@ -347,7 +374,9 @@ public:
     const std::size_t next_position = offset + consumed;
     const auto prefix = DeepSeekEngineTokens(prompt.first(next_position));
     std::string error;
+    const PrefillYieldScope yield(deepseek.session(), state);
     if (!deepseek.session().Sync(prefix, &error)) {
+      deepseek.set_position(0);
       throw std::runtime_error("DeepSeek prefill failed: " + error);
     }
     deepseek.set_position(next_position);
@@ -635,106 +664,6 @@ public:
     return RequireDeepSeekState(state).position();
   }
 
-  [[nodiscard]] std::size_t SnapshotPayloadBytes(
-      const TextRunnerState& state) const override {
-    const auto& session = RequireDeepSeekState(state).session();
-    if (use_dspark_ && session.DsparkStatistics().context_tokens !=
-                           static_cast<uint32_t>(session.Position())) {
-      throw std::runtime_error("DSpark prefix lacks complete support state");
-    }
-    const std::uint64_t bytes = session.PayloadBytes();
-    if (bytes == 0 || bytes > static_cast<std::uint64_t>(
-                                  std::numeric_limits<std::size_t>::max())) {
-      throw std::overflow_error("DeepSeek snapshot size is unavailable");
-    }
-    return static_cast<std::size_t>(bytes);
-  }
-
-  [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
-      const TextRunnerState& state) const override {
-    const auto& deepseek = RequireDeepSeekState(state);
-    std::string error;
-    auto snapshot = deepseek.session().SaveSnapshot(&error);
-    if (snapshot == nullptr) {
-      throw std::runtime_error("DeepSeek snapshot failed: " + error);
-    }
-    return std::make_unique<DeepSeekTextRunnerSnapshot>(
-        model_, std::move(snapshot), deepseek.position());
-  }
-
-  void RestoreOrFork(TextRunnerState& state,
-                     const TextRunnerSnapshot& snapshot) const override {
-    const auto* deepseek_snapshot =
-        dynamic_cast<const DeepSeekTextRunnerSnapshot*>(&snapshot);
-    if (deepseek_snapshot == nullptr ||
-        deepseek_snapshot->model.get() != model_.get() ||
-        deepseek_snapshot->snapshot == nullptr) {
-      throw std::invalid_argument(
-          "DeepSeek snapshot does not belong to this model");
-    }
-    auto& restored = RequireDeepSeekState(state);
-    std::string error;
-    if (!restored.session().RestoreSnapshot(*deepseek_snapshot->snapshot,
-                                            &error)) {
-      throw std::runtime_error("DeepSeek snapshot restore failed: " + error);
-    }
-    restored.set_position(deepseek_snapshot->position);
-  }
-
-  [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
-      const TextRunnerSnapshot& snapshot) const override {
-    const auto* deepseek_snapshot =
-        dynamic_cast<const DeepSeekTextRunnerSnapshot*>(&snapshot);
-    if (deepseek_snapshot == nullptr ||
-        deepseek_snapshot->model.get() != model_.get() ||
-        deepseek_snapshot->snapshot == nullptr) {
-      throw std::invalid_argument(
-          "DeepSeek persistent snapshot does not belong to this model");
-    }
-    return deepseek_snapshot->PayloadBytes();
-  }
-
-  [[nodiscard]] std::size_t SerializePersistentSnapshot(
-      const TextRunnerSnapshot& snapshot,
-      std::span<std::uint8_t> destination) const override {
-    const auto* deepseek_snapshot =
-        dynamic_cast<const DeepSeekTextRunnerSnapshot*>(&snapshot);
-    if (deepseek_snapshot == nullptr ||
-        deepseek_snapshot->model.get() != model_.get() ||
-        deepseek_snapshot->snapshot == nullptr ||
-        destination.size() != deepseek_snapshot->PayloadBytes() ||
-        !deepseek_snapshot->snapshot->CopyTo(destination)) {
-      throw std::invalid_argument(
-          "DeepSeek persistent snapshot serialization failed");
-    }
-    return destination.size();
-  }
-
-  void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
-                                const SnapshotSink& sink) const override {
-    (void)PersistentSnapshotPayloadBytes(snapshot);
-    sink(dynamic_cast<const DeepSeekTextRunnerSnapshot&>(snapshot)
-             .snapshot->bytes());
-  }
-
-  void RestorePersistentSnapshot(
-      TextRunnerState& state,
-      std::span<const std::uint8_t> payload) const override {
-    auto& restored = RequireDeepSeekState(state);
-    std::string error;
-    if (!restored.session().RestoreSnapshot(payload, &error)) {
-      throw std::runtime_error("DeepSeek persistent snapshot restore failed: " +
-                               error);
-    }
-    const int position = restored.session().Position();
-    if (position <= 0 || static_cast<std::uint64_t>(position) > max_context_) {
-      restored.session().Invalidate();
-      throw std::runtime_error(
-          "DeepSeek persistent snapshot restored an invalid position");
-    }
-    restored.set_position(static_cast<std::size_t>(position));
-  }
-
 private:
   struct DeepSeekChatInput {
     std::vector<models::deepseek_v4_flash::ChatMessage> messages;
@@ -817,7 +746,7 @@ private:
   std::uint32_t max_context_;
   bool use_dspark_;
   std::uint32_t max_draft_tokens_;
-  std::optional<TextRunnerPersistenceDescriptor> persistence_;
+  cache::Identity component_identity_;
 };
 
 }  // namespace

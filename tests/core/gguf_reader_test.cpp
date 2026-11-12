@@ -148,6 +148,53 @@ void TestSplitGgufDiscovery() {
   std::filesystem::remove_all(temp_dir);
 }
 
+void TestTensorlessFirstShard() {
+  // Unsloth's engram repack stores only metadata in shard 1 and ends it right
+  // after the header, without padding to the data alignment.
+  const auto temp_dir =
+      std::filesystem::temp_directory_path() /
+      ("gufo-gguf-tensorless-" + std::to_string(static_cast<long>(getpid())));
+  std::filesystem::create_directories(temp_dir);
+  const auto first_path = temp_dir / "model-00001-of-00002.gguf";
+  const auto second_path = temp_dir / "model-00002-of-00002.gguf";
+
+  GgufBuilder first;
+  first.AddMetadataUint32("split.no", 0);
+  first.AddMetadataUint32("split.count", 2);
+  first.AddMetadataInt32("split.tensors.count", 1);
+  first.AddMetadataString("general.architecture", "qwen35");
+  auto first_bytes = first.Build(0);
+  while (!first_bytes.empty() && first_bytes.back() == 0)
+    first_bytes.pop_back();
+  Expect(first_bytes.size() % 32 != 0, "Tensorless shard ends unaligned");
+
+  GgufBuilder second;
+  second.AddMetadataUint32("split.no", 1);
+  second.AddMetadataUint32("split.count", 2);
+  second.AddMetadataInt32("split.tensors.count", 1);
+  second.AddTensor("token_embd.weight", {32, 4}, gufo::core::GgmlType::kQ8_0,
+                   0);
+
+  WriteBinaryFile(first_path, first_bytes);
+  WriteBinaryFile(second_path, second.Build(0));
+
+  std::string err;
+  const auto shard = gufo::core::GgufReader::OpenMemory(
+      first_bytes.data(), first_bytes.size(), &err);
+  Expect(shard != nullptr, "Unpadded tensorless GGUF opens: " + err);
+  Expect(shard->GetTensorCount() == 0, "Tensorless GGUF has no tensors");
+
+  const auto reader = gufo::core::GgufReader::OpenFile(first_path, &err);
+  Expect(reader != nullptr, "Split set with tensorless shard opens: " + err);
+  Expect(reader->GetTensorCount() == 1, "Tensor shard supplies the tensor");
+  Expect(reader->FindTensor("token_embd.weight") != nullptr,
+         "Tensor from second shard found");
+  Expect(reader->GetMetadataString("general.architecture") == "qwen35",
+         "Metadata comes from the tensorless first shard");
+
+  std::filesystem::remove_all(temp_dir);
+}
+
 void TestQuantizationLabel() {
   // The label the benchmark table prints, derived from the tensor table rather
   // than from `general.file_type`: the Unsloth UD-Q8_K_XL artifact records
@@ -410,6 +457,55 @@ void TestIntegerRoutingTensor() {
          "integer routing extent overflow is rejected");
 }
 
+// A layout core cannot size opens only on request, with each such tensor
+// spanning the bytes the file reserves for it.
+void TestUnsizedTensors() {
+  using gufo::core::GgmlType;
+  GgufBuilder builder;
+  builder.AddMetadataString("general.architecture", "custom");
+  // Q4_K rows must be whole 256-element blocks; 100 columns are not.
+  builder.AddTensor("odd_shape.weight", {100, 2}, GgmlType::kQ4_K, 0);
+  builder.AddTensor("plain.weight", {8}, GgmlType::kF32, 256);
+  builder.AddTensor("unknown_type.weight", {64}, static_cast<GgmlType>(200),
+                    288);
+  const auto bytes = builder.Build(288 + 96);
+  std::string error;
+  Expect(
+      !gufo::core::GgufReader::OpenMemory(bytes.data(), bytes.size(), &error) &&
+          error ==
+              "Invalid GGUF tensor shape or unsupported storage type: "
+              "odd_shape.weight",
+      "unsized tensors are rejected by default");
+  auto reader = gufo::core::GgufReader::OpenMemory(
+      bytes.data(), bytes.size(), &error, {.allow_unsized_tensors = true});
+  Expect(reader != nullptr, "unsized tensors open on request: " + error);
+  const auto* odd = reader->FindTensor("odd_shape.weight");
+  const auto* plain = reader->FindTensor("plain.weight");
+  const auto* unknown = reader->FindTensor("unknown_type.weight");
+  Expect(odd && !odd->sized && odd->size_bytes == 256 && odd->data != nullptr,
+         "an unsized tensor reaches the next tensor's offset");
+  Expect(plain && plain->sized && plain->size_bytes == 8 * sizeof(float),
+         "sized tensors keep their exact extent");
+  Expect(unknown && !unknown->sized && unknown->size_bytes == 96,
+         "the last unsized tensor reaches the end of the data");
+  Expect(reader->FirstUnsizedTensor() == odd &&
+             reader->UnsizedTensorError() ==
+                 "Invalid GGUF tensor shape or unsupported storage type: "
+                 "odd_shape.weight",
+         "the reader names the first unsized tensor");
+
+  GgufBuilder sized;
+  sized.AddMetadataString("general.architecture", "custom");
+  sized.AddTensor("plain.weight", {8}, GgmlType::kF32, 0);
+  const auto sized_bytes = sized.Build(32);
+  const auto plain_reader = gufo::core::GgufReader::OpenMemory(
+      sized_bytes.data(), sized_bytes.size(), &error,
+      {.allow_unsized_tensors = true});
+  Expect(plain_reader && plain_reader->FirstUnsizedTensor() == nullptr &&
+             plain_reader->UnsizedTensorError().empty(),
+         "a fully sized file reports no unsized tensor");
+}
+
 void TestMappedPrefetch() {
   char path[] = "/tmp/gufo-prefetch-XXXXXX";
   const int fd = mkstemp(path);
@@ -443,11 +539,13 @@ void TestMappedPrefetch() {
 int main() {
   TestMappedPrefetch();
   TestIntegerRoutingTensor();
+  TestUnsizedTensors();
   TestVisionMetadataArrays();
   TestNarrowIntegerArrays();
   std::cout << "Running GgufReader unit tests...\n";
   TestBasicGgufParsing();
   TestSplitGgufDiscovery();
+  TestTensorlessFirstShard();
   TestQuantizationLabel();
   TestMalformedGgufRejection();
   TestHostileHeaders();

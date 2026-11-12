@@ -8,6 +8,7 @@
 #include "src/cli/decide/decide.hpp"
 #include "src/cli/diagnose/diagnose.h"
 #include "src/cli/eval/eval.hpp"
+#include "src/cli/extension/extension.hpp"
 #include "src/cli/extension_diagnostics.hpp"
 #include "src/cli/prompt/prompt.hpp"
 #include "src/cli/serve/serve.hpp"
@@ -53,6 +54,8 @@ void print_help(std::string_view program_name) {
       << "  decide         Answer typed decision questions with a decision "
          "model\n"
       << "  diagnose       Inspect system hardware, memory, and drivers\n"
+      << "  extension      Install, list, rebuild and remove extension "
+         "modules\n"
       << "  help           Print help for a specific command\n\n"
       << "Run '" << program_name << " help <COMMAND>' or '" << program_name
       << " <COMMAND> --help' for details on a command\n\n"
@@ -143,6 +146,9 @@ int run(std::span<const char* const> args) {
     return gufo::cli::RunProbe(options.subspan(1));
   }
 
+  if (first_arg == "extension") {
+    return gufo::cli::RunExtension(options.subspan(1));
+  }
   if (first_arg == "diagnose") {
     return gufo::cli::RunDiagnose(options);
   }

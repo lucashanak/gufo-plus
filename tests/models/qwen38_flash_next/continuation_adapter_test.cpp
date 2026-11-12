@@ -20,6 +20,7 @@
 #include "src/cache/slot.hpp"
 #include "src/families/qwen/text/chat_template.hpp"
 #include "tests/models/qwen38_flash_next/mtp_replay.hpp"
+#include "tests/models/qwen38_flash_next/split_plan.hpp"
 
 namespace qfn = gufo::models::qwen38_flash_next;
 namespace cache = gufo::cache;
@@ -382,13 +383,16 @@ void CheckSlotReuse(const std::shared_ptr<qfn::Model>& model, bool mtp) {
   std::cout << (mtp ? "MTP" : "AR")
             << ",slot_reuse,sampled/greedy/cancellation/reset,PASS\n";
 }
-/// Several component checkpoints captured in one pass, through the
-/// production adapter path, against a prompt split at every point: a point
-/// five rows into the pass, one four rows later (closer than the draft
-/// depth), one on a selection block and one off the alignment. Each frozen
-/// checkpoint, the live frontier and a resumed checkpoint equal the split.
+/// Several component checkpoints captured in prefill passes, through the
+/// production adapter path, against a prompt split at every point and at
+/// the same pass ends: a point five rows into the first pass, one four rows
+/// later (closer than the draft depth), one on a selection block and one off
+/// the alignment. Each frozen checkpoint, the live frontier and a resumed
+/// checkpoint equal the split. `in_pass` is false when the device has no
+/// room for the checkpoint arena, so each point ends a pass.
 void CheckInPassMany(const std::shared_ptr<qfn::Model>& model, bool mtp,
-                     std::span<const std::int32_t> prompt) {
+                     std::span<const std::int32_t> prompt,
+                     bool in_pass = true) {
   gufo::hip::TransferPool streams(2);
   qfn::ContinuationAdapter adapter(
       model,
@@ -413,8 +417,11 @@ void CheckInPassMany(const std::shared_ptr<qfn::Model>& model, bool mtp,
   Require(
       (order == std::vector<std::size_t>{0, 1, 2, 3}) && a.Position() == kEnd,
       "in-pass captures out of order or frontier changed");
+  const auto splits = gufo::test::SplitPlan(*model, 0, kEnd, points, in_pass);
+  auto split_at = splits.begin();
   for (std::size_t i = 0; i < std::size(points); ++i) {
-    Require(b.Sync(prompt.first(points[i]), &error), error);
+    for (; split_at != splits.end() && *split_at <= points[i]; ++split_at)
+      Require(b.Sync(prompt.first(*split_at), &error), error);
     const auto split = Capture(adapter, *reference, streams);
     std::string differing;
     for (std::size_t c = 0; c < split.bytes.size(); ++c) {
@@ -438,7 +445,8 @@ void CheckInPassMany(const std::shared_ptr<qfn::Model>& model, bool mtp,
             "component in-pass checkpoint at " + std::to_string(points[i]) +
                 " differs from a pass ending there:" + differing);
   }
-  Require(b.Sync(prompt.first(kEnd), &error), error);
+  for (; split_at != splits.end(); ++split_at)
+    Require(b.Sync(prompt.first(*split_at), &error), error);
   SameLogits(a, b);
   {
     const auto live = Capture(adapter, *source, streams);
@@ -1186,6 +1194,9 @@ int main(int argc, char** argv) {
       std::cout << "device exhaustion:\n";
       CheckInPass(model, false, prompt);
       CheckInPass(model, true, prompt);
+      // Each boundary then ends a pass of its own.
+      CheckInPassMany(model, false, prompt, false);
+      CheckInPassMany(model, true, prompt, false);
     }
     if (!image_only && !in_pass_only) {
       CheckTransferAndGuardLifetime(model, false, prompt);

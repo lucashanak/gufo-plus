@@ -13,6 +13,7 @@
 
 #include "src/core/sampling.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
+#include "tests/models/qwen38_flash_next/split_plan.hpp"
 
 void LimitReportedDeviceFree(std::size_t bytes);
 
@@ -400,7 +401,8 @@ void CheckExtendedPrefillCheckpoint(const std::shared_ptr<qfn::Model>& model,
 
 /// Checkpoints captured inside long prefill passes: every boundary's
 /// payload, the live logits, a sampled continuation and each checkpoint's
-/// resumed prompt equal a prompt split at the boundaries.
+/// resumed prompt equal a prompt split at the boundaries and at the same
+/// pass ends (SplitPlan).
 void CheckDeepPrefillCheckpoints(const std::shared_ptr<qfn::Model>& model,
                                  std::span<const std::int32_t> prompt,
                                  gufo::core::SessionMode mode, std::size_t warm,
@@ -421,21 +423,27 @@ void CheckDeepPrefillCheckpoints(const std::shared_ptr<qfn::Model>& model,
           error);
   Require(checkpoints.size() == boundaries.size(),
           "deep checkpoints were not all returned");
+  const auto splits = gufo::test::SplitPlan(
+      *model, static_cast<std::uint32_t>(warm),
+      static_cast<std::uint32_t>(prompt.size()), boundaries);
+  auto split_at = splits.begin();
   for (std::size_t i = 0; i < boundaries.size(); ++i) {
-    Require(split->Sync(prompt.first(boundaries[i]), &error), error);
+    for (; split_at != splits.end() && *split_at <= boundaries[i]; ++split_at)
+      Require(split->Sync(prompt.first(*split_at), &error), error);
     Require(checkpoints[i] && Payload(*checkpoints[i]) == Payload(*split),
             "deep checkpoint at " + std::to_string(boundaries[i]) +
                 " differs from a pass ending there");
   }
-  Require(split->Sync(prompt, &error), error);
+  for (; split_at != splits.end(); ++split_at)
+    Require(split->Sync(prompt.first(*split_at), &error), error);
   Require(std::memcmp(source->Logits().data(), split->Logits().data(),
                       source->Logits().size_bytes()) == 0,
           "deep checkpoints changed split-pass logits");
   Require(Payload(*source) == Payload(*split),
           "deep checkpoints changed the live frontier");
-  // A resumed checkpoint continues like the prompt split at it and the
-  // boundaries before it (a split at an unaligned boundary groups later
-  // sparse queries from it, in a pass and across passes alike).
+  // A resumed checkpoint continues like the prompt split at it and at the
+  // splits before it (a split at an unaligned boundary groups later sparse
+  // queries from it, in a pass and across passes alike).
   for (std::size_t i = 0; i < boundaries.size(); ++i) {
     auto restored = model->CreateSession(mode, kContext, &error);
     auto reference = model->CreateSession(mode, kContext, &error);
@@ -444,8 +452,9 @@ void CheckDeepPrefillCheckpoints(const std::shared_ptr<qfn::Model>& model,
             error);
     if (warm)
       Require(reference->Sync(prompt.first(warm), &error), error);
-    for (std::size_t j = 0; j <= i; ++j)
-      Require(reference->Sync(prompt.first(boundaries[j]), &error), error);
+    for (const auto at : splits)
+      if (at <= boundaries[i])
+        Require(reference->Sync(prompt.first(at), &error), error);
     Require(reference->Sync(prompt, &error) && restored->Sync(prompt, &error),
             error);
     Require(Payload(*restored) == Payload(*reference),
@@ -510,9 +519,11 @@ int main(int argc, char** argv) {
       const auto all = std::span<const std::int32_t>(long_prompt);
       for (const auto mode : {gufo::core::SessionMode::kAutoregressive,
                               gufo::core::SessionMode::kSpeculative}) {
-        // One 16,000-row pass: the sparse budget's first row, a point off
-        // the four-token alignment and a deep one.
-        CheckDeepPrefillCheckpoints(model, all, mode, 0, {2048, 6146, 12288});
+        // 4,096-row passes: the sparse budget's first row and a point off
+        // the four-token alignment in the first pass, two in the second, and
+        // a deep one off the alignment.
+        CheckDeepPrefillCheckpoints(model, all, mode, 0,
+                                    {2048, 3074, 6146, 7168, 12290});
         // A pass starting off the alignment after a warm prefix.
         CheckDeepPrefillCheckpoints(model, all.first(10000), mode, 4095,
                                     {6144, 8190});
@@ -523,7 +534,7 @@ int main(int argc, char** argv) {
         // More boundaries than one pass captures: the pass ends at the
         // fourth and the next one takes the fifth.
         CheckDeepPrefillCheckpoints(model, all.first(8000), mode, 0,
-                                    {1024, 2048, 3072, 4096, 5120});
+                                    {512, 1024, 2048, 3072, 3584});
       }
       return 0;
     }
@@ -565,22 +576,18 @@ int main(int argc, char** argv) {
       CheckPrefillCheckpoint(model, prompt, mode, 0, 0);
       CheckPrefillCheckpoint(
           model, std::span<const std::int32_t>(warm_prompt).first(2055), mode);
-      // The longest in-pass tail: an eight-row suffix behind a boundary that
-      // four-token alignment moved back by three (sparse at 2,048, and after
-      // a warm prefix so the pass starts off the alignment).
+      // An eight-row suffix behind a boundary that four-token alignment
+      // moved back by three (sparse at 2,048, and after a warm prefix so the
+      // pass starts off the alignment), and a tail beyond it.
       CheckPrefillCheckpoint(model,
                              std::span<const std::int32_t>(prompt).first(2059),
                              mode, 0, 11);
       CheckPrefillCheckpoint(
           model, std::span<const std::int32_t>(warm_prompt).first(4111), mode,
           prompt.size(), 11);
-      auto longer = model->CreateSession(mode, 8192, &error);
-      Require(longer != nullptr, error);
-      std::unique_ptr<qfn::SessionSnapshot> refused;
-      Require(!longer->SyncThrough(
-                  std::span<const std::int32_t>(prompt).first(2060), 2048,
-                  &refused, &error),
-              "a 12-row in-pass tail was accepted");
+      CheckPrefillCheckpoint(model,
+                             std::span<const std::int32_t>(prompt).first(2060),
+                             mode, 0, 12);
     }
     CheckBorrowedSnapshots(model, prompt,
                            gufo::core::SessionMode::kAutoregressive);

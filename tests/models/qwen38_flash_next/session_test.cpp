@@ -6,12 +6,14 @@
 #include <future>
 #include <iostream>
 #include <latch>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "src/cli/serve/inference_backend.hpp"
+#include "src/cli/serve/text_model_runner.hpp"
 #include "src/families/qwen/draft_vocab/draft_vocab.hpp"
 #include "src/families/qwen/text/chat_template.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
@@ -368,6 +370,77 @@ void CheckPrefillChunks(const std::shared_ptr<qfn::Model>& model) {
               << " four logit rows and sampled MTP replay exact\n"
               << std::flush;
   }
+}
+
+// A continuation of a decoded frontier off the selection block, longer than
+// one prefill pass, ends its capacity-limited steps on the block (#1015).
+// Those steps then continue the prompt as one Sync from that frontier does.
+void CheckUnalignedContinuationPasses(
+    const std::shared_ptr<qfn::Model>& model) {
+  namespace server = gufo::server;
+  std::string error;
+  const std::size_t ratio = model->config().compress_ratio;
+  server::TextRunnerPool pool(qfn::CreateQwenFlashNextTextRunner(model, 6145),
+                              1);
+  const auto pattern = model->Tokenize(
+      "Virtual memory maps pages to physical storage. "
+      "A train travels sixty kilometers per hour. ");
+  Require(pattern.size() > 5, "short continuation fixture");
+  std::size_t unaligned = 0;
+  for (std::size_t generate = 1; generate <= 3; ++generate) {
+    std::vector<std::int32_t> prompt(pattern.begin(), pattern.begin() + 5);
+    prompt.front() += static_cast<std::int32_t>(generate);
+    const std::vector<std::int32_t> head = prompt;
+    auto first = pool.Acquire({prompt.begin(), prompt.end()},
+                              sampling::SamplingConfig{});
+    while (!first.prefill_complete())
+      (void)first.Prefill(prompt.size());
+    for (std::size_t i = 0; i < generate; ++i) {
+      prompt.push_back(static_cast<std::int32_t>(first.SelectNext().token));
+      first.Advance();
+    }
+    (void)first.Commit();
+    const auto decoded = prompt.size();
+    for (std::size_t i = 0; prompt.size() < 5000; ++i)
+      prompt.push_back(pattern[i % pattern.size()]);
+    auto second = pool.Acquire({prompt.begin(), prompt.end()},
+                               sampling::SamplingConfig{});
+    auto position = second.cached_prompt_tokens();
+    Require(position > head.size() && position <= decoded,
+            "continuation did not reuse the decoded frontier");
+    const auto frontier = position;
+    unaligned += position % ratio != 0;
+    std::vector<std::size_t> ends;
+    while (!second.prefill_complete()) {
+      position += second.Prefill(prompt.size()).consumed_tokens;
+      Require(position == prompt.size() || position % ratio == 0,
+              "capacity-limited prefill step ended off the selection block: " +
+                  std::to_string(position));
+      ends.push_back(position);
+    }
+    second.Invalidate();
+    Require(ends.size() > 1, "continuation fit one prefill pass");
+    auto bulk = model->CreateSession(gufo::core::SessionMode::kAutoregressive,
+                                     6145, &error);
+    auto split = model->CreateSession(gufo::core::SessionMode::kAutoregressive,
+                                      6145, &error);
+    Require(bulk && split, error);
+    for (auto* session : {bulk.get(), split.get()}) {
+      Require(session->Sync(head, &error), error);
+      for (std::size_t i = head.size(); i < frontier; ++i)
+        Require(session->Evaluate(prompt[i], &error), error);
+    }
+    Require(bulk->Sync(prompt, &error), error);
+    for (const auto end : ends)
+      Require(split->Sync(std::span(prompt).first(end), &error), error);
+    RequireExact(bulk->Logits(), split->Logits(),
+                 "aligned continuation steps changed logits: frontier=" +
+                     std::to_string(frontier));
+  }
+  Require(unaligned > 0, "fixture never reused an unaligned frontier");
+  std::cout << "unaligned continuation: aligned steps exact, frontiers="
+            << unaligned << '\n'
+            << std::flush;
 }
 
 // A prefetched chunk serves the next chunk's leading tokens when a cache
@@ -2046,6 +2119,27 @@ void CheckLogprobs(const std::shared_ptr<qfn::Model>& model) {
   }
 }
 
+// Sessions allocate full-context K/V when they are created and the pool admits
+// them through per_request_state_bytes. Prompts write those committed rows, so
+// charging prompt length again refuses cached follow-ups under low host
+// headroom without any new allocation (#1157).
+void CheckPreallocatedStateClaim(const std::shared_ptr<qfn::Model>& model) {
+  gufo::ext::TextSpeculativeConfig speculative;
+  speculative.backend = gufo::ext::TextSpeculativeBackend::kMtp;
+  for (const bool mtp : {false, true}) {
+    const auto runner =
+        mtp ? qfn::CreateQwenFlashNextTextRunner(model, 6145, speculative)
+            : qfn::CreateQwenFlashNextTextRunner(model, 6145);
+    const auto claim = runner->ResourceClaim();
+    Require(claim.per_request_state_bytes.value_or(0) > 0,
+            "Flash-Next claims its full-context session state");
+    Require(!claim.prompt_state_bytes_per_token &&
+                !claim.prompt_admission_budget_bytes &&
+                !claim.prompt_admission_available_bytes,
+            "Flash-Next leaves preallocated prompt state unclaimed");
+  }
+}
+
 int main(int argc, char** argv) {
   const bool logprobs_only =
       argc == 6 && std::string_view(argv[5]) == "--logprobs-only";
@@ -2095,6 +2189,7 @@ int main(int argc, char** argv) {
          .decode_concurrency = 8},
         &error);
     Require(model != nullptr, error);
+    CheckPreallocatedStateClaim(model);
     if (logprobs_only) {
       CheckLogprobs(model);
       CheckServingEos(model);
@@ -2129,6 +2224,7 @@ int main(int argc, char** argv) {
     if (!batch_only) {
       CheckExecutionModes(model, 2048, true);
       CheckPrefillChunks(model);
+      CheckUnalignedContinuationPasses(model);
       CheckPrefetchHints(model);
       CheckColdPrefillRamp(model);
     }

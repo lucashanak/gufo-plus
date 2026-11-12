@@ -312,10 +312,6 @@ std::uint32_t Model::PrefillThroughCapacity() const noexcept {
                   options_.max_context);
 }
 
-std::uint32_t Model::PrefillCheckpointTail() const noexcept {
-  return executor_->PrefillCheckpointTail();
-}
-
 bool Model::HasMtp() const noexcept {
   return device_->has_mtp();
 }
@@ -378,6 +374,16 @@ std::size_t Model::DeferredScratchBytes() const {
 
 void Model::LimitCopyRows(std::uint32_t rows) noexcept {
   executor_->LimitCopyRows(rows);
+}
+
+void Model::SetPrefillYield(std::size_t groups,
+                            std::function<void()> yield) const {
+  if (groups < 2 || !yield) {
+    executor_->SetLayerHook({}, {});
+    return;
+  }
+  executor_->SetLayerHook(executor_->LayerHookBoundaries(groups),
+                          std::move(yield));
 }
 
 std::size_t Session::AllocatedBytes() const noexcept {
@@ -1288,6 +1294,7 @@ struct Session::PendingDecode {
   std::int32_t draft{0};
   bool draft_subset{false};  ///< this cycle drafts through the subset head
   bool sampled_subset_cost{false};
+  bool planned_greedy{false};
   /// Trailing chain tokens copied by prompt lookup (after the MTP drafts).
   std::uint32_t lookup{0};
   /// Committed index the copied tokens were taken from.
@@ -1404,6 +1411,8 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   pending->policy_concurrency = MtpPolicyConcurrency(
       sampler.config().uses_random_sampling(), sampler.config().seed >= 0,
       batch_drafts.has_value(), occupancy);
+  pending->planned_greedy =
+      batch_drafts.has_value() && !sampler.config().uses_random_sampling();
   // Every chain ends after its first proposal below the gate (greedy: the
   // head's confidence, read back with each draft token in every path;
   // sampled: host-side q). An unplanned cycle drafts to its budget; a jointly
@@ -1813,7 +1822,8 @@ bool Session::FinishDecode(const DecodeRequest& request,
   if (!pending.dflash)
     draft_length_.Observe(
         observed, result->stop || mtp_all ? observed : mtp_drafts, base,
-        pending.policy_concurrency, pending.sampled_subset_cost);
+        pending.policy_concurrency, pending.sampled_subset_cost,
+        pending.planned_greedy);
 
   // The next call knows the next sampled anchor. Defer draft catch-up until
   // then, retaining this session's target hidden rows across interleaving.
