@@ -233,29 +233,6 @@ private:
   std::size_t position_{0};
 };
 
-template<class Traits>
-class QwenMoeTextRunnerSnapshot final : public TextRunnerSnapshot {
-public:
-  QwenMoeTextRunnerSnapshot(std::shared_ptr<typename Traits::Model> model,
-                            std::unique_ptr<typename Traits::Snapshot> snapshot,
-                            std::size_t position)
-      : model(std::move(model)),
-        snapshot(std::move(snapshot)),
-        position(position) {}
-
-  [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
-    if (snapshot == nullptr ||
-        snapshot->SizeBytes() > static_cast<std::uint64_t>(
-                                    std::numeric_limits<std::size_t>::max())) {
-      return 0;
-    }
-    return static_cast<std::size_t>(snapshot->SizeBytes());
-  }
-
-  std::shared_ptr<typename Traits::Model> model;
-  std::unique_ptr<typename Traits::Snapshot> snapshot;
-  std::size_t position;
-};
 
 template<class Traits>
 QwenMoeTextRunnerState<Traits>& RequireQwenMoeState(TextRunnerState& state) {
@@ -294,6 +271,22 @@ public:
         max_draft_tokens_(max_draft_tokens),
         persistence_(std::move(persistence)) {}
 
+  // TODO(fork): the Qwen3.6 component-cache adapter replaces the native
+  // snapshots upstream v0.34 removed; until it lands this runner cannot load.
+  [[nodiscard]] std::unique_ptr<ComponentCacheResources>
+  CreateComponentCacheResources(cache::ResourceLedger&,
+                                std::size_t) const override {
+    throw std::runtime_error(std::string(Traits::kName) +
+                             " needs its component-cache adapter (v0.34 port)");
+  }
+  [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
+      cache::Adapter&, cache::Slot&) const override {
+    throw std::logic_error("Qwen3.6 component state is not bound yet");
+  }
+  void ReconcileComponentState(TextRunnerState&, std::size_t) const override {
+    throw std::logic_error("Qwen3.6 component state is not bound yet");
+  }
+
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
     return {
         .model_id = model_->ModelName(),
@@ -302,8 +295,6 @@ public:
         .capabilities =
             TextRunnerCapabilities{
                 .incremental_prefill = true,
-                .snapshot = true,
-                .fork = true,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
                 .multi_token_decode = use_mtp_,
@@ -311,7 +302,6 @@ public:
                 .batched_multi_token_decode_max_width = use_mtp_ ? 8u : 0u,
                 .prefix_reuse = true,
             },
-        .persistence = persistence_,
         .sampling_preset = sampling::TextModelPreset::kQwen36,
     };
   }
@@ -644,105 +634,6 @@ public:
     return RequireQwenMoeState<Traits>(state).position();
   }
 
-  [[nodiscard]] std::size_t SnapshotPayloadBytes(
-      const TextRunnerState& state) const override {
-    const std::uint64_t bytes =
-        RequireQwenMoeState<Traits>(state).session().SnapshotBytes();
-    if (bytes == 0 || bytes > static_cast<std::uint64_t>(
-                                  std::numeric_limits<std::size_t>::max())) {
-      throw std::overflow_error(std::string(Traits::kName) +
-                                " snapshot size is unavailable");
-    }
-    return static_cast<std::size_t>(bytes);
-  }
-
-  [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
-      const TextRunnerState& state) const override {
-    const auto& qfn = RequireQwenMoeState<Traits>(state);
-    std::string error;
-    auto snapshot = qfn.session().SaveSnapshot(&error);
-    if (snapshot == nullptr) {
-      throw std::runtime_error(std::string(Traits::kName) +
-                               " snapshot failed: " + error);
-    }
-    return std::make_unique<QwenMoeTextRunnerSnapshot<Traits>>(
-        model_, std::move(snapshot), qfn.position());
-  }
-
-  void RestoreOrFork(TextRunnerState& state,
-                     const TextRunnerSnapshot& snapshot) const override {
-    const auto* qfn_snapshot =
-        dynamic_cast<const QwenMoeTextRunnerSnapshot<Traits>*>(&snapshot);
-    if (qfn_snapshot == nullptr || qfn_snapshot->model.get() != model_.get() ||
-        qfn_snapshot->snapshot == nullptr) {
-      throw std::invalid_argument(std::string(Traits::kName) +
-                                  " snapshot does not belong to this model");
-    }
-    auto& restored = RequireQwenMoeState<Traits>(state);
-    std::string error;
-    if (!restored.session().RestoreSnapshot(*qfn_snapshot->snapshot, &error)) {
-      restored.Invalidate();
-      throw std::runtime_error(std::string(Traits::kName) +
-                               " snapshot restore failed: " + error);
-    }
-    restored.set_position(qfn_snapshot->position);
-  }
-
-  [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
-      const TextRunnerSnapshot& snapshot) const override {
-    const auto* qfn_snapshot =
-        dynamic_cast<const QwenMoeTextRunnerSnapshot<Traits>*>(&snapshot);
-    if (qfn_snapshot == nullptr || qfn_snapshot->model.get() != model_.get() ||
-        qfn_snapshot->snapshot == nullptr) {
-      throw std::invalid_argument(
-          std::string(Traits::kName) +
-          " persistent snapshot does not belong to this "
-          "model");
-    }
-    return qfn_snapshot->PayloadBytes();
-  }
-
-  [[nodiscard]] std::size_t SerializePersistentSnapshot(
-      const TextRunnerSnapshot& snapshot,
-      std::span<std::uint8_t> destination) const override {
-    const auto* qfn_snapshot =
-        dynamic_cast<const QwenMoeTextRunnerSnapshot<Traits>*>(&snapshot);
-    if (qfn_snapshot == nullptr || qfn_snapshot->model.get() != model_.get() ||
-        qfn_snapshot->snapshot == nullptr ||
-        destination.size() != qfn_snapshot->PayloadBytes() ||
-        !qfn_snapshot->snapshot->CopyTo(destination)) {
-      throw std::invalid_argument(std::string(Traits::kName) +
-                                  " persistent snapshot serialization failed");
-    }
-    return destination.size();
-  }
-
-  void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
-                                const SnapshotSink& sink) const override {
-    (void)PersistentSnapshotPayloadBytes(snapshot);
-    sink(dynamic_cast<const QwenMoeTextRunnerSnapshot<Traits>&>(snapshot)
-             .snapshot->bytes());
-  }
-
-  void RestorePersistentSnapshot(
-      TextRunnerState& state,
-      std::span<const std::uint8_t> payload) const override {
-    auto& restored = RequireQwenMoeState<Traits>(state);
-    std::string error;
-    if (!restored.session().RestoreSnapshot(payload, &error)) {
-      restored.Invalidate();
-      throw std::runtime_error(std::string(Traits::kName) +
-                               " persistent snapshot restore failed: " + error);
-    }
-    const std::uint32_t position = restored.session().Position();
-    if (position == 0 || position > max_context_) {
-      restored.Invalidate();
-      throw std::runtime_error(std::string(Traits::kName) +
-                               " persistent snapshot restored an invalid "
-                               "position");
-    }
-    restored.set_position(position);
-  }
 
 private:
   mutable models::qwen::vision::ImageCache image_cache_;

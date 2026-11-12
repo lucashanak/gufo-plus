@@ -759,38 +759,6 @@ struct TextRunnerPool::Request::Impl {
                           position);
   }
 
-  /// Retains an intermediate checkpoint at `position` while the runner
-  /// exposes it inside a prefill pass (component leases only).
-  void CaptureInPassCheckpoint(std::size_t position) noexcept {
-    std::size_t bytes = 0;
-    bool reserved = false;
-    try {
-      const auto prefix =
-          std::span<const TextRunnerToken>(prompt).first(position);
-      if (lease.HasSnapshotFor(prefix))
-        return;
-      const bool shared_with_peers =
-          std::ranges::find(shared_checkpoints, position) !=
-          shared_checkpoints.end();
-      bytes = lease.CaptureBytes();
-      reserved = lease.TryReserveSnapshot(bytes, position, true,
-                                          shared_with_peers
-                                              ? SnapshotPurpose::kBranchPoint
-                                              : SnapshotPurpose::kHistory);
-      if (!reserved)
-        return;
-      std::shared_ptr<const TextRunnerSnapshot> snapshot = lease.Capture();
-      if (snapshot) {
-        snapshot_metrics.snapshot_bytes += lease.PublishSnapshot(
-            {prefix.begin(), prefix.end()}, snapshot, true);
-        reserved = false;
-      }
-    } catch (...) {
-    }
-    if (reserved)
-      lease.SkipSnapshot(SnapshotEventReason::kCaptureFailure, bytes, position);
-  }
-
   std::shared_ptr<TextModelRunner> runner;
   std::unique_ptr<ComponentTextCache::Lease> lease;
   std::vector<TextRunnerToken> prompt;
