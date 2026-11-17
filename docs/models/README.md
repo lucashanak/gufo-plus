@@ -13,11 +13,13 @@ to run the model and what speed to expect.
 | Qwen-Image-2.1 | BF16 safetensors; generation and image editing | [Usage](qwen-image-2.1.md) |
 | Qwen3-ASR 1.7B | BF16 safetensors; audio to text | [Usage](qwen3-asr.md) |
 | Qwen3-TTS 12Hz 1.7B | BF16 safetensors; text/reference audio to speech | [Voice modes](qwen3-tts.md) |
+| Qwen3.6 35B-A3B | Q6dense GGUF with native MTP; text | [Usage](docs/models/qwen3.6-35b-a3b/README.md) |
 | Qwen3.8 27B | Q4/Q8 GGUF; text/images | [Usage and modes](qwen3.8-27b.md) |
 | Qwen3.8 Flash-Next | Sharded Q4 GGUF; text/images | [Usage and modes](qwen3.8-flash-next.md) |
 <!-- END GENERATED MODEL TABLE -->
 
-Gufo doesn't ship weights; download them from Hugging Face as each page shows.
+Install a model's weights with `gufo model install <id>`, as each page shows;
+see [model files](../install.md#model-files).
 Every speed on these pages was measured on Strix Halo with 128 GB of memory,
 on the date given next to it.
 

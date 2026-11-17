@@ -100,6 +100,9 @@ public:
   ~StreamedStore();
   StreamedStore(const StreamedStore&) = delete;
   StreamedStore& operator=(const StreamedStore&) = delete;
+  // Optional stream classes for disk writes and restores; empty leases keep
+  // the constructor's. Call before the first Write or Restore.
+  void SetStreamClasses(StreamLease write, StreamLease restore);
   void Write(DiskFileId, const DiskManifest&, std::span<PersistenceSource>,
              TransferTiming&, std::stop_token = {},
              const std::function<bool()>& model_idle = {});
@@ -164,6 +167,10 @@ public:
   PersistenceQueue(const PersistenceQueue&) = delete;
   PersistenceQueue& operator=(const PersistenceQueue&) = delete;
   bool TrySubmit(PersistenceJob);
+  // Discard one queued (never active) write and release its source pins.
+  // Reports false completion outside the queue lock before returning; counted
+  // as superseded work. Drain also waits for this completion callback.
+  bool DiscardPending(CheckpointId);
   void Drain();
   void Stop();
   [[nodiscard]] PersistenceQueueStats Stats() const;

@@ -10,8 +10,10 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <gufo/ext/experimental/managed_alloc.hpp>
 #include <gufo/ext/experimental/snapshot_transfer.hpp>
+#include <gufo/ext/experimental/state_memory.hpp>
 #include <gufo/ext/platform/pages.hpp>
 #include <limits>
 #include <memory>
@@ -30,6 +32,13 @@ namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
 
 using core::GgmlType;
+
+// Rows past the frontier that must be backed now: tile-rounded attention
+// reads and the next steps' writes.
+constexpr std::size_t kKvTileRows = 2048;
+// Rows the pool thread maps further ahead, off the scheduler thread: a
+// prefill pass and more, so a writer normally finds its pages mapped.
+constexpr std::size_t kKvAheadRows = 8192;
 
 void AssignError(std::string* error_msg, const std::string& message) {
   if (error_msg != nullptr) {
@@ -114,6 +123,8 @@ constexpr double kCountsWaitShare = 0.92;
 // 1,693 without the shared-expert one, 1,741 without both (production
 // 1,733). Off until it is retuned for these kernels.
 constexpr bool kPrefillSideStream = false;
+/// Rows of one draft head projection: a batch drafts at most eight sessions.
+constexpr std::uint32_t kDraftHeadRows = 8;
 // Keep prompt arithmetic independent of chunk width. A scoped, per-thread
 // policy also lets the output head retain its existing logits-row arithmetic.
 thread_local bool prefill_phase = false;
@@ -278,7 +289,7 @@ public:
                           std::uint64_t reserved = 0) const {
     std::size_t free = 0;
     std::size_t total = 0;
-    if (hipMemGetInfo(&free, &total) != hipSuccess)
+    if (mem::MemGetInfo(&free, &total) != hipSuccess)
       return false;
     return free >= bytes && free - bytes + reserved >= reserve_;
   }
@@ -696,9 +707,6 @@ void Session::PreserveSnapshots(std::uint32_t position,
 }
 
 Session::~Session() {
-  // No longer a candidate for releasing idle K/V rows.
-  if (owner_ != nullptr)
-    owner_->Unregister(this);
   try {
     PreserveSnapshots(0, 0);
   } catch (...) {
@@ -710,11 +718,6 @@ Session::~Session() {
   TrimRollback(0);
   if (owner_ != nullptr)
     owner_->DropBatchGraphs(this);
-  if (kv_ && kv_.use_count() == 1) {
-    // Unmapping is not ordered after queued work: drain readers first.
-    (void)hipDeviceSynchronize();
-    kv_.reset();
-  }
   for (auto& [key, exec] : graphs_) {
     (void)hipGraphExecDestroy(exec);
   }
@@ -780,18 +783,8 @@ bool Session::CheckCancellation(std::string* error) const {
   return true;
 }
 
-std::size_t Session::KvBytes() const noexcept {
-  std::size_t bytes = 0;
-  if (kv_) {
-    for (const auto* rows : {&kv_->target, &kv_->draft})
-      for (const auto& buffer : *rows)
-        bytes += buffer.mapped_bytes();
-  }
-  return bytes;
-}
-
 std::size_t Session::AllocatedBytes() const noexcept {
-  return allocated_bytes_ + KvBytes() + rollback_bytes_ + vision_input_.Bytes();
+  return allocated_bytes_ + rollback_bytes_ + vision_input_.Bytes();
 }
 
 PrefillCheckpoint::~PrefillCheckpoint() {
@@ -870,7 +863,6 @@ std::unique_ptr<PrefillCheckpoint> Executor::MakePrefillCheckpoint(
   view.position_ = source.position_ + prefix;
   view.mtp_enabled_ = source.mtp_enabled_;
   view.attention_ = source.attention_;
-  view.kv_ = source.kv_;
   view.linear_.resize(source.linear_.size());
   view.blocks_ = c.compress_ratio > 0 && view.position_ > c.indexer_top_k
                      ? view.position_ / c.compress_ratio
@@ -1106,17 +1098,6 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     return nullptr;
   }
   e->context_capacity_ = std::max(c.context_length, options.max_context);
-  if (!KvPool::Supported(error_msg))
-    return nullptr;
-  e->kv_pool_ = std::make_unique<KvPool>(options.kv_budget);
-  // The address arena first: session buffers allocated and freed later never
-  // share an address with K/V chunks (see KvPool::kRemapQuarantine). It
-  // holds 64 sessions at the executor's context.
-  if (!e->kv_pool_->ReserveArena(
-          64 * e->GrowableBytes(core::SessionMode::kSpeculative,
-                                e->context_capacity_),
-          error_msg))
-    return nullptr;
   // YaRN stays static here: the 8-bit key rows (kv_cache_format.hpp) have no
   // re-rotation, so dynamic YaRN (SetYarnFactor) is not enabled.
   e->yarn_ = MakeYarnRope(c.rope_scaling, c.rotary_dim, c.rope_theta);
@@ -1357,6 +1338,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     s.mtp_argmax = Alloc<ArgmaxCandidate>(a, kArgmaxParts, error_msg);
     // The draft token and its confidence (float bits), one host transfer.
     s.mtp_token = Alloc<std::int32_t>(a, 2, error_msg);
+    s.draft_head_ids = Alloc<std::int32_t>(a, kDraftHeadRows, error_msg);
     const auto candidate_ids = std::max<std::size_t>(
         MtpCandidateWorkspaceSize(c.vocab_size),
         e->options_.max_speculative * kArgmaxParts *
@@ -1491,23 +1473,35 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   s->linear_.resize(c.num_layers);
   s->attention_.resize(c.num_layers);
   auto& a = s->allocations_;
+  // 8-bit K/V rows (kv_cache_format.hpp).
   const std::size_t kv_bytes = KvRowBytes(c.AttentionKvDim());
-  const std::size_t block_rows = max_context / c.compress_ratio + 1;
-  const std::size_t block_bytes =
-      std::size_t{c.indexer_head_dim} * sizeof(__half);
-  s->kv_ = std::make_shared<Session::KvRows>();
-  // Reserve the full-context ranges; ReserveKv backs them as rows arrive.
-  const auto reserve = [&](std::vector<GrowableRows>& rows, std::size_t bytes,
-                           std::size_t count) -> std::uint8_t* {
-    auto& buffer = rows.emplace_back();
-    return buffer.Reserve(kv_pool_.get(), bytes, count, error_msg)
-               ? buffer.data()
-               : nullptr;
-  };
+  const std::size_t block_elems =
+      std::size_t{max_context / c.compress_ratio + 1} * c.indexer_head_dim;
   const std::size_t conv_elems =
       static_cast<std::size_t>(c.ssm_conv_kernel - 1) * c.SsmConvChannels();
   const std::size_t state_elems = static_cast<std::size_t>(c.ssm_num_v_heads) *
                                   c.ssm_head_dim * c.ssm_head_dim;
+  // K/V keeps a fixed address for the whole context, backed by pages as
+  // positions are written (EnsureKv). The session still accounts its full
+  // size, and the state ledger keeps the unwritten rows promised to it. A
+  // failed reservation leaves a null entry. The account charges the pages
+  // to the shared state budget (#715); EnsureKv backs a tile past the
+  // frontier, which its margin covers.
+  s->account_ = std::make_shared<gufo::mem::StateAccount>(kKvTileRows);
+  const auto grow =
+      [&](std::vector<std::shared_ptr<gufo::mem::Region>>& regions) {
+        auto region = gufo::mem::Region::Create(
+            {.row_bytes = kv_bytes, .rows = max_context}, error_msg,
+            s->account_);
+        if (!region) {
+          a.push_back(nullptr);
+          return static_cast<std::uint8_t*>(nullptr);
+        }
+        s->allocated_bytes_ += region->bytes();
+        auto* data = static_cast<std::uint8_t*>(region->data());
+        regions.push_back(std::move(region));
+        return data;
+      };
   for (std::uint32_t il = 0; il < c.num_layers; ++il) {
     if (c.IsLinearLayer(il)) {
       auto& l = s->linear_[il];
@@ -1516,13 +1510,10 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
       l.state = Alloc<float>(a, state_elems, error_msg, &s->allocated_bytes_);
     } else {
       auto& at = s->attention_[il];
-      auto& rows = s->kv_->target;
-      at.k_cache = reserve(rows, kv_bytes, max_context);
-      at.v_cache = reserve(rows, kv_bytes, max_context);
-      at.block_k =
-          reinterpret_cast<__half*>(reserve(rows, block_bytes, block_rows));
-      if (!at.k_cache || !at.v_cache || !at.block_k)
-        return nullptr;
+      at.k_cache = grow(s->kv_regions_);
+      at.v_cache = grow(s->kv_regions_);
+      at.block_k = Alloc<__half>(a, block_elems, error_msg,
+                                 &s->allocated_bytes_);
       at.index_k = Alloc<float>(
           a, static_cast<std::size_t>(s->index_capacity_) * c.indexer_head_dim,
           error_msg, &s->allocated_bytes_);
@@ -1542,13 +1533,10 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
                          std::max(options_.max_speculative, max_copy_rows())) *
                          c.HcDim(),
                      error_msg, &s->allocated_bytes_);
-    auto& rows = s->kv_->draft;
-    s->mtp_.k_cache = reserve(rows, kv_bytes, max_context);
-    s->mtp_.v_cache = reserve(rows, kv_bytes, max_context);
+    s->mtp_.k_cache = grow(s->mtp_kv_regions_);
+    s->mtp_.v_cache = grow(s->mtp_kv_regions_);
     s->mtp_.block_k =
-        reinterpret_cast<__half*>(reserve(rows, block_bytes, block_rows));
-    if (!s->mtp_.k_cache || !s->mtp_.v_cache || !s->mtp_.block_k)
-      return nullptr;
+        Alloc<__half>(a, block_elems, error_msg, &s->allocated_bytes_);
     s->mtp_.index_k =
         Alloc<float>(a, std::size_t{s->index_capacity_} * c.indexer_head_dim,
                      error_msg, &s->allocated_bytes_);
@@ -1574,10 +1562,6 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
   // buffers until they have landed.
   if (!Check(hipDeviceSynchronize(), "session init", error_msg)) {
     return nullptr;
-  }
-  {
-    const std::lock_guard lock(sessions_mutex_);
-    sessions_.push_back(s.get());
   }
   // The table starts with the special tokens; every other slot is empty.
   if (s->mtp_.draft_rows != nullptr &&
@@ -1782,6 +1766,30 @@ bool Executor::EnsureWideSegments(std::uint32_t segments,
   return true;
 }
 
+bool Executor::EnsureKv(Session& session, std::uint32_t trunk_end,
+                        std::uint32_t mtp_end, std::string* error) const {
+  const auto ensure = [&](const auto& regions, std::size_t end) {
+    for (const auto& region : regions) {
+      if (!region->Ensure(end + kKvTileRows, error))
+        return false;
+      region->MapAhead(end + kKvAheadRows);
+    }
+    return true;
+  };
+  return ensure(session.kv_regions_, trunk_end) &&
+         ensure(session.mtp_kv_regions_, mtp_end);
+}
+
+std::size_t Executor::DemandMappedBytes(
+    core::SessionMode mode, std::uint32_t max_context) const noexcept {
+  const auto& c = config();
+  const std::size_t kv =
+      2 * std::size_t{max_context} * KvRowBytes(c.AttentionKvDim());
+  const std::size_t buffers = c.num_layers / c.full_attention_interval +
+                              (mode == core::SessionMode::kSpeculative);
+  return buffers * kv;
+}
+
 std::size_t Executor::SessionBytes(
     core::SessionMode mode, std::uint32_t max_context,
     std::uint32_t rollback_depth) const noexcept {
@@ -1794,14 +1802,14 @@ std::size_t Executor::SessionBytes(
       std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
   const std::size_t ple =
       c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
-  // K, V and pooled keys as mapped once every row is backed.
+  // 8-bit K and V rows (demand-mapped) and pooled keys.
   const std::size_t kv =
-      2 * GrowableRows::FullBytes(KvRowBytes(c.AttentionKvDim()), max_context);
+      2 * std::size_t{max_context} * KvRowBytes(c.AttentionKvDim());
   const std::size_t index =
       std::size_t{IndexerCapacity(c, options_.max_batch, max_context)} *
           c.indexer_head_dim * sizeof(float) +
-      GrowableRows::FullBytes(std::size_t{c.indexer_head_dim} * sizeof(__half),
-                              max_context / c.compress_ratio + 1);
+      std::size_t{max_context / c.compress_ratio + 1} * c.indexer_head_dim *
+          sizeof(__half);
   const auto rollback_state =
       rollback_depth == 0
           ? 0
@@ -1825,163 +1833,6 @@ std::size_t Executor::SessionBytes(
                                     sizeof(std::int32_t)) +
                                4096)
               : 0);
-}
-
-std::size_t Executor::GrowableBytes(core::SessionMode mode,
-                                    std::uint32_t tokens) const noexcept {
-  const auto& c = config();
-  const std::size_t layers = c.num_layers / c.full_attention_interval +
-                             (mode == core::SessionMode::kSpeculative ? 1 : 0);
-  return layers *
-         (2 * GrowableRows::FullBytes(KvRowBytes(c.AttentionKvDim()), tokens) +
-          GrowableRows::FullBytes(
-              std::size_t{c.indexer_head_dim} * sizeof(__half),
-              tokens / c.compress_ratio + 1));
-}
-
-std::size_t Executor::KvMappedBytes() const {
-  return kv_pool_->mapped();
-}
-
-void Executor::Unregister(const Session* session) const {
-  const std::lock_guard lock(sessions_mutex_);
-  std::erase(sessions_, session);
-}
-
-bool Executor::ReserveKv(Session& session, std::uint32_t rows,
-                         std::uint32_t draft_rows, std::string* error_msg,
-                         std::span<Session* const> busy,
-                         bool release_idle) const {
-  if (!session.kv_)
-    return true;
-  const auto& c = config();
-  auto& kv = *session.kv_;
-  const auto plan = [&](auto&& visit) {
-    for (std::size_t i = 0; i < kv.target.size(); ++i)
-      if (!visit(kv.target[i], i % 3 == 2 ? rows / c.compress_ratio + 1 : rows))
-        return false;
-    for (std::size_t i = 0; i < kv.draft.size(); ++i)
-      if (!visit(kv.draft[i],
-                 i % 3 == 2 ? draft_rows / c.compress_ratio + 1 : draft_rows))
-        return false;
-    return true;
-  };
-  std::size_t growth = 0;
-  (void)plan([&](const GrowableRows& buffer, std::size_t want) {
-    growth += buffer.GrowthBytes(want);
-    return true;
-  });
-  if (growth == 0)
-    return true;
-  if (!release_idle && kv_pool_->Available() < growth)
-    return false;
-  std::vector<Session*> keep(busy.begin(), busy.end());
-  keep.push_back(&session);
-  std::size_t kept = 0;
-  if (kv_pool_->Available() < growth)
-    (void)ReleaseIdleKv(growth - kv_pool_->Available(), keep, &kept);
-  if (kv_pool_->Available() < growth) {
-    AssignError(error_msg, "K/V memory exhausted: " + std::to_string(growth) +
-                               " more bytes needed, " +
-                               std::to_string(kv_pool_->mapped()) + " of " +
-                               std::to_string(kv_pool_->budget()) +
-                               " budgeted bytes in use; idle sessions kept " +
-                               std::to_string(kept) + "; holders " +
-                               KvHolders(keep));
-    return false;
-  }
-  return plan([&](GrowableRows& buffer, std::size_t want) {
-    // The device heap can run out before the budget: release idle rows and
-    // retry once.
-    return buffer.Grow(want, stream_, nullptr) ||
-           (release_idle && ReleaseIdleKv(buffer.GrowthBytes(want), keep) > 0 &&
-            buffer.Grow(want, stream_, nullptr)) ||
-           buffer.Grow(want, stream_, error_msg);
-  });
-}
-
-std::string Executor::KvHolders(std::span<Session* const> busy) const {
-  const std::lock_guard lock(sessions_mutex_);
-  std::string out;
-  for (const auto* session : sessions_) {
-    std::size_t bytes = 0;
-    if (session->kv_) {
-      for (const auto& buffer : session->kv_->target)
-        bytes += buffer.mapped_bytes();
-      for (const auto& buffer : session->kv_->draft)
-        bytes += buffer.mapped_bytes();
-    }
-    out += "[pos=" + std::to_string(session->position_) +
-           " mib=" + std::to_string(bytes >> 20) +
-           (std::ranges::find(busy, session) != busy.end() ? " busy" : "") +
-           "]";
-  }
-  return out;
-}
-
-std::size_t Executor::ReleaseIdleKv(std::size_t want,
-                                    std::span<Session* const> busy,
-                                    std::size_t* kept) const {
-  // Held throughout: a session being destroyed elsewhere waits in Unregister.
-  const std::lock_guard lock(sessions_mutex_);
-  const auto& c = config();
-  std::size_t released = 0;
-  bool drained = false;
-  for (auto* session : sessions_) {
-    if (released >= want)
-      break;
-    if (std::ranges::find(busy, session) != busy.end())
-      continue;
-    auto& kv = *session->kv_;
-    // Rows a pending speculative batch wrote stay until it is cut back.
-    const std::uint32_t rows = session->position_ + session->spec_tokens_;
-    const std::uint32_t draft_rows = session->mtp_.position;
-    const auto blocks = rows / c.compress_ratio + 1;
-    const auto draft_blocks = draft_rows / c.compress_ratio + 1;
-    // Releasing rows is an overwrite for anything that borrowed them.
-    try {
-      if (session->continuation_hooks_) {
-        std::uint32_t mapped = 0;
-        std::uint32_t mapped_blocks = 0;
-        std::uint32_t draft_mapped = 0;
-        std::uint32_t draft_mapped_blocks = 0;
-        for (std::size_t i = 0; i < kv.target.size(); ++i)
-          (i % 3 == 2 ? mapped_blocks : mapped) = std::max<std::uint32_t>(
-              i % 3 == 2 ? mapped_blocks : mapped,
-              static_cast<std::uint32_t>(kv.target[i].rows()));
-        for (std::size_t i = 0; i < kv.draft.size(); ++i)
-          (i % 3 == 2 ? draft_mapped_blocks : draft_mapped) =
-              std::max<std::uint32_t>(
-                  i % 3 == 2 ? draft_mapped_blocks : draft_mapped,
-                  static_cast<std::uint32_t>(kv.draft[i].rows()));
-        if (rows < mapped || blocks < mapped_blocks)
-          session->continuation_hooks_->BeforeWrite(false, rows, mapped, blocks,
-                                                    mapped_blocks);
-        if (draft_rows < draft_mapped || draft_blocks < draft_mapped_blocks)
-          session->continuation_hooks_->BeforeWrite(true, draft_rows,
-                                                    draft_mapped, draft_blocks,
-                                                    draft_mapped_blocks);
-      }
-      session->PreserveSnapshots(rows, draft_rows);
-    } catch (const std::exception&) {
-      if (kept != nullptr)
-        ++*kept;
-      continue;  // a pending transfer or failed slot keeps its rows
-    }
-    if (!drained) {
-      // Unmapping is not ordered after queued work or borrowed copies.
-      if (hipDeviceSynchronize() != hipSuccess) {
-        (void)hipGetLastError();
-        return released;
-      }
-      drained = true;
-    }
-    for (std::size_t i = 0; i < kv.target.size(); ++i)
-      released += kv.target[i].Shrink(i % 3 == 2 ? blocks : rows);
-    for (std::size_t i = 0; i < kv.draft.size(); ++i)
-      released += kv.draft[i].Shrink(i % 3 == 2 ? draft_blocks : draft_rows);
-  }
-  return released;
 }
 
 std::size_t Executor::DeferredScratchBytes() const {
@@ -4070,6 +3921,10 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     AssignError(error_msg, "session context is full");
     return false;
   }
+  if (!EnsureKv(session, session.position_ + n,
+                session.mtp_enabled_ ? session.mtp_.position + n : 0,
+                error_msg))
+    return false;
   for (auto t : tokens) {
     if (t < 0 || static_cast<std::uint32_t>(t) >= c.vocab_size) {
       AssignError(error_msg, "token out of range");
@@ -4086,8 +3941,6 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     return false;
   }
   if (speculative && !EnsureRollback(session, n - 1, error_msg))
-    return false;
-  if (!ReserveKv(session, start_pos + n, session.mtp_.position, error_msg))
     return false;
   // Failed eager/captured work can still be reading pinned inputs. Drain it
   // before another request reuses those buffers; successful forwards already
@@ -4184,20 +4037,14 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   if (graph && ple_pending_ && !WaitPle(error_msg)) {
     return false;
   }
-  // While a long prompt pass runs, map the K/V rows of the next pass and
-  // of this pass's draft catch-up: mapping between passes left the GPU idle
-  // (7 ms per pass in `gufo bench`, up to 70 ms behind a server). Only
-  // rows the budget has free; the passes themselves reserve the rest.
+  // Long eager prompt passes wait for the GPU in WaitRelaxed; EnsureKv's
+  // map-ahead backs the next pass's K/V rows on the page pool's thread.
   const bool relaxed = n >= kRelaxedWaitRows;
   const bool pregrow = relaxed && !graph && prefill_phase;
   if (!Run(session, key, graph, body, error_msg, !pregrow, relaxed)) {
     return false;
   }
   if (pregrow) {
-    const auto rows = start_pos + n + static_cast<std::uint32_t>(next.size());
-    (void)ReserveKv(session, rows,
-                    session.mtp_enabled_ ? rows : session.mtp_.position,
-                    nullptr, {}, false);
     if (!Check(hipEventRecord(pass_done_, stream_), "pass event", error_msg) ||
         !WaitRelaxed(pass_done_, "forward", error_msg))
       return false;
@@ -5185,6 +5032,8 @@ bool Executor::RestoreSnapshot(Session& session,
     AssignError(error_msg, "snapshot positions do not fit this session");
     return false;
   }
+  if (!EnsureKv(session, h.position, h.mtp_position, error_msg))
+    return false;
   if (h.position - h.blocks * h.compress_ratio > session.index_capacity_) {
     AssignError(error_msg, "unpooled indexer rows exceed the ring capacity");
     return false;
@@ -5217,8 +5066,6 @@ bool Executor::RestoreSnapshot(Session& session,
                 "image snapshot layout does not match its prompt attachment");
     return false;
   }
-  if (!ReserveKv(session, h.position, h.mtp_position, error_msg))
-    return false;
   if (layout.images.empty())
     session.ConfigureVision(nullptr, nullptr, stream_);
   // The session's queued work targets buffers the copies overwrite.
@@ -5702,7 +5549,7 @@ bool Executor::MtpForward(Session& session,
     AssignError(error_msg, "MTP context is full");
     return false;
   }
-  if (!ReserveKv(session, session.position_, pos + n, error_msg))
+  if (!EnsureKv(session, session.position_, pos + n, error_msg))
     return false;
   if (session.continuation_hooks_)
     session.continuation_hooks_->BeforeWrite(

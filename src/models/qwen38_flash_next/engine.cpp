@@ -202,7 +202,6 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
           : 1;
   exec.max_speculative = exec.max_logit_rows;
   exec.max_context = options.max_context;
-  exec.kv_budget = options.kv_cache_bytes;
   m->executor_ =
       rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);
   if (!m->executor_) {
@@ -351,21 +350,16 @@ std::size_t Model::SessionBytes(core::SessionMode mode,
                                         3 * sizeof(std::int32_t)) +
                     64
               : 0;
-  const std::size_t full =
-      executor_->SessionBytes(mode, context,
-                              mode == core::SessionMode::kSpeculative
-                                  ? executor_->max_speculative() - 1
-                                  : 0) +
-      vision;
-  // K/V rows grow with the tokens held: with a budget, a session claims its
-  // fixed state plus an equal share of the budget, not its full context.
-  const std::size_t growable = executor_->GrowableBytes(mode, context);
-  if (options_.kv_cache_bytes == 0 || growable == 0)
-    return full;
-  const std::size_t share =
-      options_.kv_cache_bytes /
-      std::max<std::uint32_t>(1, options_.decode_concurrency);
-  return full - std::min(full, growable) + std::min(growable, share);
+  return executor_->SessionBytes(mode, context,
+                                 mode == core::SessionMode::kSpeculative
+                                     ? executor_->max_speculative() - 1
+                                     : 0) +
+         vision;
+}
+
+std::size_t Model::DemandMappedBytes(core::SessionMode mode,
+                                     std::uint32_t context) const {
+  return mem::DemandMapped() ? executor_->DemandMappedBytes(mode, context) : 0;
 }
 
 std::size_t Model::DeferredScratchBytes() const {
@@ -386,12 +380,12 @@ void Model::SetPrefillYield(std::size_t groups,
                           std::move(yield));
 }
 
-std::size_t Session::AllocatedBytes() const noexcept {
-  return session_->AllocatedBytes();
+std::shared_ptr<mem::StateAccount> Session::StateAccount() const {
+  return session_->state_account();
 }
 
-std::size_t Session::KvBytes() const noexcept {
-  return session_->KvBytes();
+std::size_t Session::AllocatedBytes() const noexcept {
+  return session_->AllocatedBytes();
 }
 
 NgramTotals Session::NgramRowTotals() const noexcept {

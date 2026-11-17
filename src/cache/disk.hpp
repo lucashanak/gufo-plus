@@ -93,6 +93,10 @@ struct DiskStartupStats {
   std::uint64_t manifest_bytes_read{};
   std::uint64_t dependency_stats{}, rejected_manifests{};
   std::uint64_t managed_bytes{};
+  // Decoded references versus unique (namespace, file ID) observations during
+  // cold recovery. dependency_stats counts actual dependency StatAt calls;
+  // the initial directory enumeration also stats files independently.
+  std::uint64_t dependency_references{}, distinct_dependency_files{};
 };
 // Host-buffer publication only; caller retains and admits immutable buffers
 // until Publish returns. Full chunks already referenced by a checkpoint can be
@@ -215,6 +219,10 @@ enum class DiskPublicationStep {
 // A directory above the budget (for example after lowering it) still opens;
 // publication refuses until retirement or orphan reclamation brings
 // Stats().managed_bytes back within the budget.
+struct DiskUseHistory {
+  std::uint64_t last_used{}, admitted_bytes{};
+  std::optional<std::uint64_t> reused_at;
+};
 class DiskStore {
 public:
   DiskStore(ResourceLedger&, const std::filesystem::path& directory,
@@ -225,6 +233,11 @@ public:
   DiskStore(DiskStore&&) = delete;
   DiskStore& operator=(DiskStore&&) = delete;
   [[nodiscard]] std::span<const DurableEntry> Entries() const;
+  // Initialized, retained manifest vector storage included in the RAM ledger.
+  // For startup remaining-allocation accounting, not an RSS measurement.
+  // Excludes spare capacity, owner/index estimates, temporary validation,
+  // payloads and reservations. Use at quiescence with the host observation.
+  [[nodiscard]] std::size_t OwnedManifestBytes() const;
   [[nodiscard]] DiskStartupStats Stats() const;
   [[nodiscard]] DiskPublicationStats PublicationStats() const;
   void Publish(DiskFileId manifest_file, const DiskManifest&,
@@ -251,6 +264,13 @@ public:
           consume,
       DiskReadStats* observation = nullptr);
   [[nodiscard]] DiskReadPin Pin(CheckpointId, std::uint64_t epoch = 0) const;
+  // Advisory use history, independently checksummed and budgeted. Invalid or
+  // absent history returns zero. Writing never waits for a busy store; failure
+  // leaves the checkpoint and its immutable dependencies unchanged.
+  [[nodiscard]] DiskUseHistory UseHistory(CheckpointId) const;
+  [[nodiscard]] std::uint64_t LastUse(CheckpointId) const;
+  [[nodiscard]] bool TryRecordUse(CheckpointId, std::uint64_t);
+  [[nodiscard]] bool TryRecordUse(CheckpointId, const DiskUseHistory&);
   // Short logical quarantine; keeps filesystem references until retirement.
   void Invalidate(CheckpointId, std::uint64_t epoch);
   // Includes provisional writers, without acquiring the I/O lock. New claims
@@ -266,6 +286,9 @@ public:
   void WaitForReclamation();
 #ifdef GUFO_CACHE_TESTING
   void SetCrashHook(std::function<void(DiskPublicationStep)>);
+  // Current-thread scope around reference validation, after filesystem
+  // discovery. Both notifications are nonthrowing, including during unwind.
+  static void SetReferenceValidationHook(void (*)(bool entering) noexcept);
 #endif
 
 private:

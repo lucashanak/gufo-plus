@@ -29,10 +29,9 @@ void FailNextResetSubmission();
 void FailNextTransferWait();
 void LimitReportedDeviceFree(std::size_t bytes);
 namespace {
-/// Allocated bytes apart from K/V rows, which stay backed for reuse after a
-/// reset until another session needs the memory.
+/// Bytes the session has allocated.
 std::size_t StateBytes(const qfn::Session& session) {
-  return session.AllocatedBytes() - session.KvBytes();
+  return session.AllocatedBytes();
 }
 void Require(bool ok, const std::string& message) {
   if (!ok)

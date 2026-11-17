@@ -23,6 +23,8 @@ def service_args(key, binary, baseline, assets, output):
             '--model', assets[model['asset']], '--output', str(output)]
     if model['category'] == 'tts':
         args += ['--variant', model['variant'], '--asr-binary', str(baseline), '--asr-model', assets['asr']]
+    if model.get('npu'):
+        args += ['--npu']
     return args
 
 
@@ -56,6 +58,8 @@ def execute(plan, binary, baseline, assets_path, output, report, logs):
                 command = service_args(key, binary, baseline, assets, destination)
                 if model['category'] == 'embedding':
                     command += ['--embedding-suite', 'smoke' if plan['tier'] == 'pr' else 'full']
+                if model['category'] == 'image':
+                    command += ['--image-suite', 'smoke' if plan['tier'] == 'pr' else 'full']
                 with (output / (key + '.log')).open('w') as log:
                     result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=900)
                 path = destination / 'report.json'

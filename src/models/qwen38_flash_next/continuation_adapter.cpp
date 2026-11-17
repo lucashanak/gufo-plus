@@ -6,6 +6,7 @@
 #include <cstring>
 #include <gufo/ext/snapshot_copy.hpp>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -298,6 +299,13 @@ void ContinuationAdapter::PrefillThrough(
                                             next))
     throw std::runtime_error("component in-pass prefill failed: " + error);
 }
+std::optional<cache::CostEstimate> ContinuationAdapter::Cost() const {
+  // Fixed least-squares fit of the retained gfx1151 depth sweep; see this
+  // model's BENCHMARKS.md. Restore rates are shared measured hardware controls.
+  return mode_ == core::SessionMode::kSpeculative
+             ? cache::CostEstimate{0.000591766466, 0.000067029640, 96e9, 3.3e9}
+             : cache::CostEstimate{0.000573457239, 0.000058015348, 96e9, 3.3e9};
+}
 cache::Capabilities ContinuationAdapter::GetCapabilities() const {
   return {.continuation = true, .persistent_encoding = true};
 }
@@ -428,13 +436,13 @@ void ContinuationAdapter::BeginRestore(
   state.session->tokens_.reserve(target);
   state.session->logits_.reserve(model_->VocabSize());
   std::vector<Coverage> coverage(descriptors_.size());
-  std::string error;
-  if (!model_->executor_->ReserveKv(*state.session->session_, target, draft,
-                                    &error))
-    throw std::runtime_error(error);
   state.GuardAll();
   Check(hipStreamSynchronize(model_->executor_->stream()));
   state.session->session_->PreserveSnapshots(0, 0);
+  // Restores write K/V rows without a forward pass: back them first.
+  if (std::string error; !model_->executor_->EnsureKv(*state.session->session_,
+                                                      target, draft, &error))
+    throw std::bad_alloc();
   state.expected = std::move(ordered);
   state.coverage = std::move(coverage);
   state.metadata.fill(std::byte{});
@@ -767,10 +775,13 @@ void ContinuationAdapter::CopyNativeKeys(
   copy(static_cast<__half*>(staging));
   const auto copied = hipMemcpyAsync(bytes.data(), staging, bytes.size(),
                                      hipMemcpyDeviceToHost, stream);
-  const auto settled = hipStreamSynchronize(stream);
+  // Only this transfer must settle before its staging allocation is freed.
+  // The native FIFO stream may also carry unrelated cache transfers.
+  const auto settled = transfer.Synchronize();
   (void)hipFree(staging);
   Check(copied);
-  Check(settled);
+  if (settled != TransferResult::kSucceeded)
+    throw std::runtime_error("Flash-Next key capture synchronization failed");
 }
 std::span<const std::byte> ContinuationAdapter::BorrowRowsView(
     const cache::Slot& slot, cache::ComponentId id, Rows first,

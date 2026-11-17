@@ -5,8 +5,10 @@
 #include <cstring>
 #include <gufo/ext/experimental/hip_utils.hpp>
 #include <gufo/ext/experimental/snapshot_transfer.hpp>
+#include <gufo/ext/experimental/state_memory.hpp>
 #include <limits>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -14,7 +16,6 @@
 #include "src/families/qwen/hip_common/attention_policy.hpp"
 #include "src/families/qwen/kernels/ops/gemm.hpp"
 #include "src/models/qwen/hip/executor.hpp"
-#include "src/models/qwen/hip/kv_growth.hpp"
 
 namespace gufo::hip {
 namespace {
@@ -418,6 +419,20 @@ QwenGpuMemoryUsage QwenGpuArena::EstimateMemoryUsage(
   return usage;
 }
 
+std::size_t QwenGpuArena::KvBytes(const core::ModelConfig& config,
+                                  std::uint32_t max_context,
+                                  QwenExecutionPolicy policy) {
+  const std::size_t kv =
+      CheckedMultiply(config.num_key_value_heads, config.head_dim);
+  const std::size_t row = policy.UsesTokenMajorAttentionKv()
+                              ? policy.AttentionKvRowBytes(kv)
+                              : CheckedMultiply(kv, sizeof(float));
+  return CheckedMultiply(
+      CheckedMultiply(CheckedMultiply(2, config.FullAttentionLayerCount()),
+                      std::max(max_context, 1U)),
+      row);
+}
+
 std::size_t QwenGpuArena::RecurrentStateBytes(const core::ModelConfig& config,
                                               QwenExecutionPolicy policy) {
   std::size_t state = 0;
@@ -587,6 +602,7 @@ void QwenGpuArena::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
   }
 
   Reset();
+  EnsureKvRows(snapshot.valid_context_);
   const std::size_t kv_f32_bytes = CheckedMultiply(
       CheckedMultiply(snapshot.kv_elements_per_plane_, 2), sizeof(float));
   if (kv_f32_bytes != 0) {
@@ -658,6 +674,7 @@ void QwenGpuArena::RestoreCompactSnapshot(
   }
 
   Reset();
+  EnsureKvRows(layout.valid_context);
   if (layout.live_kv_bytes_per_plane != 0) {
     const std::size_t row_bytes =
         policy_.UsesTokenMajorAttentionKv()
@@ -703,7 +720,7 @@ void QwenGpuArena::RestoreCompactSnapshot(
 
 QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
                            std::uint32_t max_context,
-                           QwenExecutionPolicy policy, KvPool* kv_pool)
+                           QwenExecutionPolicy policy)
     : config_(config),
       max_context_(std::max(max_context, 1U)),
       max_batch_(std::min(max_context_, kMaxPromptBatch)),
@@ -791,28 +808,27 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
     HIP_CHECK(
         hipMalloc(&d_weights_bf16, max_weight_elems * sizeof(hip_bfloat16)));
 
-    const std::size_t total_kv = GetAttentionKvPlaneElements();
-    if (policy_.UsesTokenMajorAttentionKv() && kv_pool != nullptr &&
-        total_kv != 0) {
-      // Full-context address ranges; QwenKvSessions::Reserve backs rows.
-      std::string error;
-      auto rows = std::make_unique<QwenGrowableKv>();
-      if (!KvPool::Supported(&error) ||
-          !rows->Reserve(
-              kv_pool, 2 * std::size_t{config_.FullAttentionLayerCount()},
-              policy_.AttentionKvRowBytes(kv_size), max_context_, &error))
-        throw std::runtime_error("Qwen growable K/V: " + error);
-      d_attention_kv_f16 = rows->data();
-      kv_rows_ = std::move(rows);
-    } else if (policy_.UsesTokenMajorAttentionKv()) {
-      HIP_CHECK(
-          hipMalloc(&d_attention_kv_f16,
-                    CheckedMultiply(total_kv / kv_size,
-                                    policy_.AttentionKvRowBytes(kv_size)) *
-                        2));
-    } else {
-      HIP_CHECK(hipMalloc(&d_kv_cache, total_kv * sizeof(float) * 2));
-    }
+    // Rows grow from the start of every segment: token-major planes (FP16
+    // or 8-bit rows) are [layer][position][row], FP32 planes
+    // [layer][head][position][dim].
+    const bool fp16_kv = policy_.UsesTokenMajorAttentionKv();
+    std::string kv_error;
+    // Charges the region's pages to the shared state budget (#715);
+    // EnsureKvRows backs a tile past the frontier, which its margin covers.
+    account_ = std::make_shared<gufo::mem::StateAccount>(kKvTileRows);
+    kv_region_ = gufo::mem::Region::Create(
+        {.row_bytes = fp16_kv ? policy_.AttentionKvRowBytes(kv_size)
+                              : head_dim * sizeof(float),
+         .rows = max_context_,
+         .segments = std::size_t{2} * config_.FullAttentionLayerCount() *
+                     (fp16_kv ? 1 : num_kv_heads)},
+        &kv_error, account_);
+    if (!kv_region_)
+      throw std::runtime_error("Qwen K/V allocation failed: " + kv_error);
+    if (fp16_kv)
+      d_attention_kv_f16 = kv_region_->data();
+    else
+      d_kv_cache = static_cast<float*>(kv_region_->data());
 
     const std::size_t total_conv =
         num_layers * ssm_qkv_size * config_.ssm_conv_kernel;
@@ -953,9 +969,9 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   d_ssm_alpha_beta = other.d_ssm_alpha_beta;
   d_logits = other.d_logits;
   d_attention_kv_f16 = other.d_attention_kv_f16;
-  kv_rows_ = std::move(other.kv_rows_);
-  kv_live_rows_ = std::exchange(other.kv_live_rows_, 0);
   d_kv_cache = other.d_kv_cache;
+  account_ = std::move(other.account_);
+  kv_region_ = std::move(other.kv_region_);
   d_ssm_conv_state = other.d_ssm_conv_state;
   d_ssm_deltanet_state = other.d_ssm_deltanet_state;
   d_prompt_tokens = other.d_prompt_tokens;
@@ -1062,6 +1078,8 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     kv_rows_ = std::move(other.kv_rows_);
     kv_live_rows_ = std::exchange(other.kv_live_rows_, 0);
     d_kv_cache = other.d_kv_cache;
+    account_ = std::move(other.account_);
+    kv_region_ = std::move(other.kv_region_);
     d_ssm_conv_state = other.d_ssm_conv_state;
     d_ssm_deltanet_state = other.d_ssm_deltanet_state;
     d_prompt_tokens = other.d_prompt_tokens;
@@ -1175,11 +1193,14 @@ void QwenGpuArena::Reset() {
   has_saved_state_ = false;
 }
 
-std::size_t QwenGpuArena::KvRowsToKeep() const noexcept {
-  // Prefill and verification attention load key tiles of up to 128 rows;
-  // keep whole tiles past the last written row backed.
-  constexpr std::size_t kMarginRows = 256;
-  return std::min<std::size_t>(max_context_, kv_live_rows_ + kMarginRows);
+void QwenGpuArena::EnsureKvRows(std::uint32_t end) {
+  if (!kv_region_)
+    return;
+  // The pool thread maps a prompt pass further ahead.
+  constexpr std::size_t kAheadRows = 8192;
+  if (!kv_region_->Ensure(std::size_t{end} + kKvTileRows))
+    throw std::bad_alloc();
+  kv_region_->MapAhead(std::size_t{end} + kAheadRows);
 }
 
 void QwenGpuArena::FreeAll() noexcept {
@@ -1221,20 +1242,14 @@ void QwenGpuArena::FreeAll() noexcept {
     LogCleanupError(hipFree(d_ssm_alpha_beta));
   if (d_logits != nullptr)
     LogCleanupError(hipFree(d_logits));
-  if (kv_rows_) {
-    // Unmapping is not ordered after queued work.
-    if (stream != nullptr)
-      LogCleanupError(hipStreamSynchronize(stream));
-    kv_rows_.reset();
-  } else if (d_attention_kv_f16 != nullptr) {
-    LogCleanupError(hipFree(d_attention_kv_f16));
-  }
+  d_attention_kv_f16 = nullptr;
+  d_kv_cache = nullptr;
+  kv_region_.reset();
+  account_.reset();
   if (d_target_layer_features != nullptr) {
     LogCleanupError(hipFree(d_target_layer_features));
     d_target_layer_features = nullptr;
   }
-  if (d_kv_cache != nullptr)
-    LogCleanupError(hipFree(d_kv_cache));
   for (float* buffer : d_ssm_conv_buffers_)
     if (buffer != nullptr)
       LogCleanupError(hipFree(buffer));

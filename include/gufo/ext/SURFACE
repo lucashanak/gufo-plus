@@ -25,7 +25,9 @@ include/gufo/ext/experimental/host_allocations.hpp
 include/gufo/ext/experimental/kv_memory.hpp
 include/gufo/ext/experimental/lora_adapter.hpp
 include/gufo/ext/experimental/managed_alloc.hpp
+include/gufo/ext/experimental/npu.hpp
 include/gufo/ext/experimental/snapshot_transfer.hpp
+include/gufo/ext/experimental/state_memory.hpp
 include/gufo/ext/experimental/weight_upload.hpp
 include/gufo/ext/gguf_identity.hpp
 include/gufo/ext/gguf_reader.hpp
@@ -66,6 +68,7 @@ src/cache/adapter.hpp
 src/cache/checkpoint.hpp
 src/cache/completion.hpp
 src/cache/component_resources.hpp
+src/cache/cost.hpp
 src/cache/disk.hpp
 src/cache/identity.hpp
 src/cache/ledger.hpp
@@ -92,6 +95,8 @@ src/core/hip/kv_memory.hpp
 src/core/hip/managed_alloc.hpp
 src/core/hip/snapshot_copy.hpp
 src/core/hip/snapshot_transfer.hpp
+src/core/hip/state_memory.hpp
+src/core/hip/state_region.hpp
 src/core/hip/transfer_pool.hpp
 src/core/hip/weight_upload.hpp
 src/core/image.hpp
@@ -102,6 +107,12 @@ src/core/logging/logging.hpp
 src/core/lora/adapter.hpp
 src/core/mapped_prefetch.hpp
 src/core/model_config.hpp
+src/core/npu/bfp_gemm.hpp
+src/core/npu/host_ops.hpp
+src/core/npu/npu.hpp
+src/core/npu/q8_gemm.hpp
+src/core/npu/qwen3_decoder.hpp
+src/core/npu/qwen3_prefill.hpp
 src/core/platform/fs.hpp
 src/core/platform/gpu_budget.hpp
 src/core/platform/library.hpp
@@ -132,4 +143,6 @@ src/ext/text.hpp
 src/ext/text_contracts.hpp
 src/ext/tts.hpp
 src/ext/video.hpp
+src/mem/account.hpp
+src/mem/ledger.hpp
 src/sched/profile.hpp

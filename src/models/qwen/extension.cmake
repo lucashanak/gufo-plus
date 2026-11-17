@@ -50,7 +50,6 @@ gufo_extension_target(
     hip/decode.cpp
     hip/decode_step.cpp
     hip/executor.cpp
-    hip/kv_growth.cpp
     hip/model_loader.cpp
     hip/prefill.cpp
     hip/prefill_chunk.cpp
@@ -81,7 +80,6 @@ if(TARGET gufo_qwen_hip)
   gufo_extension_hip_sources(gufo_qwen_hip
     SOURCES
       hip/attention.hip
-      hip/batched_ssm.hip
   )
   target_compile_definitions(gufo_qwen_hip PUBLIC ENGINE_ENABLE_HIP=1)
   target_include_directories(gufo_qwen_hip SYSTEM PUBLIC

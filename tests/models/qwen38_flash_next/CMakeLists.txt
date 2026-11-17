@@ -86,9 +86,9 @@ if (ENGINE_ENABLE_HIP)
     SKIP_RETURN_CODE 77
     RUN_SERIAL TRUE
     TIMEOUT 1800)
-  add_executable(qwen38_flash_next_growable_kv_test EXCLUDE_FROM_ALL
-    growable_kv_test.cpp)
-  target_link_libraries(qwen38_flash_next_growable_kv_test PRIVATE
+  add_executable(qwen38_flash_next_state_churn_test EXCLUDE_FROM_ALL
+    state_churn_test.cpp)
+  target_link_libraries(qwen38_flash_next_state_churn_test PRIVATE
     qwen38_flash_next_test_hip)
   # Layered prefill (SetPrefillYield) against lone runs, in AR and MTP modes.
   # Built with qwen38_flash_next_model_tests; needs the same model variables
@@ -111,7 +111,7 @@ if (ENGINE_ENABLE_HIP)
   add_custom_target(qwen38_flash_next_model_tests
     DEPENDS qwen38_flash_next_session_test qwen38_flash_next_snapshot_test
       qwen38_flash_next_continuation_adapter_test
-      qwen38_flash_next_growable_kv_test
+      qwen38_flash_next_state_churn_test
       qwen38_flash_next_layered_prefill_test)
 
   add_executable(qwen38_flash_next_dense_gemm_bench EXCLUDE_FROM_ALL

@@ -37,10 +37,9 @@ void RequireExact(std::span<const float> expected,
           message);
 }
 
-/// Allocated bytes apart from K/V rows, which stay backed for reuse after a
-/// reset until another session needs the memory.
+/// Bytes the session has allocated.
 std::size_t StateBytes(const qfn::Session& session) {
-  return session.AllocatedBytes() - session.KvBytes();
+  return session.AllocatedBytes();
 }
 
 void CheckSnapshotDuringGraphCapture(const std::shared_ptr<qfn::Model>& model,

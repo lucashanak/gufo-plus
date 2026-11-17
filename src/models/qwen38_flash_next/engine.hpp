@@ -63,10 +63,6 @@ struct ModelOptions {
   /// artifact's own setting, which is always off: no GGUF metadata key sets
   /// it today.
   std::optional<RopeScaling> rope_scaling{};
-  /// Device bytes of K/V rows all sessions may hold at once; each session's
-  /// rows grow with its tokens. Zero leaves the device heap as the limit and
-  /// claims every session's full context at startup.
-  std::size_t kv_cache_bytes = 0;
 };
 
 class Session;
@@ -116,6 +112,10 @@ public:
   /// Worst-case private device state, including the configured rollback cap.
   [[nodiscard]] std::size_t SessionBytes(core::SessionMode mode,
                                          std::uint32_t context) const noexcept;
+  /// The part of SessionBytes() a session maps only as it writes it (K/V
+  /// regions); zero without demand mapping.
+  [[nodiscard]] std::size_t DemandMappedBytes(core::SessionMode mode,
+                                              std::uint32_t context) const;
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
   /// Caps wide copy verification (Executor::LimitCopyRows); call before any
   /// session is created.
@@ -253,9 +253,8 @@ public:
   void SetCancellationCheck(std::function<bool()> check);
   [[nodiscard]] bool IsValid() const noexcept { return valid_; }
   [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
-  /// The part of AllocatedBytes in K/V rows, which grow with the tokens held
-  /// under the model's K/V budget (ModelOptions::kv_cache_bytes).
-  [[nodiscard]] std::size_t KvBytes() const noexcept;
+  /// The account of this session's demand-mapped K/V.
+  [[nodiscard]] std::shared_ptr<mem::StateAccount> StateAccount() const;
   void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt);
   /// A new request reusing cached context starts its own acceptance history.
   void ResetDraftPolicy();

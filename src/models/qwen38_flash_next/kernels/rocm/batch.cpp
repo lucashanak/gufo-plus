@@ -345,6 +345,9 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
         item.session->mtp_.position + n > item.session->max_context_) {
       return Fail(error, "invalid MTP body request");
     }
+    if (!EnsureKv(*item.session, item.session->position_,
+                  item.session->mtp_.position + n, error))
+      return false;
     for (std::size_t j = 0; j < i; ++j) {
       if (items[j].session == item.session)
         return Fail(error, "MTP body requests must be independent");
@@ -365,18 +368,6 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
     const auto& item = items.front();
     return MtpForward(*item.session, item.tokens, item.hidden_row,
                       {.kv_only = item.kv_only}, error);
-  }
-  std::array<Session*, kBatchSessions> members{};
-  for (std::size_t i = 0; i < items.size(); ++i)
-    members[i] = items[i].session;
-  for (const auto& item : items) {
-    auto& session = *item.session;
-    if (!session.Cancelled() &&
-        !ReserveKv(session, session.position_,
-                   session.mtp_.position +
-                       static_cast<std::uint32_t>(item.tokens.size()),
-                   error, std::span(members.data(), items.size())))
-      return false;
   }
   for (const auto& item : items) {
     auto& session = *item.session;
@@ -574,10 +565,16 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
     if (compact_tail) {
       tail.mtp_res = base.res;
       tail.ctx = base.qg;
-      tail.inject = base.mtp_h;
+      // Inject rows move down within their own buffer (rows only move to
+      // lower indices, so the in-order copies never overwrite a pending
+      // source). base.mtp_h aliases s_.xn, which the FFN combine writes
+      // while its blocks still read the inject partials.
+      tail.inject = base.inject;
       for (std::size_t i = 0; i < items.size(); ++i) {
         const auto r = final_rows[i];
         const auto copy = [&](float* dst, const float* src, std::size_t width) {
+          if (dst + i * width == src + r * width)
+            return true;  // the row is already in place
           return Check(hipMemcpyAsync(dst + i * width, src + r * width,
                                       width * sizeof(float),
                                       hipMemcpyDeviceToDevice, stream_),
@@ -759,10 +756,18 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
       if (!DenseBatch(full_head, base.mixed, batch_logits_, n, error))
         return false;
       for (std::uint32_t i = 0; i < n; ++i) {
-        if (slot[i] < subset_rows)
-          GatherDraftLogits(logits_of(i), items[i].session->mtp_.draft_ids,
-                            static_cast<std::uint32_t>(prefix),
-                            speculative::kDraftVocabExtraRows, stream_);
+        if (slot[i] >= subset_rows)
+          continue;
+        GatherDraftLogits(logits_of(i), items[i].session->mtp_.draft_ids,
+                          static_cast<std::uint32_t>(prefix),
+                          speculative::kDraftVocabExtraRows, stream_);
+        // A requantized prefix scores its rows as alone; the table rows
+        // above keep the full head's values either way.
+        if (prefix_head.data != full_head.data &&
+            !Dense(prefix_head,
+                   base.mixed + std::size_t{slot[i]} * full_head.cols,
+                   logits_of(i), 1, error))
+          return false;
       }
     } else if (subset_rows != 0) {
       float* staged = batch_logits_ + kBatchSessions * vocab -
@@ -1109,6 +1114,15 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
             item.session->max_context_) {
       return Fail(error, "invalid session or chain in decode batch");
     }
+    if (!EnsureKv(*item.session,
+                  item.session->position_ +
+                      static_cast<std::uint32_t>(item.tokens.size()),
+                  item.session->mtp_enabled_
+                      ? item.session->mtp_.position +
+                            static_cast<std::uint32_t>(item.tokens.size())
+                      : 0,
+                  error))
+      return false;
     for (std::size_t j = 0; j < i; ++j) {
       if (items[j].session == item.session) {
         return Fail(error, "decode batch contains a duplicate session");
@@ -1132,19 +1146,6 @@ bool Executor::ForwardBatchImpl(std::span<const BatchItem> items, bool wide,
   }
   if (!AnyActive(items))
     return true;
-  std::array<Session*, kBatchSessions> members{};
-  for (std::size_t i = 0; i < items.size(); ++i)
-    members[i] = items[i].session;
-  for (const auto& item : items) {
-    auto& session = *item.session;
-    if (!session.Cancelled() &&
-        !ReserveKv(
-            session,
-            session.position_ + static_cast<std::uint32_t>(item.tokens.size()),
-            session.mtp_.position, error,
-            std::span(members.data(), items.size())))
-      return false;
-  }
   for (const auto& item : items) {
     auto& session = *item.session;
     if (!session.Cancelled() && session.continuation_hooks_) {

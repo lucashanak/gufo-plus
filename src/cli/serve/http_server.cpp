@@ -40,6 +40,7 @@
 #include "src/cli/serve/openai_chat.hpp"
 #include "src/cli/serve/responses_logprobs.hpp"
 #include "src/cli/serve/sampling_request.hpp"
+#include "src/cli/serve/sdapi.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
 #include "src/cli/serve/tts_service.hpp"
@@ -49,6 +50,7 @@
 #include "src/core/json.hpp"
 #include "src/core/platform/net.hpp"
 #include "src/core/platform/shutdown_signal.hpp"
+#include "src/core/rust/callback.hpp"
 #include "src/core/utf8.hpp"
 #include "src/families/qwen/text/chat_template.hpp"
 
@@ -91,21 +93,18 @@ GufoHttpParse ReadHead(std::string& out, int fd, HttpRequest& request,
                        GufoHttpHead& head) {
   struct FieldContext {
     HttpRequest* request;
-    std::exception_ptr failure;
-  } context{&request, nullptr};
+    core::ffi::CallbackFailure failure;
+  } context{&request, {}};
   const GufoHttpFieldFn add_field =
       [](void* opaque, const std::uint8_t* name, std::size_t name_len,
          const std::uint8_t* value, std::size_t value_len) noexcept -> int {
     auto& context = *static_cast<FieldContext*>(opaque);
-    try {
+    return context.failure.Guard(1, [&] {
       context.request->headers.emplace_back(
           std::string(reinterpret_cast<const char*>(name), name_len),
           std::string(reinterpret_cast<const char*>(value), value_len));
       return 0;
-    } catch (...) {
-      context.failure = std::current_exception();
-      return 1;
-    }
+    });
   };
   char buf[4096];
   std::size_t known_partial = 0;
@@ -121,8 +120,7 @@ GufoHttpParse ReadHead(std::string& out, int fd, HttpRequest& request,
     const GufoHttpParse parsed = gufo_http_parse_head(
         reinterpret_cast<const std::uint8_t*>(out.data()), out.size(),
         known_partial, &head, add_field, &context);
-    if (context.failure)
-      std::rethrow_exception(context.failure);
+    context.failure.Rethrow();
     if (parsed == GUFO_HTTP_INTERNAL)
       throw std::runtime_error("Rust HTTP request parser failed internally");
     if (parsed != GUFO_HTTP_PARTIAL)
@@ -1534,6 +1532,11 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
   if (const auto sessions = b.session_states().size(); sessions > 0) {
     resp["total_slots"] = sessions;
   }
+  // Sessions sharing their state (#715) hold prompts up to this length; a
+  // longer one is refused with 507 insufficient_memory_permanent.
+  if (const auto shared = b.shared_state()) {
+    resp["max_prompt_tokens"] = shared->max_prompt_tokens;
+  }
 
   // What a request without sampling fields gets.
   const auto defaults = b.sampling_defaults();
@@ -1710,6 +1713,39 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
          "tokens over sessions times context; excludes retained cache\n"
       << "# TYPE llamacpp:kv_cache_usage_ratio gauge\n"
       << "llamacpp:kv_cache_usage_ratio " << KvCacheUsageRatio(b) << "\n";
+  if (const auto shared = b.shared_state()) {
+    out << "# HELP gufo_shared_state_bytes Session state the configured "
+           "sessions share when they do not all fit at full context\n"
+        << "# TYPE gufo_shared_state_bytes gauge\n"
+        << "gufo_shared_state_bytes " << shared->shared_bytes << "\n"
+        << "# HELP gufo_shared_state_charged_bytes Shared session state "
+           "charged to sessions\n"
+        << "# TYPE gufo_shared_state_charged_bytes gauge\n"
+        << "gufo_shared_state_charged_bytes " << shared->charged_bytes << "\n"
+        << "# HELP gufo_shared_state_reclaimable_bytes Charged session state "
+           "held by idle sessions or mapped past a session's need\n"
+        << "# TYPE gufo_shared_state_reclaimable_bytes gauge\n"
+        << "gufo_shared_state_reclaimable_bytes " << shared->reclaimable_bytes
+        << "\n"
+        << "# HELP gufo_shared_state_max_prompt_tokens Longest prompt the "
+           "shared session state holds\n"
+        << "# TYPE gufo_shared_state_max_prompt_tokens gauge\n"
+        << "gufo_shared_state_max_prompt_tokens " << shared->max_prompt_tokens
+        << "\n"
+        << "# HELP gufo_shared_state_waits_total Requests that waited for "
+           "shared session state\n"
+        << "# TYPE gufo_shared_state_waits_total counter\n"
+        << "gufo_shared_state_waits_total " << shared->waits << "\n"
+        << "# HELP gufo_shared_state_pauses_total Decoding requests paused "
+           "until shared session state freed\n"
+        << "# TYPE gufo_shared_state_pauses_total counter\n"
+        << "gufo_shared_state_pauses_total " << shared->pauses << "\n"
+        << "# HELP gufo_shared_state_preemptions_total Requests stopped "
+           "with memory_pressure so others could continue\n"
+        << "# TYPE gufo_shared_state_preemptions_total counter\n"
+        << "gufo_shared_state_preemptions_total " << shared->preemptions
+        << "\n";
+  }
   if (const auto budget = b.prompt_admission_budget()) {
     out << "# HELP gufo_prompt_state_budget_bytes Host RAM prompt state may "
            "claim before admission refuses\n"
@@ -1932,23 +1968,19 @@ bool IsListenAddress(const std::string& host) {
 std::string HttpRequest::query_param(const std::string& key) const {
   struct Found {
     std::string value;
-    std::exception_ptr failure;
+    core::ffi::CallbackFailure failure;
   } found;
   const GufoHttpBytesFn keep = [](void* opaque, const std::uint8_t* data,
                                   std::size_t len) noexcept {
     auto& out = *static_cast<Found*>(opaque);
-    try {
-      out.value.assign(reinterpret_cast<const char*>(data), len);
-    } catch (...) {
-      out.failure = std::current_exception();
-    }
+    out.failure.Guard(
+        [&] { out.value.assign(reinterpret_cast<const char*>(data), len); });
   };
   const int status = gufo_http_query_param(
       reinterpret_cast<const std::uint8_t*>(query.data()), query.size(),
       reinterpret_cast<const std::uint8_t*>(key.data()), key.size(), keep,
       &found);
-  if (found.failure)
-    std::rethrow_exception(found.failure);
+  found.failure.Rethrow();
   if (status < 0)
     throw std::logic_error("Rust query parser failed internally");
   return found.value;
@@ -2068,7 +2100,10 @@ bool HttpServer::start(std::string* error) {
       *error = "socket() failed";
     return false;
   }
-  (void)net::SetReuseAddr(listen_fd_);
+  // Exclusive on Windows, where SO_REUSEADDR alone lets a second server bind
+  // a port this one still serves; its bind() fails instead. POSIX keeps
+  // SO_REUSEADDR, so a restart binds through TIME_WAIT as before.
+  (void)net::SetExclusiveListenerReuse(listen_fd_);
   // `::` serves IPv4 clients too. Set it explicitly: the kernel default
   // follows net.ipv6.bindv6only, which differs between hosts.
   if (addr.ss_family == AF_INET6 && !net::ClearIpv6Only(listen_fd_)) {
@@ -2080,8 +2115,14 @@ bool HttpServer::start(std::string* error) {
   }
 
   if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), addr_length) < 0) {
+    const int code = net::LastSocketError();
     if (error != nullptr) {
-      *error = "bind() failed on " + host_ + ":" + std::to_string(port_);
+      *error = "bind() failed on " + host_ + ":" + std::to_string(port_) +
+               " (error " + std::to_string(code) + ")";
+      if (net::IsAddressInUseError(code))
+        *error +=
+            ": the port is already in use, another server (gufo?) "
+            "listens on it";
     }
     net::CloseSocket(listen_fd_);
     listen_fd_ = -1;
@@ -2341,8 +2382,10 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
                  "server_error", "image_service_unavailable");
     return HandleImageApiRequest(req, *images_);
   }
-  if (req.path == "/sdapi/v1/loras" && images_ != nullptr)
-    return HandleImageLorasRequest(req, *images_);
+  // An image server answers every A1111 route; a text server keeps the 501
+  // stubs of the route table.
+  if (images_ != nullptr && IsSdapiPath(req.path))
+    return HandleSdapiRequest(req, *images_);
   if (req.path == "/v1/audio/speech/stream") {
     if (!tts_ || !tts_->ready())
       return Err(503, "Service Unavailable", "TTS is not configured",
@@ -2409,7 +2452,8 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
 
 bool HttpServer::device_lost() {
   const bool lost = (backend_ != nullptr && backend_->device_lost()) ||
-                    (embeddings_ != nullptr && embeddings_->device_lost());
+                    (embeddings_ != nullptr && embeddings_->device_lost()) ||
+                    (images_ != nullptr && images_->device_lost());
   if (!lost)
     return false;
   if (options_.on_device_lost &&

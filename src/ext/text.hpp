@@ -33,6 +33,10 @@
 #include "src/cache/component_resources.hpp"
 #include "src/core/text_sampling_defaults.hpp"
 
+namespace gufo::mem {
+class StateAccount;
+}  // namespace gufo::mem
+
 namespace gufo::ext {
 
 using ComponentCacheResources = cache::ComponentCacheResources;
@@ -189,9 +193,9 @@ struct TextRunnerDescriptor {
   /// Core preset kept for existing extensions.
   sampling::TextModelPreset sampling_preset{
       sampling::TextModelPreset::kUnspecified};
-  /// Prompt scheduling beside other sessions' decoding. Empty keeps passes
-  /// bounded by the host's decode-active budget.
-  std::optional<TextSchedulingProfile> scheduling{};
+  /// Prompt scheduling beside other sessions' decoding. Required: the host
+  /// rejects a runner that leaves `pass_tokens` (or any field) zero.
+  TextSchedulingProfile scheduling{};
 };
 
 struct TextRunnerResourceClaim {
@@ -212,6 +216,15 @@ struct TextRunnerResourceClaim {
   /// The server subtracts outstanding reservations conservatively, including
   /// those released during the sample. Empty keeps the fixed budget.
   std::function<std::size_t()> prompt_admission_available_bytes;
+  /// The part of `per_request_state_bytes` in demand-mapped state regions
+  /// charged to the session's state account (TextRunnerState::state_account):
+  /// pages a session takes only as it writes rows. When the configured
+  /// sessions do not all fit at full context, the host lets them share this
+  /// memory instead of refusing the configuration (mem::FitSessions), and
+  /// admits each request against its own tokens. Missing or zero keeps the
+  /// full-context check. Declared last, so positional initializers of the
+  /// earlier fields keep their meaning.
+  std::optional<std::size_t> demand_mapped_state_bytes;
 };
 
 struct TextRunnerMeasuredResources {
@@ -263,6 +276,18 @@ class TextRunnerState : public ContinuationState {
 public:
   using CancellationCheck = std::function<bool()>;
 
+  /// The session's state account, whose regions hold the
+  /// demand-mapped state `TextRunnerResourceClaim::demand_mapped_state_bytes`
+  /// counts; null when the runner has none. The host claims a request's
+  /// tokens on it before the request writes them, sets it to the live
+  /// frontier afterwards, and trims an idle session's pages when another
+  /// request needs them; every write past the claim maps only what the
+  /// shared budget allows.
+  [[nodiscard]] virtual std::shared_ptr<mem::StateAccount> state_account()
+      const {
+    return nullptr;
+  }
+
   void SetStopAtEos(bool value) noexcept { stop_at_eos_ = value; }
   [[nodiscard]] bool stop_at_eos() const noexcept { return stop_at_eos_; }
 
@@ -286,12 +311,13 @@ public:
 
   virtual void SetCancellationCheck(const CancellationCheck&) {}
 
-  /// Set by the host for the next Prefill or PrefillThrough call only. A
-  /// runner whose descriptor has a scheduling profile splits each pass into
-  /// about `groups` layer groups of similar duration and calls YieldPrefill()
-  /// between them; it may add a boundary where the pass would otherwise
-  /// stall, such as a wait for input rows. Every layer keeps the arithmetic
-  /// of an unsplit pass. A runner may ignore it and run unsplit passes.
+  /// Set by the host for the next Prefill or PrefillThrough call only, with
+  /// `groups` up to the profile's `max_layer_groups`. The runner splits each
+  /// pass into about `groups` layer groups of similar duration and calls
+  /// YieldPrefill() between them; it may add a boundary where the pass would
+  /// otherwise stall, such as a wait for input rows. Every layer keeps the
+  /// arithmetic of an unsplit pass. A runner may ignore it and run unsplit
+  /// passes.
   /// While yielding, it must hold no lock or scratch its decode paths take.
   void SetPrefillYield(std::size_t groups, PrefillYield yield) {
     prefill_yield_groups_ = yield ? std::max<std::size_t>(groups, 1) : 1;
@@ -336,8 +362,13 @@ enum class InitialOutputState : std::uint8_t {
   kAuto,
   kThought,
   kText,
+  /// The prompt closed reasoning (for example, it ends in "<think></think>"):
+  /// output is text, and the host drops the separator before it as after a
+  /// close the model wrote.
+  kTextAfterThought,
   kReasoning = kThought,
   kContent = kText,
+  kContentAfterReasoning = kTextAfterThought,
 };
 
 enum class ChatRole : std::uint8_t {
@@ -567,6 +598,16 @@ public:
   /// after restoring rows into its slot at the given position.
   [[nodiscard]] virtual std::unique_ptr<ComponentCacheResources>
   CreateComponentCacheResources(cache::ResourceLedger&, std::size_t) const = 0;
+  /// Actual serving-slot count, including typed callers. Providers may use it
+  /// to size eager transfer resources before slot construction/cache grants.
+  /// An unchanged provider retains its existing resource policy via fallback.
+  [[nodiscard]] virtual std::unique_ptr<ComponentCacheResources>
+  CreateComponentCacheResourcesForSessions(cache::ResourceLedger& ledger,
+                                           std::size_t ram_bytes,
+                                           std::size_t sessions) const {
+    (void)sessions;
+    return CreateComponentCacheResources(ledger, ram_bytes);
+  }
   [[nodiscard]] virtual std::unique_ptr<TextRunnerState> BindComponentState(
       cache::Adapter&, cache::Slot&) const = 0;
   virtual void ReconcileComponentState(TextRunnerState&, std::size_t) const = 0;

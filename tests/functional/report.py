@@ -145,8 +145,10 @@ def phases_section(data):
                  f"{settings['slowdown'] * 100:.0f}% and >{settings['noise_ms']} ms); 🟨 slower in "
                  "some repeats, inconclusive; ⬜ never slower. Observations, not qualified timing "
                  f"regressions. Measured in {data['wall_s'] / 60:.1f} min.</sub>")
-    if any(phase.get('advisory_reason') for phase in phases):
-        lines += ["", "⚠️ HTTP ready timing is advisory: server-side timestamps are unavailable in one or more arms."]
+    reasons = sorted({phase['advisory_reason'] for phase in phases if phase.get('advisory_reason')})
+    for reason in reasons:
+        lines += ["", "⚠️ HTTP ready timing is advisory: server-side timestamps are unavailable in one or more arms."
+                  if reason == 'server readiness timestamps unavailable' else f"⚠️ Timings are advisory: {reason}."]
     if data.get("diverged"):
         lines += ["", "⚠️ Generated text differs or server work differs between arms for "
                   + ", ".join(f"`{key}`" for key in data["diverged"])
@@ -314,7 +316,7 @@ def render_models(args, plan, summary):
               f"merge `{plan['head'][:7]}` vs main `{plan['base'][:7]}` · "
               f"{len(plan['deferred'])} deferred, {len(plan['release_only'])} for the release run. "
               f"`{STATUS_CONTEXT}` is advisory on PRs; only the automatic release merge waits for it. "
-              'Coverage is limited to the selected representatives; image/video generation and agent replay remain separate.</sub>']
+              'Coverage is limited to the selected representatives; video generation and agent replay remain separate.</sub>']
     return state, description, '\n'.join(lines) + '\n'
 
 

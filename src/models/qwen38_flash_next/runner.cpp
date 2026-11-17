@@ -18,6 +18,7 @@
 #include "gufo/ext/component_cache_resources.hpp"
 #include "gufo/ext/experimental/admission_query.hpp"
 #include "gufo/ext/gguf_identity.hpp"
+#include "gufo/ext/host.hpp"
 #include "gufo/ext/host_budget.hpp"
 #include "src/families/qwen/control_tokens/control_tokens.hpp"
 #include "src/families/qwen/text/chat_template.hpp"
@@ -58,9 +59,14 @@ bool EndsTurn(const State& state, const Tokens& tokens, int token) {
   return state.stop_at_eos() && tokens.IsStopToken(token);
 }
 
+// Cache backing diagnostics (transfer resources, backing growth and limits)
+// go to the process log under the cache component, as before the extension
+// migration.
 [[nodiscard]] inline hip::ComponentCacheHooks HipComponentCacheHooks() {
-  return {[] { return ext::HostSnapshotCeilingBytes(); },
-          [](std::string_view) {}, [](std::string_view) {}};
+  return {
+      [] { return ext::HostSnapshotCeilingBytes(); },
+      [](std::string_view message) { server::Logger::Warn("cache", message); },
+      [](std::string_view message) { server::Logger::Info("cache", message); }};
 }
 
 struct QwenImageContext final : TextPromptContext {
@@ -178,11 +184,12 @@ public:
   }
   [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
       const noexcept override {
-    // K/V rows grow with the tokens held and are bounded by the model's K/V
-    // budget; the claim charges each state a share of it, not its rows.
-    return {.per_request_state_bytes =
-                session_->AllocatedBytes() - session_->KvBytes(),
+    return {.per_request_state_bytes = session_->AllocatedBytes(),
             .temporary_scratch_bytes = 0};
+  }
+  [[nodiscard]] std::shared_ptr<mem::StateAccount> state_account()
+      const override {
+    return session_->StateAccount();
   }
 
   [[nodiscard]] QwenFlashNextSession& session() const { return *session_; }
@@ -280,6 +287,23 @@ public:
   [[nodiscard]] std::unique_ptr<ComponentCacheResources>
   CreateComponentCacheResources(cache::ResourceLedger& ledger,
                                 std::size_t ram) const override {
+    return CreateCacheResources(ledger, ram, {});
+  }
+  [[nodiscard]] std::unique_ptr<ComponentCacheResources>
+  CreateComponentCacheResourcesForSessions(
+      cache::ResourceLedger& ledger, std::size_t ram,
+      std::size_t sessions) const override {
+    return CreateCacheResources(ledger, ram,
+                                hip::PlanComponentTransfers(sessions));
+  }
+  [[nodiscard]] std::unique_ptr<ComponentCacheResources> CreateCacheResources(
+      cache::ResourceLedger& ledger, std::size_t ram,
+      std::optional<hip::ComponentTransferPlan> transfers) const {
+    auto hooks = HipComponentCacheHooks();
+    if (transfers) {
+      hooks.transfer_streams = transfers->native_streams;
+      hooks.transfer_leases = transfers->leases;
+    }
     (void)ram;
     return hip::CreateHipComponentCacheResources(
         std::make_unique<models::qwen38_flash_next::ContinuationAdapter>(
@@ -287,7 +311,7 @@ public:
             use_mtp_ ? core::SessionMode::kSpeculative
                      : core::SessionMode::kAutoregressive,
             max_context_, component_identity_),
-        ledger, HipComponentCacheHooks());
+        ledger, std::move(hooks));
   }
   [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
       cache::Adapter& adapter, cache::Slot& slot) const override {
@@ -339,10 +363,9 @@ public:
   }
 
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
-    const auto session_bytes = model_->SessionBytes(
-        use_mtp_ ? gufo::core::SessionMode::kSpeculative
-                 : gufo::core::SessionMode::kAutoregressive,
-        max_context_);
+    const auto mode = use_mtp_ ? gufo::core::SessionMode::kSpeculative
+                               : gufo::core::SessionMode::kAutoregressive;
+    const auto session_bytes = model_->SessionBytes(mode, max_context_);
     std::optional<std::size_t> capacity;
     if (const auto memory = gufo::hip::QueryAdmissionMemory()) {
       const auto deferred = model_->DeferredScratchBytes();
@@ -362,6 +385,8 @@ public:
         .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
         .retained_snapshot_ceiling_bytes = HostSnapshotCeilingBytes(),
         .requires_device_runtime_lock = true,
+        .demand_mapped_state_bytes =
+            model_->DemandMappedBytes(mode, max_context_),
     };
   }
 
@@ -888,7 +913,6 @@ std::shared_ptr<ext::TextModelRunner> CreateQwenFlashNextTextRunner(
           .decode_concurrency =
               DecodeConcurrencyForSessions(options.session_count),
           .rope_scaling = rope_scaling,
-          .kv_cache_bytes = options.kv_cache_bytes,
       },
       &load_error);
   if (!model) {
@@ -908,18 +932,30 @@ std::shared_ptr<ext::TextModelRunner> CreateQwenFlashNextTextRunner(
   // until the configured sessions fit, rather than refusing a session count
   // the ordinary verifier width fits.
   if (std::size_t free_bytes = 0, total_bytes = 0;
-      use_mtp && hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
+      use_mtp && mem::MemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
     const std::size_t sessions =
         std::max<std::size_t>(options.session_count, 1);
-    for (std::uint32_t rows = rocm::Executor::kWideRows;; rows -= 8) {
+    const auto mode = gufo::core::SessionMode::kSpeculative;
+    const auto fit = [&](std::uint32_t rows) {
       model->LimitCopyRows(rows);
-      if (rows == 8 ||
-          sessions * model->SessionBytes(gufo::core::SessionMode::kSpeculative,
-                                         max_context) +
-                  model->DeferredScratchBytes() <=
-              free_bytes)
-        break;
-    }
+      const std::size_t deferred = model->DeferredScratchBytes();
+      if (free_bytes <= deferred)
+        return mem::SessionFit::Kind::kRefused;
+      return mem::FitSessions(sessions, model->SessionBytes(mode, max_context),
+                              model->DemandMappedBytes(mode, max_context),
+                              free_bytes - deferred)
+          .kind;
+    };
+    std::uint32_t rows = rocm::Executor::kWideRows;
+    while (rows > 8 && fit(rows) != mem::SessionFit::Kind::kFits)
+      rows -= 8;
+    // When no width fits every session at full context, the sessions share
+    // their K/V (mem::FitSessions): keep the widest width that allows it.
+    if (fit(rows) != mem::SessionFit::Kind::kFits)
+      for (rows = rocm::Executor::kWideRows;
+           rows > 8 && fit(rows) == mem::SessionFit::Kind::kRefused;)
+        rows -= 8;
+    model->LimitCopyRows(rows);
   }
   std::string model_fingerprint = options.disk_cache.model_artifact_fingerprint;
   if (!options.disk_cache.directory.empty() && model_fingerprint.empty()) {

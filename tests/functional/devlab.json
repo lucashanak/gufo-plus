@@ -5,7 +5,8 @@
     "llm": "flash-next-q4",
     "embedding": "embedding-gemma2",
     "asr": "qwen3-asr",
-    "tts": "qwen3-tts-base"
+    "tts": "qwen3-tts-base",
+    "image": "qwen-image-turbo"
   },
   "assets": {
     "flash-next": {
@@ -154,6 +155,41 @@
         "speech_tokenizer/config.json",
         "speech_tokenizer/model.safetensors"
       ]
+    },
+    "image-turbo": {
+      "repo": "Qwen/Qwen-Image-2.1-Turbo",
+      "revision": "fc13ba1986fcb905854dc8de2f52eee395f49b5b",
+      "patterns": [
+        "*.json",
+        "*.safetensors",
+        "*.jinja",
+        "LICENSE",
+        "README.md"
+      ],
+      "required": [
+        "model_index.json",
+        "transformer/diffusion_pytorch_model.safetensors.index.json",
+        "text_encoder/config.json",
+        "vae/config.json"
+      ]
+    },
+    "image": {
+      "repo": "Qwen/Qwen-Image-2.1",
+      "revision": "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+      "patterns": [
+        "*.json",
+        "*.safetensors",
+        "*.txt",
+        "*.jinja",
+        "LICENSE",
+        "README.md"
+      ],
+      "required": [
+        "model_index.json",
+        "transformer/diffusion_pytorch_model.safetensors.index.json",
+        "text_encoder/model.safetensors.index.json",
+        "vae/diffusion_pytorch_model.safetensors"
+      ]
     }
   },
   "models": {
@@ -242,6 +278,40 @@
       "asset": "tts-design",
       "service": "tts",
       "variant": "design"
+    },
+    "qwen-image-turbo": {
+      "title": "Qwen-Image-2.1-Turbo",
+      "category": "image",
+      "asset": "image-turbo",
+      "service": "image"
+    },
+    "qwen-image": {
+      "title": "Qwen-Image-2.1",
+      "category": "image",
+      "asset": "image",
+      "service": "image"
+    },
+    "embedding-gemma2-npu": {
+      "title": "EmbeddingGemma 2 NPU",
+      "category": "embedding",
+      "asset": "embedding",
+      "service": "embedding",
+      "npu": true
+    },
+    "qwen3-asr-npu": {
+      "title": "Qwen3-ASR NPU",
+      "category": "asr",
+      "asset": "asr",
+      "service": "asr",
+      "npu": true
+    },
+    "qwen3-tts-custom-npu": {
+      "title": "Qwen3-TTS custom NPU",
+      "category": "tts",
+      "asset": "tts-custom",
+      "service": "tts",
+      "variant": "custom",
+      "npu": true
     }
   },
   "rules": [
@@ -263,13 +333,10 @@
       "id": "outside-current-scope",
       "priority": 20,
       "paths": [
-        "src/models/qwen_image_21/**",
         "src/models/minimax_h3/**",
-        "tests/models/qwen_image_21/**",
         "tests/models/minimax_h3*",
         "tools/h3/**",
         "tools/gufo/h3*",
-        "tools/models/qwen_image_21/**",
         "tests/cli/video*"
       ],
       "owners": []
@@ -323,7 +390,8 @@
         "tests/functional/embedding*"
       ],
       "owners": [
-        "embedding"
+        "embedding",
+        "embedding-gemma2-npu"
       ]
     },
     {
@@ -337,7 +405,8 @@
         "tests/functional/asr_service.py"
       ],
       "owners": [
-        "asr"
+        "asr",
+        "qwen3-asr-npu"
       ]
     },
     {
@@ -351,7 +420,22 @@
         "tests/functional/tts_service.py"
       ],
       "owners": [
-        "tts"
+        "tts",
+        "qwen3-tts-custom-npu"
+      ]
+    },
+    {
+      "id": "image",
+      "priority": 20,
+      "paths": [
+        "src/models/qwen_image_21/**",
+        "tests/models/qwen_image_21/**",
+        "tools/models/qwen_image_21/**",
+        "src/cli/serve/image*",
+        "tests/functional/image_service.py"
+      ],
+      "owners": [
+        "image"
       ]
     },
     {
@@ -365,7 +449,26 @@
       ],
       "owners": [
         "asr",
-        "tts"
+        "tts",
+        "qwen3-asr-npu",
+        "qwen3-tts-custom-npu"
+      ]
+    },
+    {
+      "id": "npu",
+      "priority": 20,
+      "owners": [
+        "embedding-gemma2-npu",
+        "qwen3-asr-npu",
+        "qwen3-tts-custom-npu"
+      ],
+      "paths": [
+        "src/core/npu/**",
+        "include/gufo/ext/experimental/npu.hpp",
+        "cmake/GufoNpuDesigns.cmake",
+        ".devops/nix/xrt/**",
+        ".devops/nix/iron/**",
+        "tests/core/npu*"
       ]
     },
     {
@@ -379,7 +482,11 @@
       "owners": [
         "embedding",
         "asr",
-        "tts"
+        "tts",
+        "image",
+        "embedding-gemma2-npu",
+        "qwen3-asr-npu",
+        "qwen3-tts-custom-npu"
       ]
     },
     {
@@ -479,7 +586,8 @@
         "llm",
         "embedding",
         "asr",
-        "tts"
+        "tts",
+        "image"
       ]
     },
     {
@@ -496,7 +604,11 @@
         "llm",
         "embedding",
         "asr",
-        "tts"
+        "tts",
+        "image",
+        "embedding-gemma2-npu",
+        "qwen3-asr-npu",
+        "qwen3-tts-custom-npu"
       ]
     }
   ]

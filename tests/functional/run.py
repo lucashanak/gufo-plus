@@ -369,7 +369,7 @@ def main():
                          "dspark" if option(command, "--dspark-model") else "off")
     base_url = f"http://127.0.0.1:{port}"
     comparison_command = list(command[1:])
-    for flag in ("--port", "--cache-disk"):
+    for flag in ("--port", "--cache-disk", "--trace"):
         if flag in comparison_command:
             comparison_command[comparison_command.index(flag) + 1] = "<runner-owned>"
     report = {**provenance(), "command": command, "comparison_command": comparison_command,
@@ -498,14 +498,18 @@ def main():
                             "--url", base_url, "--model", model, "--prefix-repetitions", "16",
                             "--output", str(output / (label + ".json")), *extra]):
                         ready_to_restore.append(label)
+                persist = run("cache-persist", "cache_persist.py", [
+                    "--url", base_url, "--model", model,
+                    "--output", str(output / "cache-persist.json")])
+                # Write spacing last: disk evicts the oldest unreused entries
+                # first, so its newest checkpoint outlives the restores' writes
+                # after the restart. Its bound measures spacing, not how long
+                # a checkpoint survives other suites' disk turnover (#1244).
                 # Retain the window; checkpoint IDs identify fixture-owned writes.
                 spacing_offset = (output / "server.log").stat().st_size
                 spacing = run("disk-spacing", "cache_disk_spacing.py", [
                     "--url", base_url, "--model", model,
                     "--output", str(output / "disk-spacing.json")])
-                persist = run("cache-persist", "cache_persist.py", [
-                    "--url", base_url, "--model", model,
-                    "--output", str(output / "cache-persist.json")])
         if ready_to_restore or spacing or persist:
             startup_started = time.monotonic()
             with server(command, output / "server-restarted.log", args.startup_timeout):
