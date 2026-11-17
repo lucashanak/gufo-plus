@@ -2866,7 +2866,8 @@ __device__ __forceinline__ v8f Wmma(v16h a, v16h b, v8f c) {
   return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
 }
 
-using v16bf = __attribute__((ext_vector_type(16))) short;
+// BF16 fragments carry the same sixteen 16-bit lanes.
+using v16bf = __attribute__((ext_vector_type(16))) __bf16;
 
 __device__ __forceinline__ v8f WmmaBf16(v16h a, v16h b, v8f c) {
   return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(
