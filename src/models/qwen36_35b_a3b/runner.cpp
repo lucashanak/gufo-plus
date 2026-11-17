@@ -273,6 +273,14 @@ public:
                 .prefix_reuse = true,
             },
         .sampling_preset = sampling::TextModelPreset::kQwen36,
+        // One prompt pass (PrefillCapacity, 2,048 rows) beside decoders,
+        // unsplit: the width the legacy --prefill-chunk 2048 budget gave.
+        .scheduling =
+            TextSchedulingProfile{
+                .pass_tokens = model_->PrefillCapacity(),
+                .max_layer_groups = 1,
+                .max_yield_decode_width = 1,
+            },
     };
   }
 
