@@ -946,15 +946,13 @@ std::shared_ptr<ext::TextModelRunner> CreateQwenFlashNextTextRunner(
                               free_bytes - deferred)
           .kind;
     };
+    // Keep the widest width the sessions load with, sharing their K/V
+    // (mem::FitSessions) when they do not all fit at full context: wide
+    // copies are what make rewrites fast, and the fork served every width
+    // under its K/V budget before #1258. Narrow only when it is refused.
     std::uint32_t rows = rocm::Executor::kWideRows;
-    while (rows > 8 && fit(rows) != mem::SessionFit::Kind::kFits)
+    while (rows > 8 && fit(rows) == mem::SessionFit::Kind::kRefused)
       rows -= 8;
-    // When no width fits every session at full context, the sessions share
-    // their K/V (mem::FitSessions): keep the widest width that allows it.
-    if (fit(rows) != mem::SessionFit::Kind::kFits)
-      for (rows = rocm::Executor::kWideRows;
-           rows > 8 && fit(rows) == mem::SessionFit::Kind::kRefused;)
-        rows -= 8;
     model->LimitCopyRows(rows);
   }
   std::string model_fingerprint = options.disk_cache.model_artifact_fingerprint;
