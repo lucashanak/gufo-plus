@@ -1512,8 +1512,8 @@ std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
       auto& at = s->attention_[il];
       at.k_cache = grow(s->kv_regions_);
       at.v_cache = grow(s->kv_regions_);
-      at.block_k = Alloc<__half>(a, block_elems, error_msg,
-                                 &s->allocated_bytes_);
+      at.block_k =
+          Alloc<__half>(a, block_elems, error_msg, &s->allocated_bytes_);
       at.index_k = Alloc<float>(
           a, static_cast<std::size_t>(s->index_capacity_) * c.indexer_head_dim,
           error_msg, &s->allocated_bytes_);

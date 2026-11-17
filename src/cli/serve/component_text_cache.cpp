@@ -1843,7 +1843,9 @@ std::size_t ComponentTextCache::ReleaseIdle() {
     try {
       // A cold acquisition resets the slot; releasing the lease uncommitted
       // leaves it invalid until the next request restores into it.
-      { auto slot = entry->slot->Acquire(); }
+      {
+        auto slot = entry->slot->Acquire();
+      }
       entry->history.reset();
       ++reset;
     } catch (...) {
@@ -1853,9 +1855,10 @@ std::size_t ComponentTextCache::ReleaseIdle() {
     entry->busy = false;
   }
   if (!targets.empty())
-    Logger::Info("cache", "schema=component-cache-v1 event=release_idle slots=" +
-                              std::to_string(reset) + " frontiers=" +
-                              std::to_string(frontiers));
+    Logger::Info("cache",
+                 "schema=component-cache-v1 event=release_idle slots=" +
+                     std::to_string(reset) +
+                     " frontiers=" + std::to_string(frontiers));
   return reset;
 }
 

@@ -8,7 +8,6 @@
 #include <stdexcept>
 #include <utility>
 
-
 namespace gufo::hip {
 namespace {
 

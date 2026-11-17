@@ -517,11 +517,10 @@ public:
   /// `wrap_up` prepends the tags' wrap-up text to the forced end (fork:
   /// --reasoning-budget-fraction).
   [[nodiscard]] std::shared_ptr<const sampling::ReasoningBudget>
-  BuildReasoningBudget(std::size_t tokens,
-                       std::span<const TextRunnerToken> prompt,
-                       ext::InitialOutputState initial =
-                           ext::InitialOutputState::kThought,
-                       bool wrap_up = false) const;
+  BuildReasoningBudget(
+      std::size_t tokens, std::span<const TextRunnerToken> prompt,
+      ext::InitialOutputState initial = ext::InitialOutputState::kThought,
+      bool wrap_up = false) const;
 
   [[nodiscard]] virtual std::vector<TextRunnerToken> Tokenize(
       std::string_view text) const = 0;

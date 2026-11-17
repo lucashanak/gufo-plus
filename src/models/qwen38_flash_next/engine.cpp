@@ -1814,10 +1814,10 @@ bool Session::FinishDecode(const DecodeRequest& request,
   // proposals as failed predictions. DFlash2 proposals say nothing about
   // the MTP head.
   if (!pending.dflash)
-    draft_length_.Observe(
-        observed, result->stop || mtp_all ? observed : mtp_drafts, base,
-        pending.policy_concurrency, pending.sampled_subset_cost,
-        pending.planned_greedy);
+    draft_length_.Observe(observed,
+                          result->stop || mtp_all ? observed : mtp_drafts, base,
+                          pending.policy_concurrency,
+                          pending.sampled_subset_cost, pending.planned_greedy);
 
   // The next call knows the next sampled anchor. Defer draft catch-up until
   // then, retaining this session's target hidden rows across interleaving.

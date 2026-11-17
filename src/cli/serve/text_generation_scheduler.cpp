@@ -1454,8 +1454,8 @@ struct TextGenerationScheduler::Impl {
              std::deque<std::shared_ptr<ScheduledRequest>>& capturing,
              std::deque<std::shared_ptr<ScheduledRequest>>& waiting,
              const std::stop_token& stop_token) {
-    UpdateWaiting(waiting, prefilling.size() + decoding.size() +
-                               capturing.size());
+    UpdateWaiting(waiting,
+                  prefilling.size() + decoding.size() + capturing.size());
     const bool shared_state = runner_pool->shared_state();
     if (shared_state)
       UpdateMemoryWaiters(waiting);
@@ -1476,9 +1476,8 @@ struct TextGenerationScheduler::Impl {
           return;
         // A request refused by the K/V budget goes first: a new arrival
         // would take the rows it waits for.
-        if (std::ranges::any_of(waiting, [](const auto& parked) {
-              return parked->kv_waiting;
-            }))
+        if (std::ranges::any_of(
+                waiting, [](const auto& parked) { return parked->kv_waiting; }))
           return;
         request = PopQueued();
       }

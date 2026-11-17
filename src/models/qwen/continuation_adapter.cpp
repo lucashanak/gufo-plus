@@ -11,7 +11,6 @@
 #include <stdexcept>
 #include <utility>
 
-
 namespace gufo::models::qwen {
 namespace {
 using cache::Rows;
@@ -433,8 +432,8 @@ cache::Identity ContinuationAdapter::CompatibilityIdentity() const {
 }
 std::unique_ptr<cache::Slot> ContinuationAdapter::CreateSlot(
     cache::MutationGuard& guard) {
-  auto executor = std::make_unique<hip::QwenGpuExecutor>(model_, context_,
-                                                         policy_);
+  auto executor =
+      std::make_unique<hip::QwenGpuExecutor>(model_, context_, policy_);
   // Prepare the rollback pair before readiness. Pinning the current buffer
   // for a prefill pass then requires neither an allocation nor a state copy.
   executor->arena_.AllocateRecurrentSnapshot();

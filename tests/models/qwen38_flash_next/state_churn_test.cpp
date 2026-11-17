@@ -6,14 +6,14 @@
 // the first round's fresh sessions exactly.
 //
 // state_churn_test --model FIRST.gguf --mtp-model MTP.gguf ROUNDS
+#include <hip/hip_runtime.h>
+
 #include <cstring>
 #include <iostream>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-#include <hip/hip_runtime.h>
 
 #include "src/mem/account.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
@@ -30,7 +30,7 @@ void Require(bool condition, const std::string& message) {
 }
 
 constexpr std::uint32_t kContext = 20000;
-constexpr std::uint32_t kLengths[] = {18000, 900,  7300,  12000,
+constexpr std::uint32_t kLengths[] = {18000, 900,   7300, 12000,
                                       3641,  16500, 5200, 9800};
 
 std::vector<std::int32_t> Prompt(const qfn::Model& model, std::size_t tokens,
@@ -58,7 +58,8 @@ Result Run(qfn::Model& model, qfn::Session& session, std::size_t slot) {
       Prompt(model, kLengths[slot], "churn " + std::to_string(slot));
   Require(session.Sync(prompt, &error), error);
   sampling::SamplerState sampler(
-      {.seed = 5}, std::vector<sampling::TokenId>(prompt.begin(), prompt.end()));
+      {.seed = 5},
+      std::vector<sampling::TokenId>(prompt.begin(), prompt.end()));
   qfn::Session::DecodeResult step;
   Require(session.DecodeStep(1, sampler, &step, &error, false), error);
   return {{session.Logits().begin(), session.Logits().end()}, step.tokens};

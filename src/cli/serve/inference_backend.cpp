@@ -283,16 +283,17 @@ bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner> runner,
   }
 }
 
-bool InferenceBackend::load(
-    const std::string& model_path, std::string* error,
-    std::uint32_t max_context, std::size_t session_count,
-    TextSchedulerPolicy scheduler_policy,
-    const TextSpeculativeConfig& speculative_config,
-    const TextDiskCacheConfig& disk_cache_config,
-    const std::string& vision_model_path,
-    TextRunnerRamCacheOptions ram_cache_config, bool enable_yarn,
-    const PrepareRunnerOptions& prepare_runner_options,
-    std::size_t kv_cache_bytes) {
+bool InferenceBackend::load(const std::string& model_path, std::string* error,
+                            std::uint32_t max_context,
+                            std::size_t session_count,
+                            TextSchedulerPolicy scheduler_policy,
+                            const TextSpeculativeConfig& speculative_config,
+                            const TextDiskCacheConfig& disk_cache_config,
+                            const std::string& vision_model_path,
+                            TextRunnerRamCacheOptions ram_cache_config,
+                            bool enable_yarn,
+                            const PrepareRunnerOptions& prepare_runner_options,
+                            std::size_t kv_cache_bytes) {
   std::string load_error;
   auto reader_owner = core::GgufReader::OpenFile(
       model_path, &load_error, {.allow_unsized_tensors = true});
@@ -630,8 +631,7 @@ InferenceBackend::Result InferenceBackend::chat(
       state->scheduler->runner().InitialOutputState(effective_request);
   if (const auto budget = ResolveReasoningBudget(
           request.reasoning, state->reasoning_defaults, max_tokens);
-      budget &&
-      !TextGenerationBackend::IsContent(initial))
+      budget && !TextGenerationBackend::IsContent(initial))
     effective_sampling.reasoning_budget =
         state->scheduler->runner().BuildReasoningBudget(
             budget->tokens, prompt->tokens, initial, budget->wrap_up);
@@ -723,8 +723,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
       state->scheduler->runner().InitialOutputState(effective_request);
   if (const auto budget = ResolveReasoningBudget(
           request.reasoning, state->reasoning_defaults, max_tokens);
-      budget &&
-      !TextGenerationBackend::IsContent(initial))
+      budget && !TextGenerationBackend::IsContent(initial))
     effective_sampling.reasoning_budget =
         state->scheduler->runner().BuildReasoningBudget(
             budget->tokens, prompt->tokens, initial, budget->wrap_up);

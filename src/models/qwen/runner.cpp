@@ -9,7 +9,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-
 #include <functional>
 #include <memory>
 #include <mutex>

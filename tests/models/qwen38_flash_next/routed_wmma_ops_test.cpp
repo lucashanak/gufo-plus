@@ -835,7 +835,7 @@ void CheckVectorGrouping(bool down = false, int experts = 8) {
   for (int t = 0; t < tokens; ++t)
     for (int j = 0; j < used; ++j)
       ids[t * used + j] = j == 1 || (down && t % 11 == 1) ? -1
-                          : experts == 8 ? (t + j) % experts
+                          : experts == 8                  ? (t + j) % experts
                                          : (t * 37 + j * 11) % experts;
   if (!down) {
     // Exercise both repeated experts across tokens and duplicate slots
