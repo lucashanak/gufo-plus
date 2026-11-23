@@ -13,6 +13,25 @@
 
 namespace gufo::mem {
 namespace {
+// EXPERIMENT ONLY: knobs for the host-pressure sweep, removed before merge.
+std::size_t ExpMib(const char* name, std::size_t fallback) {
+  const char* v = std::getenv(name);
+  return v ? static_cast<std::size_t>(std::strtoull(v, nullptr, 10)) << 20
+           : fallback;
+}
+std::size_t ExpWarmCap() {
+  static const std::size_t v = ExpMib("GUFO_EXP_WARM_MIB", PagePool::kWarmCapBytes);
+  return v;
+}
+std::size_t ExpKeepPages() {
+  static const std::size_t v =
+      ExpMib("GUFO_EXP_KEEP_MIB", ~std::size_t{0} >> 21 << 20) / kPageBytes;
+  return v;
+}
+bool ExpNoReclaim() {
+  static const bool v = std::getenv("GUFO_EXP_NO_RECLAIM") != nullptr;
+  return v;
+}
 
 bool SupportsDemandMapping(int device, const hipMemAllocationProp& prop) {
   // The ledger holds outstanding state back from host budgets, which is
@@ -237,7 +256,8 @@ bool PagePool::AcquireForLender(hipMemGenericAllocationHandle_t* handle,
   // restore right after load that found them gone made its pages on the
   // scheduler thread (+40 ms for 3,143 Qwen 27B rows).
   if (!may_create_(kPageBytes) &&
-      !(may_reclaim && host_available_() >= floor_bytes_ + kPageBytes))
+      !(may_reclaim && !ExpNoReclaim() &&
+        host_available_() >= floor_bytes_ + kPageBytes))
     return false;
   return CreatePage(handle);
 }
@@ -339,7 +359,7 @@ void PagePool::MapAhead(const std::shared_ptr<Region>& region,
 void PagePool::Warm(std::size_t bytes) {
   {
     std::lock_guard lock(mutex_);
-    warm_bytes_ = std::min(kWarmCapBytes, warm_bytes_ + bytes);
+    warm_bytes_ = std::min(ExpWarmCap(), warm_bytes_ + bytes);
   }
   wake_.notify_one();
 }
@@ -422,7 +442,7 @@ void PagePool::Run() {
       // Pages from reclaim (possibly compaction) only for the warm-up at
       // load, or when writers would otherwise make them on their own
       // threads, and never below the floor of MemAvailable.
-      if (!create)
+      if (!create && !ExpNoReclaim())
         create = (warm_bytes_ > 0 || free < kLowPages) &&
                  host_available_() >= floor_bytes_ + kPageBytes;
       if (!create) {
@@ -456,7 +476,8 @@ void PagePool::Run() {
     // Pages of released regions that no region promises any more go back to
     // the driver, on this thread only: a release may wait for the device.
     const std::size_t keep =
-        StateLedger::Process().UnmappedBytes() / kPageBytes;
+        std::min(StateLedger::Process().UnmappedBytes() / kPageBytes,
+                 std::max(kHighPages, ExpKeepPages()));
     if (jobs_.empty() && free_.size() + recycled_.size() > keep) {
       auto& list = recycled_.empty() ? free_ : recycled_;
       const auto handle = list.back();
