@@ -171,11 +171,10 @@ public:
   /// Free pages kept for map-ahead and first writes.
   static constexpr std::size_t kLowPages = 256;
   static constexpr std::size_t kHighPages = 512;
-  /// No working set is created at load (fork): with a 100+ GiB model on a
-  /// 128 GiB host an 8 GiB warm-up took the page cache and free 2 MiB
-  /// blocks, and serving then ran under kswapd and compaction (prefill
-  /// 1,550 -> 850 tok/s, about 3,000 compaction stalls per request set).
-  static constexpr std::size_t kWarmCapBytes = 0;
+  /// The working set created at load: 8 GiB, about 200 ms. Pages beyond the
+  /// high watermark are made only while the host keeps twice its free floor
+  /// (WarmBytesFit): a 100+ GiB model on a 128 GiB host leaves too little.
+  static constexpr std::size_t kWarmCapBytes = std::size_t{8} << 30;
   /// Pages taken from lenders per pass: 128 MiB, a bounded eviction.
   static constexpr std::size_t kBorrowBatchPages = 64;
 
@@ -195,8 +194,8 @@ private:
 
   int device_;
   std::function<bool(std::uint64_t)> may_create_;
-  [[maybe_unused]] std::function<std::uint64_t()> host_available_;
-  [[maybe_unused]] std::uint64_t floor_bytes_;
+  std::function<std::uint64_t()> host_available_;
+  std::uint64_t floor_bytes_;
   hipMemAllocationProp prop_{};
   hipMemAccessDesc access_{};
 

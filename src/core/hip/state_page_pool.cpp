@@ -244,8 +244,10 @@ bool PagePool::AcquireForLender(hipMemGenericAllocationHandle_t* handle,
   // Always a new page: the free pages are the regions' working set, and a
   // restore right after load that found them gone made its pages on the
   // scheduler thread (+40 ms for 3,143 Qwen 27B rows).
-  // Never from reclaim (fork): MemAvailable counts the page cache, which on
-  // a near-full host holds the files the model reads every token.
+  // Never from reclaim: MemAvailable counts the page cache, which on a
+  // near-full host holds the files the model reads every token (pages made
+  // past it at load evicted 18 GB of cache and stalled compaction 1,800
+  // times). `may_reclaim` no longer widens this.
   (void)may_reclaim;
   if (!may_create_(kPageBytes))
     return false;
@@ -544,8 +546,14 @@ void PagePool::Run() {
     }
     if (free_.size() + recycled_.size() < TargetFreePages()) {
       // Free 2 MiB blocks first: a page made from them costs no reclaim.
-      bool create = may_create_(kPageBytes);
+      // Warm-up pages past the high watermark also leave the free floor
+      // free a second time: on a 128 GiB host whose model left 25 GB free,
+      // an 8 GiB warm-up from free blocks alone brought memory pressure
+      // (PSI full 28%) and compaction stalls into serving.
       const std::size_t free = free_.size() + recycled_.size();
+      bool create = may_create_(free >= kHighPages
+                                    ? kPageBytes + HostFreeFloorBytes()
+                                    : kPageBytes);
       if (!create && free < kLowPages) {
         // Otherwise take pages the RAM cache borrowed from the promised
         // state: a map, no new memory. Only up to the low watermark: pages
@@ -559,8 +567,8 @@ void PagePool::Run() {
         if (borrowed || free_.size() + recycled_.size() > free)
           continue;
       }
-      // Never pages from reclaim (fork, see AcquireForLender): writers
-      // that find the pool empty make their own, as without a pool.
+      // Never pages from reclaim (see AcquireForLender): writers that find
+      // the pool empty make their own, as without a pool.
       if (!create) {
         // Writers take pooled or on-demand pages. Look again once memory
         // may have freed.
