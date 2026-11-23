@@ -1091,9 +1091,8 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
       l.ffn_up_exps.experts == l.ffn_gate_exps.experts) {
     // The shared expert's quantized rows (upstream #1321) are reused only by
     // the Q4_K route they were measured on.
-    const bool reuse_q8 = gate_type == core::GgmlType::kQ4_K &&
-                          q8t_src_ == x && q8t_rows_ == rows &&
-                          q8t_cols_ == c.hidden_size;
+    const bool reuse_q8 = gate_type == core::GgmlType::kQ4_K && q8t_src_ == x &&
+                          q8t_rows_ == rows && q8t_cols_ == c.hidden_size;
     // Share expert weights across request boundaries while retaining the
     // scalar Q8 activation quantization and dot-product reduction.
     const int gu_rc =

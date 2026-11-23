@@ -427,10 +427,9 @@ gufo::mem::StateDeclaration QwenGpuArena::DeclareState(
   const std::size_t planes =
       CheckedMultiply(2, config.FullAttentionLayerCount());
   (void)state.Context(
-      {.row_bytes =
-           fp16 ? policy.AttentionKvRowBytes(CheckedMultiply(
-                      config.num_key_value_heads, config.head_dim))
-                : CheckedMultiply(config.head_dim, sizeof(float)),
+      {.row_bytes = fp16 ? policy.AttentionKvRowBytes(CheckedMultiply(
+                               config.num_key_value_heads, config.head_dim))
+                         : CheckedMultiply(config.head_dim, sizeof(float)),
        .rows = std::max(max_context, 1U),
        .segments = fp16 ? planes
                         : CheckedMultiply(planes, config.num_key_value_heads)});

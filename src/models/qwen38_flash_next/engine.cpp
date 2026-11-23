@@ -1020,10 +1020,10 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     }
   }
   const auto pass_tokens = [&](std::size_t remaining, std::size_t limit) {
-    std::size_t n = std::min<std::size_t>(
-        remaining <= exec.pass_rows() ? std::size_t{exec.pass_rows()}
-                                      : model_->PassChunk(),
-        remaining);
+    std::size_t n = std::min<std::size_t>(remaining <= exec.pass_rows()
+                                              ? std::size_t{exec.pass_rows()}
+                                              : model_->PassChunk(),
+                                          remaining);
     // An even split avoids a short last pass, whose time would not hide the
     // next reads.
     if (limit != 0 && limit + kPrefillTailTokens < remaining)

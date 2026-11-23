@@ -551,9 +551,8 @@ void PagePool::Run() {
       // an 8 GiB warm-up from free blocks alone brought memory pressure
       // (PSI full 28%) and compaction stalls into serving.
       const std::size_t free = free_.size() + recycled_.size();
-      bool create = may_create_(free >= kHighPages
-                                    ? kPageBytes + HostFreeFloorBytes()
-                                    : kPageBytes);
+      bool create = may_create_(
+          free >= kHighPages ? kPageBytes + HostFreeFloorBytes() : kPageBytes);
       if (!create && free < kLowPages) {
         // Otherwise take pages the RAM cache borrowed from the promised
         // state: a map, no new memory. Only up to the low watermark: pages
