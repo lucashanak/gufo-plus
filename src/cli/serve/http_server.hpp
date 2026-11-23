@@ -27,6 +27,9 @@ class EmbeddingService;
 struct DecisionService;
 class WebSocket;
 
+/// Whether a comma-separated header value lists the lowercase token.
+bool HasToken(std::string_view value, std::string_view token);
+
 struct HttpRequest {
   std::string method;  // "GET" / "POST" / ...
   std::string path;    // "/v1/chat/completions" (no query)
@@ -95,6 +98,15 @@ struct HttpServerOptions {
   std::size_t max_request_body_bytes{static_cast<std::size_t>(8) * 1024 * 1024};
   std::size_t max_connections{16};
   std::chrono::milliseconds sse_heartbeat_interval{std::chrono::seconds(15)};
+  /// Reuse HTTP/1.1 connections for sequential requests. The CLI enables it;
+  /// embedders that assume one request per socket keep the old behavior.
+  bool keep_alive{false};
+  /// A reused connection waiting for its next request holds a worker slot for
+  /// at most this long.
+  std::chrono::milliseconds keep_alive_idle_timeout{std::chrono::seconds(5)};
+  /// Bound the requests one connection may serve, so a pooled client rotates
+  /// sockets and idle clients cannot pin a worker indefinitely.
+  std::size_t max_requests_per_connection{100};
   /// Called once, on the listener or a request thread, when the text backend or
   /// the embedding service reports a lost device. Health, readiness and
   /// generation answer 503 `device_lost` from then on; the hook decides how the
@@ -143,7 +155,9 @@ private:
 
   HttpResponse handle_request(const HttpRequest& req);
   bool device_lost();
-  void handle_connection(int client_fd, std::atomic<bool>& response_sent);
+  void handle_connection(int client_fd, std::atomic<bool>& response_sent,
+                         std::atomic<bool>& parked,
+                         std::chrono::steady_clock::time_point& parked_since);
   void reap_workers();
   void register_routes();
 
@@ -174,6 +188,10 @@ private:
 /// Best effort: when the address cannot be bound, or for port 0, nothing
 /// listens and the caller proceeds exactly as without it. stop() closes the
 /// socket so `HttpServer::start` can bind the same address.
+///
+/// Beside the `error` object the body reports the load stage as top-level
+/// `progress` (0 to 1) and `message`, which llama-swap v269 and later show
+/// and use to restart `healthCheckTimeout` whenever `progress` changes.
 class LoadingResponder {
 public:
   LoadingResponder(const std::string& host, int port);
@@ -192,11 +210,19 @@ public:
   /// answered client to close.
   void stop();
 
+  /// Reports a load stage in later replies. `progress` is clamped to [0, 1].
+  /// Safe to call from any thread, before or after stop().
+  void SetProgress(double progress, std::string_view message);
+
 private:
   void serve();
+  [[nodiscard]] std::string Reply() const;
 
   int listen_fd_ = -1;
   std::atomic<bool> stopped_{false};
+  mutable std::mutex progress_mutex_;
+  double progress_ = 0.0;
+  std::string message_ = "Loading model";
   std::thread thread_;
 };
 

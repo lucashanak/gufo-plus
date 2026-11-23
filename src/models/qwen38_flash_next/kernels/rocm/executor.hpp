@@ -17,6 +17,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <optional>
 #include <span>
 #include <string>
 #include <tuple>
@@ -242,12 +243,19 @@ private:
   /// once (the GEMM tier's arena must be grown before capture).
   std::unordered_map<std::uint64_t, hipGraphExec_t> graphs_;
   std::unordered_set<std::uint64_t> warmed_;
-  std::vector<void*> allocations_;
+  /// The session's declared state (Executor::DeclareSessionState); the
+  /// pointers above and the regions below point into it.
+  std::unique_ptr<gufo::mem::SessionState> state_;
   /// Charges the K/V regions' pages to the shared state budget.
   std::shared_ptr<gufo::mem::StateAccount> account_;
   /// Trunk and MTP K/V, one region per buffer, backed as rows are written.
   std::vector<std::shared_ptr<gufo::mem::Region>> kv_regions_;
   std::vector<std::shared_ptr<gufo::mem::Region>> mtp_kv_regions_;
+  /// Pooled indexer keys, one region per attention layer and one for the
+  /// predictor. Small (17 MiB at 262,144 tokens), so backed whole; regions
+  /// so checkpoints share their pages like the K/V's.
+  std::vector<std::shared_ptr<gufo::mem::Region>> pooled_regions_;
+  std::vector<std::shared_ptr<gufo::mem::Region>> mtp_pooled_regions_;
   std::size_t allocated_bytes_{0};
   std::size_t rollback_bytes_{0};
   std::function<bool()> is_cancelled_;
@@ -298,7 +306,13 @@ public:
                       hipStream_t stream) const;
 
   struct Options {
+    /// Widest pass. Rows past `narrow_batch` take memory only while
+    /// AcquireWidePasses() holds them (#952); without demand mapping the
+    /// executor allocates `narrow_batch` rows and never runs wider passes.
     std::uint32_t max_batch{1};
+    /// Rows every pass may take, backed for the executor's life. Zero (or
+    /// a value of at least max_batch) means max_batch.
+    std::uint32_t narrow_batch{0};
     /// Rows of logits (and hidden states) a Forward call may return.
     std::uint32_t max_logit_rows{1};
     /// Longest speculative batch; bounds the recurrent snapshot storage.
@@ -322,12 +336,17 @@ public:
       std::string* error_msg = nullptr) const;
   [[nodiscard]] bool EnsureRollback(Session& session, std::uint32_t depth,
                                     std::string* error_msg) const;
-  [[nodiscard]] std::size_t SessionBytes(
-      core::SessionMode mode, std::uint32_t max_context,
-      std::uint32_t rollback_depth) const noexcept;
-  /// The K/V part of SessionBytes(), in demand-mapped regions.
-  [[nodiscard]] std::size_t DemandMappedBytes(
-      core::SessionMode mode, std::uint32_t max_context) const noexcept;
+  /// Bytes one session's state takes: its declared state
+  /// (DeclareSessionState) plus `rollback_depth` rollback rows.
+  [[nodiscard]] std::size_t SessionBytes(core::SessionMode mode,
+                                         std::uint32_t max_context,
+                                         std::uint32_t rollback_depth) const;
+  /// Bytes of `depth` rollback rows of a session (EnsureRollback).
+  [[nodiscard]] std::size_t RollbackBytes(std::uint32_t depth) const noexcept;
+  /// The part of SessionBytes() a session maps only as it writes it: its
+  /// K/V regions, zero without demand mapping.
+  [[nodiscard]] std::size_t DemandMappedBytes(core::SessionMode mode,
+                                              std::uint32_t max_context) const;
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
   /// Backs the K/V rows of trunk positions below `trunk_end` and MTP
   /// positions below `mtp_end`, plus a tile of rows past each, before they
@@ -335,6 +354,22 @@ public:
   /// K/V writer calls it first, cache restores included.
   [[nodiscard]] bool EnsureKv(Session& session, std::uint32_t trunk_end,
                               std::uint32_t mtp_end, std::string* error) const;
+  /// Asks the page pool to back the rows EnsureKv() would, without waiting.
+  void MapKvAhead(Session& session, std::uint32_t trunk_end,
+                  std::uint32_t mtp_end) const;
+  /// Before rows [first, end) of the trunk's K/V and blocks [first_block,
+  /// end_block) of its pooled keys (the predictor's with `draft`) are
+  /// written: pages of them that a checkpoint or another session shares
+  /// become the session's own, copied where they hold rows below `kept`
+  /// (blocks below `kept_block`) and cleared otherwise
+  /// (mem::Region::PrepareWrite). One atomic read per buffer when nothing
+  /// in it can be shared.
+  [[nodiscard]] bool UnshareKv(Session& session, bool draft,
+                               std::uint32_t first, std::uint32_t end,
+                               std::uint32_t kept, std::uint32_t first_block,
+                               std::uint32_t end_block,
+                               std::uint32_t kept_block,
+                               std::string* error) const;
 
   enum class ForwardMode { kDecode, kVerify, kPrefill };
   /// Commits checkpoint slot 0 on first use. False when the device lacks
@@ -592,6 +627,29 @@ public:
   [[nodiscard]] std::uint32_t max_batch() const noexcept {
     return options_.max_batch;
   }
+  [[nodiscard]] std::uint32_t narrow_batch() const noexcept {
+    return narrow_batch_;
+  }
+  /// Rows one pass may take now: max_batch while the wide scratch is
+  /// mapped, otherwise narrow_batch.
+  [[nodiscard]] std::uint32_t pass_rows() const noexcept {
+    return scratch_arena_ && scratch_arena_->transient_mapped()
+               ? options_.max_batch
+               : narrow_batch_;
+  }
+  /// Bytes the wide scratch maps beyond the narrow rows; zero when wide
+  /// passes are unavailable.
+  [[nodiscard]] std::size_t WidePassBytes() const noexcept {
+    return scratch_arena_ ? scratch_arena_->transient_bytes() : 0;
+  }
+  /// Maps the wide pass scratch when the host can spare it: free 2 MiB
+  /// blocks above the host floor and room in the device heap after the
+  /// state promised to sessions. It never evicts the RAM cache or waits.
+  /// True when wide passes may run.
+  [[nodiscard]] bool AcquireWidePasses() const;
+  /// Returns the wide scratch to the driver. Waits for in-flight GPU work;
+  /// call it between passes. A no-op while a wide pass runs.
+  void ReleaseWidePasses() const;
   [[nodiscard]] std::uint32_t max_speculative() const noexcept {
     return options_.max_speculative;
   }
@@ -614,6 +672,36 @@ private:
   friend class Session;
   friend struct ExecutorTestAccess;  // capture failure injection in GPU tests
   Executor() = default;
+
+  /// One session's state as the core allocates it (mem::SessionState), and
+  /// the buffer each of the session's pointers takes. Linear layers use
+  /// `conv` and `state`, attention layers the others.
+  struct SessionStateLayout {
+    struct Layer {
+      gufo::mem::StateBufferId conv{0};
+      gufo::mem::StateBufferId state{0};
+      gufo::mem::StateBufferId k{0};
+      gufo::mem::StateBufferId v{0};
+      gufo::mem::StateBufferId index_k{0};
+      gufo::mem::StateBufferId block_k{0};
+    };
+    explicit SessionStateLayout(std::size_t margin_tokens)
+        : state(margin_tokens) {}
+    gufo::mem::StateDeclaration state;
+    std::vector<Layer> layers;
+    std::optional<gufo::mem::StateBufferId> ple_history;
+    gufo::mem::StateBufferId control{0};
+    /// MTP sessions only: `mtp` holds k, v, index_k and block_k.
+    std::optional<Layer> mtp;
+    gufo::mem::StateBufferId mtp_target_hidden{0};
+    gufo::mem::StateBufferId mtp_h{0};
+    std::optional<gufo::mem::StateBufferId> mtp_draft_rows;
+    gufo::mem::StateBufferId mtp_draft_ids{0};
+  };
+  /// The state CreateSession() allocates and SessionBytes() and
+  /// DemandMappedBytes() count.
+  [[nodiscard]] SessionStateLayout DeclareSessionState(
+      core::SessionMode mode, std::uint32_t max_context) const;
 
   /// Visits every device region of a snapshot in payload order with
   /// (device pointer or null when sizing, payload offset, bytes, name).
@@ -971,6 +1059,24 @@ private:
   /// Writes layer `il`'s feature slice from `res` when it is tapped.
   void TapFeatures(std::uint32_t il, const float* res,
                    std::uint32_t rows) const;
+  /// Carves the buffers with a row per pass token for `rows` rows with
+  /// `allocate`; the other fields of `scratch` stay as they are.
+  [[nodiscard]] bool CarveRowScratch(
+      Scratch& scratch, std::size_t rows,
+      const std::function<void*(std::size_t)>& allocate) const;
+  /// The scratch every pass of at most narrow_batch_ rows runs on, and the
+  /// set of wider passes: the same buffers except the row buffers, which
+  /// live in scratch_arena_ and are mapped only while AcquireWidePasses()
+  /// holds them. Null arena without demand mapping (max_batch is then
+  /// narrow_batch_).
+  Scratch narrow_s_{};
+  Scratch wide_s_{};
+  std::unique_ptr<gufo::mem::ScratchArena> scratch_arena_;
+  std::uint32_t narrow_batch_{1};
+  /// Rows of the set s_ belongs to: max_batch during a wide pass.
+  mutable std::uint32_t scratch_rows_{1};
+  /// Set while a pass wider than narrow_batch_ is in flight.
+  mutable bool wide_pass_running_{false};
   [[nodiscard]] Scratch RowScratch(const Scratch& base,
                                    std::uint32_t offset) const;
   void UseScratch(const Scratch& scratch) const;
@@ -988,6 +1094,8 @@ private:
   static constexpr std::size_t kCompactPenaltyLimit = 4096;
   std::uint32_t* verification_ids_{nullptr};
   std::uint32_t* verification_scratch_ids_{nullptr};
+  std::uint32_t* verification_allowed_masks_{nullptr};
+  std::uint32_t* verification_allowed_masks_host_{nullptr};
   sampling::LogitCandidate* verification_candidates_{nullptr};
   sampling::LogitCandidate* verification_candidates_host_{nullptr};
   mutable std::vector<sampling::TokenPenalty> verification_penalty_host_;

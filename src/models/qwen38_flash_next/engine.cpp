@@ -26,15 +26,22 @@ namespace gufo::models::qwen38_flash_next {
 namespace {
 
 // gfx1151, served repository prompts: 4096-token chunks prefill 24K-102K
-// tokens 6-11% faster than 2048 (pp4096 +5% at d0, +6% at d32K). 16,384
-// rows give each of the 512 routed experts about 320 rows instead of 80, so
-// the gate/up and down tiles decode each expert's weights for far more
-// tokens: 26.5K-token HTTP prompts +3%, about 4 GiB more scratch. The dense
-// GEMMs launch their tiles in 4,096-row groups (GroupedRasterTile) so their
-// activations stay cached. Each chunk's n-gram gather grows with it;
-// next-chunk prefetch overlaps that read. Prefill logits do not depend on
-// the chunk size (pre-budget queries always take the dense attention tiles).
-constexpr std::uint32_t kPrefillChunkTokens = 16384;
+// tokens 6-11% faster than 2048 (pp4096 +5% at d0, +6% at d32K). Each
+// chunk's n-gram gather grows with it; next-chunk prefetch overlaps that
+// read. Prefill logits do not depend on the chunk size (pre-budget queries
+// always take the dense attention tiles).
+constexpr std::uint32_t kPrefillChunkTokens = 4096;
+// A prompt pass the scheduler leaves unbounded (no session decoding beside
+// it, none free to admit an arrival) takes up to this many rows when the
+// host has the memory: served prompts of 28K-85K tokens
+// prefill 2-7% faster than in 4096-row passes (#952). Those passes run on a
+// second set of the row buffers (4.6 GiB), mapped only while they run and
+// freed at the next decode step, so loading costs no more memory than
+// before. Passes beside decoders stay narrow: a decoder would wait for every
+// layer group of a wider pass (1.4 s instead of 0.6 s between tokens). With
+// the tail rows, the widest pass plus the indexer's top-k rows fills a
+// 16,384-row ring.
+constexpr std::uint32_t kWidePrefillChunkTokens = 14208;
 // A prompt ending this close past a chunk finishes in that chunk: a separate
 // tail pass costs about as much as this many more chunk rows.
 constexpr std::uint32_t kPrefillTailTokens = 128;
@@ -194,7 +201,9 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     }
   }
   rocm::Executor::Options exec;
-  exec.max_batch = m->PrefillThroughCapacity();
+  exec.max_batch = std::min(kWidePrefillChunkTokens + kPrefillTailTokens,
+                            options.max_context);
+  exec.narrow_batch = m->PrefillThroughCapacity();
   exec.max_logit_rows =
       m->mtp_weights_
           ? static_cast<std::uint32_t>(std::min<std::uint64_t>(
@@ -311,6 +320,47 @@ std::uint32_t Model::PrefillThroughCapacity() const noexcept {
                   options_.max_context);
 }
 
+std::size_t Model::StepThrough(std::size_t remaining,
+                               std::size_t budget) const {
+  const std::size_t narrow = PrefillThroughCapacity();
+  const bool wide =
+      budget > narrow && remaining > narrow && executor_->AcquireWidePasses();
+  return wide ? std::size_t{executor_->pass_rows()} : narrow;
+}
+
+std::size_t Model::StepCapacity(std::size_t remaining,
+                                std::size_t budget) const {
+  const std::size_t through = StepThrough(remaining, budget);
+  if (remaining <= through)
+    return through;
+  return through > PrefillThroughCapacity() ? through - kPrefillTailTokens
+                                            : PrefillCapacity();
+}
+
+std::size_t Model::PlannedThrough() const noexcept {
+  return executor_->max_batch();
+}
+
+std::size_t Model::PlannedChunk() const noexcept {
+  const std::size_t through = PlannedThrough();
+  return through > PrefillThroughCapacity() ? through - kPrefillTailTokens
+                                            : PrefillCapacity();
+}
+
+std::size_t Model::PassThrough() const noexcept {
+  return executor_->pass_rows();
+}
+
+std::size_t Model::PassChunk() const noexcept {
+  const std::size_t through = executor_->pass_rows();
+  return through > PrefillThroughCapacity() ? through - kPrefillTailTokens
+                                            : PrefillCapacity();
+}
+
+void Model::ReleaseWidePasses() const {
+  executor_->ReleaseWidePasses();
+}
+
 bool Model::HasMtp() const noexcept {
   return device_->has_mtp();
 }
@@ -344,7 +394,7 @@ std::size_t Model::ResidentBytes() const noexcept {
 }
 
 std::size_t Model::SessionBytes(core::SessionMode mode,
-                                std::uint32_t context) const noexcept {
+                                std::uint32_t context) const {
   const std::size_t vision =
       vision_ ? std::size_t{context} * (config().hidden_size * sizeof(float) +
                                         3 * sizeof(std::int32_t)) +
@@ -359,7 +409,7 @@ std::size_t Model::SessionBytes(core::SessionMode mode,
 
 std::size_t Model::DemandMappedBytes(core::SessionMode mode,
                                      std::uint32_t context) const {
-  return mem::DemandMapped() ? executor_->DemandMappedBytes(mode, context) : 0;
+  return executor_->DemandMappedBytes(mode, context);
 }
 
 std::size_t Model::DeferredScratchBytes() const {
@@ -933,6 +983,10 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
   // The first boundary no pass has captured yet.
   std::size_t next_boundary = 0;
   rocm::Executor& exec = *model_->executor_;
+  // A prompt longer than one narrow pass takes wide passes when the host can
+  // spare their scratch (the runner already asked when its step allows it).
+  if (prefill && tokens.size() > exec.narrow_batch())
+    (void)exec.AcquireWidePasses();
   // Prompt tokens whose new PLE rows the disk reads per second, and the
   // size limit of the next pass while a cold prompt ramps up (zero: none).
   double read_tokens_per_second = 0;
@@ -949,7 +1003,7 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
               rows - std::min(rows, exec.PleDiskRows(*session_, half))) /
           static_cast<double>(sample.size() - half.size());
       const auto first =
-          std::min<std::size_t>(tokens.size(), model_->PrefillCapacity());
+          std::min<std::size_t>(tokens.size(), model_->PassChunk());
       const double first_rows =
           static_cast<double>(rows) +
           later * static_cast<double>(first - sample.size());
@@ -966,8 +1020,10 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     }
   }
   const auto pass_tokens = [&](std::size_t remaining, std::size_t limit) {
-    std::size_t n =
-        remaining <= exec.max_batch() ? remaining : model_->PrefillCapacity();
+    std::size_t n = std::min<std::size_t>(
+        remaining <= exec.pass_rows() ? std::size_t{exec.pass_rows()}
+                                      : model_->PassChunk(),
+        remaining);
     // An even split avoids a short last pass, whose time would not hide the
     // next reads.
     if (limit != 0 && limit + kPrefillTailTokens < remaining)
@@ -1029,7 +1085,7 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
       const double grown =
           (kRampPassSeconds + static_cast<double>(n) / kRampTokensPerSecond) *
           read_tokens_per_second;
-      ramp = grown < model_->PrefillCapacity()
+      ramp = grown < model_->PassChunk()
                  ? std::max(static_cast<std::size_t>(grown) / kRampAlign *
                                 kRampAlign,
                             kRampAlign)
@@ -1253,6 +1309,7 @@ bool Session::SyncImpl(
 }
 
 bool Session::Evaluate(std::int32_t token, std::string* error_msg) {
+  model_->ReleaseWidePasses();
   if (continuation_hooks_)
     continuation_hooks_->BeforeExecution();
   if (!valid_) {
@@ -1705,16 +1762,25 @@ bool Session::FinishDecode(const DecodeRequest& request,
       continue;
     }
     if (sampled) {
-      if (gpu_verification && !cpu_rows && sampler.NeedsConstraintMask() &&
-          !download_remaining(keep - 1))
-        return false;
+      std::optional<MtpVerification> compact;
+      if (gpu_verification && !cpu_rows) {
+        compact = TryVerifyMtpProposal(candidates[keep - 1], kMtpCandidates,
+                                       vocab, proposals[keep - 1], sampler);
+        if (!compact) {
+          verify_logits_.resize(
+              std::max<std::size_t>(exec.max_speculative(), k) * vocab);
+          auto row =
+              std::span(verify_logits_).subspan((keep - 1) * vocab, vocab);
+          if (!exec.ReadVerificationRows(keep - 1, row, error_msg))
+            return false;
+          compact = VerifyMtpProposal(row, proposals[keep - 1], sampler);
+        }
+      }
       const auto verified =
-          gpu_verification && !cpu_rows
-              ? VerifyMtpProposal(candidates[keep - 1], vocab,
-                                  proposals[keep - 1], sampler)
-              : VerifyMtpProposal(std::span<const float>(verify_logits_)
-                                      .subspan((keep - 1) * vocab, vocab),
-                                  proposals[keep - 1], sampler);
+          compact ? *compact
+                  : VerifyMtpProposal(std::span<const float>(verify_logits_)
+                                          .subspan((keep - 1) * vocab, vocab),
+                                      proposals[keep - 1], sampler);
       const auto token = static_cast<std::int32_t>(verified.token);
       const bool accepted = verified.accepted;
       if (is_stop(token)) {
@@ -1845,6 +1911,9 @@ bool Session::DecodeStep(std::size_t max_tokens,
                          sampling::SamplerState& sampler, DecodeResult* result,
                          std::string* error_msg, bool stop_at_eos,
                          std::uint32_t occupancy) {
+  // Decoding means the wide passes are over: their scratch goes back to the
+  // host before this step, as later passes run beside a decoder.
+  model_->ReleaseWidePasses();
   if (continuation_hooks_)
     continuation_hooks_->BeforeExecution();
   if (!valid_) {
@@ -2033,11 +2102,15 @@ bool Session::RunIsolatedBatch(std::span<const Request> requests,
 
 bool Session::DecodeBatch(std::span<const DecodeRequest> requests,
                           std::string* error_msg) {
+  if (!requests.empty())
+    requests.front().session->model_->ReleaseWidePasses();
   return RunIsolatedBatch(requests, error_msg);
 }
 
 bool Session::EvaluateBatch(std::span<const AdvanceRequest> requests,
                             std::string* error_msg) {
+  if (!requests.empty())
+    requests.front().session->model_->ReleaseWidePasses();
   return RunIsolatedBatch(requests, error_msg);
 }
 

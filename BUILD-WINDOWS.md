@@ -39,7 +39,11 @@ release packaging builds the upstream runtime instead.
 - **Visual Studio 2022 or 18** with the "Desktop development with C++"
   workload (MSVC x64).
 - **Git**, **CMake ≥ 3.29**, **Ninja** (Visual Studio bundles both;
-  `vs-env.cmd` puts them on `PATH`) and **Python 3**.
+  `vs-env.cmd` puts them on `PATH`) and **Python 3**. The
+  [Loom runtime](docs/models/loom.md#platforms), which the build compiles
+  from source, needs **CMake ≥ 4.2**, newer than Visual Studio's; put a
+  standalone CMake first on `PATH`, or leave Loom out with
+  `-DGUFO_EXTENSIONS=<list>`.
 - **Rust 1.88 or newer** from [rustup](https://rustup.rs), with the
   `x86_64-pc-windows-msvc` target. Rustup reads the pinned version from
   `rust-toolchain.toml`; Cargo builds the Rust components.
@@ -63,10 +67,13 @@ release packaging builds the upstream runtime instead.
 
   AMD's index no longer serves 10.0.0; CI downloads it from the
   [Windows port's mirror](https://github.com/endyjasmi/gufo/releases/tag/toolchain/therock-10.0.0).
-  It is the only SDK validated at full speed on gfx1151: later builds
-  (10.1.0 through at least the 10.2.0a nightlies of October 2026) compile
-  correct kernels that stall on this GPU, with decode up to hundreds of times
-  slower. The `windows-base` preset chain-loads
+  It is the only SDK that CI builds and validates. Later SDKs used to stall on
+  this GPU: from clang 24 (ROCm 10.1), `clang-cl` stops passing its optimisation
+  level to the device compile, so HIP sources that set no level of their own
+  built device code at `-O0`, and decode ran up to hundreds of times slower. The
+  build adds `/clang:-O3` for both compiles, so as of November 2026 a 10.1.0
+  build of these sources runs at 10.0.0 speed; keep 10.0.0 until CI covers a
+  later SDK. The `windows-base` preset chain-loads
   `cmake/toolchains/windows-therock.cmake`, which takes `clang-cl` and the
   runtime from `HIP_PATH`. `clang-cl` ignores GCC-style options such as
   `-ffast-math`, `-ffp-contract=off` or `-fno-slp-vectorize`, with only a

@@ -1,6 +1,8 @@
 #ifndef GUFO_SERVER_TEXT_MODEL_RUNNER_HPP_
 #define GUFO_SERVER_TEXT_MODEL_RUNNER_HPP_
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -19,10 +21,12 @@
 #include "src/cli/serve/continuation_types.hpp"
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_publication_wait.hpp"
+#include "src/ext/host_budget.hpp"
 #include "src/mem/account.hpp"
 
 namespace gufo::server {
 
+using ext::AutomaticRetainedBytes;
 using ext::CgroupAvailableBytes;
 using ext::ComponentCacheResources;
 using ext::HipTextModelRunner;
@@ -48,6 +52,7 @@ using ext::TextRunnerCapabilities;
 using ext::TextRunnerDecode;
 using ext::TextRunnerDescriptor;
 using ext::TextRunnerDiskCacheOptions;
+using ext::TextRunnerExpertCacheClaim;
 using ext::TextRunnerMeasuredResources;
 using ext::TextRunnerNgramRows;
 using ext::TextRunnerRamCacheOptions;
@@ -111,9 +116,14 @@ public:
     /// use than capturing another one: followers prefill the gap themselves.
     static constexpr std::size_t kSharedCheckpointSlack = 64;
     /// A shared prefix must add at least this many tokens to what a request
-    /// can already restore before it waits for a peer or captures an extra
-    /// checkpoint for later requests. Shorter gaps cost less to prefill again.
+    /// can already restore before it waits for a peer's shared checkpoint.
+    /// Shorter gaps cost less to prefill again.
     static constexpr std::size_t kSharedPrefixMinTokens = 512;
+    /// A prompt that diverges from a retained one after at least this many
+    /// common tokens publishes a checkpoint there for later prompts. Lower
+    /// than kSharedPrefixMinTokens: nobody waits for it, and a short system
+    /// prompt shared by many short requests is worth one RAM copy.
+    static constexpr std::size_t kSharedBranchMinTokens = 192;
 
     void PrepareBatchExecution();
     /// With `yield`, a runner with a scheduling profile splits the pass into
@@ -163,6 +173,26 @@ public:
   TextRunnerPool& operator=(TextRunnerPool&&) = delete;
 
   [[nodiscard]] const TextModelRunner& runner() const noexcept;
+  /// The scheduler is idle: nothing runs, is queued or waits. Called on its
+  /// thread when it goes idle and about once a second while it stays idle,
+  /// to return memory only running work holds (TextModelRunner::Idle()),
+  /// and, when other processes leave the host short of its reserve, RAM-cache
+  /// memory (ComponentTextCache::RelieveHostPressure). A runner that streams
+  /// experts fills the host down to its expert store's floor, which then
+  /// replaces the reserve: below it, the expert cache gives memory back
+  /// first (Store::Release), and is restored once memory is back.
+  void Idle() const;
+  /// The host's shortfall below its reserve (ext::HostReserveShortfallBytes)
+  /// when it is too short to admit new work: more than
+  /// kAdmissionShortfallBytes (#932), so MemAvailable below 2 GiB without
+  /// free CMA pages. Running work then finishes, the scheduler goes
+  /// idle and the RAM cache gives memory back. A runner that streams experts
+  /// refuses below half its expert store's floor instead.
+  [[nodiscard]] std::optional<std::uint64_t> AdmissionShortfall() const;
+  static constexpr std::uint64_t kAdmissionShortfallBytes =
+      ext::kHostSnapshotHeadroomBytes / 2;
+  /// Replaces the live host sample (ext::SampleHostMemory), for tests.
+  void SetHostSampler(std::function<ext::HostMemorySample()> sampler);
   [[nodiscard]] std::size_t capacity() const noexcept;
   /// Validated resource claim, including host prompt-state admission inputs.
   [[nodiscard]] const TextRunnerResourceClaim& resource_claim() const noexcept;
@@ -178,8 +208,14 @@ public:
     std::size_t tokens{0};
     mem::StateReservation reservation;
   };
+  /// Runs a restore's copies, possibly on another thread, told how long they
+  /// would stop the calling thread; see cache::RestoreCopyRunner.
+  using RestoreCopyRunner =
+      std::function<void(std::chrono::microseconds inline_estimate,
+                         const std::function<void()>& copies)>;
   /// With `state`, the session the request lands on claims its tokens from
-  /// the ticket's reservation.
+  /// the ticket's reservation. A restore runs its copies through
+  /// `run_copies` when given.
   [[nodiscard]] Request Acquire(
       std::vector<TextRunnerToken> prompt,
       const sampling::SamplingConfig& sampling,
@@ -187,12 +223,16 @@ public:
       std::shared_ptr<const TextPromptContext> context = {},
       bool reuse_prompt = true, std::size_t cache_prefix_tokens = 0,
       bool stop_at_eos = true, bool persist = true,
-      StateTicket* state = nullptr);
+      StateTicket* state = nullptr, const RestoreCopyRunner& run_copies = {});
 
   /// Whether sessions share their demand-mapped state (#715): more sessions
   /// are configured at full context than fit at once. Each request then
   /// claims the tokens it may write, and is admitted only when they fit.
   [[nodiscard]] bool shared_state() const noexcept;
+  /// Whether a restore's copies may run beside decoders (`run_copies` in
+  /// Acquire): only where they copy on a copy engine. Otherwise they wait
+  /// behind decode work, slower than stopping it to restore.
+  [[nodiscard]] bool restores_beside_decode() const noexcept;
   /// Generated tokens a request claims ahead, at admission and each time
   /// decoding nears its claim.
   static constexpr std::size_t kStateDecodeTokens = 8192;
@@ -227,6 +267,13 @@ public:
   /// Resets idle component-cache states so their device rows can be freed
   /// (see ComponentTextCache::ReleaseIdle). Zero without a component cache.
   std::size_t ReleaseIdleStates();
+  /// Starts reading the disk-only checkpoint prompt would restore into the
+  /// page cache; see ComponentTextCache::WarmDisk.
+  [[nodiscard]] std::shared_ptr<const std::atomic<bool>> WarmDisk(
+      std::span<const TextRunnerToken> prompt, const TextPromptContext* context,
+      std::size_t stable,
+      std::chrono::microseconds beside_after =
+          std::chrono::microseconds::max()) const;
   /// A disk job is still writing a prefix of prompt much deeper than any
   /// restorable checkpoint; admission may wait for it instead of prefilling.
   [[nodiscard]] std::optional<TextPendingPublication> PendingPublication(

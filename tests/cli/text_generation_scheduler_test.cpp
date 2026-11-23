@@ -216,6 +216,7 @@ struct FakeControl {
   std::atomic<bool> device_usable{true};
   std::atomic<std::size_t> device_probes{0};
   std::atomic<std::size_t> idle_probes{0};
+  std::atomic<std::size_t> idle_calls{0};
   std::atomic<TextModelRunner::DeviceProbeStatus> idle_probe_status{
       TextModelRunner::DeviceProbeStatus::kUsable};
   TextRunnerToken advance_gate_label{0};
@@ -255,6 +256,13 @@ struct FakeControl {
   std::function<void()> before_yield;
   // Each decode advance inside a yield takes this long.
   std::chrono::milliseconds yield_advance_delay{0};
+  // Every decode advance takes this many microseconds.
+  std::atomic<unsigned> advance_delay_us{0};
+  // Runs where a restore copies its first rows in; set before the scheduler
+  // starts.
+  std::function<void()> restore_callback;
+  // Whether restores may copy beside decode (a restore queue of its own).
+  bool restore_beside_decode{true};
   std::atomic<bool> yielding{false};
   std::vector<std::string> output_pieces;
   std::uint32_t max_context{128};
@@ -329,6 +337,16 @@ public:
     if (executed)
       control_->RecordInvalidation();
     return FakeAdapter::Invalidate(slot);
+  }
+  gufo::cache::Completion CopyRowsIn(gufo::cache::Slot& slot,
+                                     gufo::cache::ComponentId id,
+                                     gufo::cache::Rows first,
+                                     gufo::cache::Rows end,
+                                     std::span<const std::byte> bytes,
+                                     gufo::cache::Stream& stream) override {
+    if (first == 0 && control_->restore_callback)
+      control_->restore_callback();
+    return FakeAdapter::CopyRowsIn(slot, id, first, end, bytes, stream);
   }
   gufo::cache::Completion CapturePrivatePiece(
       const gufo::cache::Slot& slot, gufo::cache::ComponentId id,
@@ -510,7 +528,8 @@ public:
         ledger, std::make_unique<ObservedAdapter>(control_),
         {.private_blocks = 512,
          .row_backing_bytes = 1024,
-         .total_row_bytes = 1U << 24});
+         .total_row_bytes = 1U << 24,
+         .restore_beside_decode = control_->restore_beside_decode});
   }
   [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
       gufo::cache::Adapter& adapter, gufo::cache::Slot& slot) const override {
@@ -646,6 +665,8 @@ public:
     }
     if (control_->yielding)
       std::this_thread::sleep_for(control_->yield_advance_delay);
+    if (const auto delay = control_->advance_delay_us.load())
+      std::this_thread::sleep_for(std::chrono::microseconds(delay));
 
     {
       std::unique_lock<std::mutex> lock(control_->mutex);
@@ -743,6 +764,11 @@ public:
   [[nodiscard]] std::size_t CheckpointPosition(
       const TextRunnerState& state) const override {
     return RequireFakeState(state).position;
+  }
+
+  void Idle() const override {
+    control_->idle_calls.fetch_add(1, std::memory_order_relaxed);
+    control_->condition.notify_all();
   }
 
   [[nodiscard]] DeviceProbeStatus PollDevice() const override {
@@ -1101,6 +1127,37 @@ void TestRunnerCanSkipUnusedFinalAdvance() {
          "runner skips the unused frontier computation after the final token");
 }
 
+// A retained frontier covers a capped reply in both decode modes, so the next
+// turn continues the same executed history and prefills only its own tokens.
+void TestRetainedCappedReplyExecutesFinalToken() {
+  using Finish = gufo::server::TextGenerationBackend::FinishReason;
+  for (const bool multi : {false, true}) {
+    auto control = std::make_shared<FakeControl>();
+    control->final_token_advance_required = false;
+    control->multi_token_decode = multi;
+    control->snapshots = true;
+    auto scheduler = MakeScheduler(control, 1);
+
+    const auto capped = scheduler->Submit({7, 70}, 2, 0.0F).Wait();
+    Expect(capped.tokens == ExpectedTokens(7, 2) &&
+               capped.finish_reason == Finish::kLength,
+           "a capped request emits its complete token budget");
+    std::size_t advances = 0;
+    for (const auto& event : control->Events()) {
+      if (event.kind == EventKind::kAdvance && event.label == 7) {
+        ++advances;
+      }
+    }
+    Expect(advances == 2,
+           "a retained capped request executes each emitted token once");
+
+    const auto next = scheduler->Submit({7, 70, 700, 701, 71}, 1, 0.0F).Wait();
+    Expect(next.cache_hit && next.cached_prompt_tokens == 4 &&
+               next.prefill_tokens == 1,
+           "the next turn reuses the complete capped reply");
+  }
+}
+
 void TestRunnerCanReuseExactIncrementalText() {
   auto control = std::make_shared<FakeControl>();
   control->incremental_text_is_exact = true;
@@ -1401,11 +1458,16 @@ void TestMultiResidentPrefillUsesBoundedWorkUnits() {
       if (event.kind == EventKind::kPrefill && event.label == 7)
         chunks.push_back(event.count);
     }
-    Expect(chunks == std::vector<std::size_t>({3, 3, 1}),
-           "idle prefill uses model geometry regardless of spare slots");
-    Expect(
-        result.prefill_chunks == 3 && result.active_decode_prefill_chunks == 0,
-        "model-sized work units still yield for admission and cancellation");
+    // Alone, the runner's own geometry; while a spare session could admit an
+    // arrival, the profile's pass (two tokens here), which it waits for.
+    const auto expected = capacity == 1
+                              ? std::vector<std::size_t>({3, 3, 1})
+                              : std::vector<std::size_t>({2, 2, 2, 1});
+    Expect(chunks == expected,
+           "idle prefill keeps model geometry unless a spare slot could admit");
+    Expect(result.prefill_chunks == expected.size() &&
+               result.active_decode_prefill_chunks == 0,
+           "model-sized work units still yield for admission and cancellation");
   }
 }
 
@@ -1751,17 +1813,22 @@ void TestLayeredPrefillTimeExcludesYieldRounds() {
 }
 
 void TestLayeredPrefillAloneRunsUnsplit() {
-  auto control = std::make_shared<FakeControl>();
-  control->scheduling =
-      gufo::ext::TextSchedulingProfile{.pass_tokens = 4, .max_layer_groups = 3};
-  auto scheduler = MakeScheduler(control, 2, 2);
-  const auto result =
-      scheduler->Submit({2, 20, 21, 22, 23, 24, 25}, 2, 0.0F).Wait();
-  Expect(result.tokens == ExpectedTokens(2, 2) && result.prefill_chunks == 1 &&
-             result.max_prefill_layer_groups == 1,
-         "a lone prompt keeps one unsplit pass");
-  for (const auto& event : control->Events())
-    Expect(event.kind != EventKind::kYield, "a lone prompt never yields");
+  // With one session nobody can join: one pass. With a spare session, passes
+  // of the profile's width, so an arrival waits for one. Neither yields.
+  for (const auto capacity : {1U, 2U}) {
+    auto control = std::make_shared<FakeControl>();
+    control->scheduling = gufo::ext::TextSchedulingProfile{
+        .pass_tokens = 4, .max_layer_groups = 3};
+    auto scheduler = MakeScheduler(control, capacity, 2);
+    const auto result =
+        scheduler->Submit({2, 20, 21, 22, 23, 24, 25}, 2, 0.0F).Wait();
+    Expect(result.tokens == ExpectedTokens(2, 2) &&
+               result.prefill_chunks == capacity &&
+               result.max_prefill_layer_groups == 1,
+           "a lone prompt keeps unsplit passes");
+    for (const auto& event : control->Events())
+      Expect(event.kind != EventKind::kYield, "a lone prompt never yields");
+  }
 }
 
 void TestDecoderFinishesInsideYield() {
@@ -2617,6 +2684,99 @@ void TestRunnerFailureInvalidatesAndDoesNotPoisonReplacement() {
   Expect(control->device_probes == 1, "successful work never probes");
 }
 
+/// An idle scheduler tells the runner on going idle and keeps telling it
+/// while idle, so it can return memory only running work holds (Flash-Next's
+/// wide pass scratch, the RAM cache under host pressure); running work does
+/// not, and device probes keep their own interval.
+void TestIdleNotifiesRunnerWhileIdle() {
+  auto control = std::make_shared<FakeControl>();
+  TextSchedulerPolicy policy{.device_probe_interval =
+                                 std::chrono::milliseconds(5)};
+  auto scheduler = MakeScheduler(control, 1, {}, policy);
+  const auto wait_for = [&](auto predicate, const char* message) {
+    std::unique_lock lock(control->mutex);
+    Expect(control->condition.wait_for(lock, kTestTimeout, predicate), message);
+  };
+  wait_for([&] { return control->idle_calls >= 3; },
+           "a scheduler that starts idle keeps telling the runner");
+  control->block_prefill_label = 1;
+  auto request = scheduler->Submit({1, 10, 11}, 2, 0.0F);
+  control->WaitForPrefill(1);
+  const auto during = control->idle_calls.load();
+  std::this_thread::sleep_for(std::chrono::milliseconds(40));
+  Expect(control->idle_calls == during, "running work is not idle");
+  control->ReleasePrefill();
+  Expect(request.Wait().tokens == ExpectedTokens(1, 2),
+         "the request completes normally");
+  wait_for([&] { return control->idle_calls >= during + 2; },
+           "the scheduler tells the runner again once the work is done");
+  scheduler.reset();
+
+  // A long probe interval does not slow the idle calls, which keep their own
+  // interval, nor do they probe the device.
+  auto slow = std::make_shared<FakeControl>();
+  auto quiet = MakeScheduler(
+      slow, 1, {},
+      TextSchedulerPolicy{.device_probe_interval = std::chrono::hours(1),
+                          .idle_interval = std::chrono::milliseconds(5)});
+  {
+    std::unique_lock lock(slow->mutex);
+    Expect(slow->condition.wait_for(lock, kTestTimeout,
+                                    [&] { return slow->idle_calls >= 3; }),
+           "idle calls repeat at their own interval");
+  }
+  Expect(slow->idle_probes == 0, "idle calls do not probe the device");
+}
+
+/// A host short of its reserve after promises (#932) refuses new work with
+/// a retryable insufficient_memory until the shortfall is small again; work
+/// already queued is not affected.
+void TestHostShortfallRefusesAdmission() {
+  constexpr std::uint64_t gib = std::uint64_t{1} << 30;
+  auto control = std::make_shared<FakeControl>();
+  auto runner = std::make_shared<FakeRunner>(control);
+  auto pool = std::make_shared<TextRunnerPool>(std::move(runner), 1);
+  std::atomic<std::uint64_t> available{64 * gib};
+  pool->SetHostSampler([&] {
+    return gufo::ext::HostMemorySample{.available = available.load()};
+  });
+  auto scheduler = std::make_unique<TextGenerationScheduler>(pool);
+  Expect(
+      scheduler->Submit({1, 10}, 2, 0.0F).Wait().tokens == ExpectedTokens(1, 2),
+      "a host with room admits work");
+  // 3 GiB available: 1 GiB short of the 4 GiB reserve, within the margin.
+  available = 3 * gib;
+  Expect(
+      scheduler->Submit({2, 20}, 2, 0.0F).Wait().tokens == ExpectedTokens(2, 2),
+      "a shortfall within the admission margin still admits");
+  // 1 GiB available: 3 GiB short.
+  available = 1 * gib;
+  bool refused = false;
+  try {
+    (void)scheduler->Submit({3, 30}, 2, 0.0F);
+  } catch (const TextGenerationError& error) {
+    refused = error.code() == TextGenerationErrorCode::kInsufficientMemory &&
+              error.http_status() == 503 && error.retryable() &&
+              error.required_bytes() == 3 * gib;
+  }
+  Expect(refused, "a host deep below its reserve refuses with 503");
+  // State promised to sessions is not memory in use: it never refuses.
+  pool->SetHostSampler([&] {
+    return gufo::ext::HostMemorySample{.available = 20 * gib,
+                                       .outstanding = 30 * gib};
+  });
+  Expect(
+      scheduler->Submit({5, 50}, 2, 0.0F).Wait().tokens == ExpectedTokens(5, 2),
+      "promised state alone does not refuse admission");
+  pool->SetHostSampler([&] {
+    return gufo::ext::HostMemorySample{.available = available.load()};
+  });
+  available = 64 * gib;
+  Expect(
+      scheduler->Submit({4, 40}, 2, 0.0F).Wait().tokens == ExpectedTokens(4, 2),
+      "admission resumes once memory is back");
+}
+
 void TestIdleDeviceProbe() {
   using Status = TextModelRunner::DeviceProbeStatus;
   auto control = std::make_shared<FakeControl>();
@@ -3063,6 +3223,73 @@ void TestSnapshotDoesNotBlockOtherRequests() {
   }
 }
 
+// A restore's copies run beside a running decoder instead of stopping it, but
+// only where they run on a copy engine: without one they would wait behind
+// decode work, so the restore stops the decoder as before. A restore shorter
+// than a decode round also stops it: beside, it would wait for the round.
+void CheckRestoreBesideDecoders(bool engine, bool longer_than_round = true) {
+  const bool beside = engine && longer_than_round;
+  auto control = std::make_shared<FakeControl>();
+  control->max_context = 4096;
+  control->snapshots = true;
+  control->restore_beside_decode = engine;
+  const auto advances = [&] {
+    std::size_t count = 0;
+    for (const auto& event : control->Events())
+      count += event.kind == EventKind::kAdvance && event.label == 2;
+    return count;
+  };
+  std::atomic<bool> armed{false}, restoring{false}, decoded{false};
+  control->restore_callback = [&] {
+    if (!armed || restoring.exchange(true))
+      return;
+    const auto before = advances();
+    // Inline, no decoder may step: wait long enough to see one.
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        (beside ? kTestTimeout : std::chrono::milliseconds(100));
+    while (std::chrono::steady_clock::now() < deadline &&
+           advances() < before + 3)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    decoded = advances() != before;
+  };
+  // The fake checkpoint is small: copy it beside decoders all the same,
+  // unless its estimate counts against their rounds (500 us each here).
+  TextSchedulerPolicy policy;
+  policy.restore_beside_decoders_after = {};
+  if (longer_than_round)
+    policy.restore_beside_rounds = 0;
+  auto scheduler = MakeScheduler(control, 2, 2, policy);
+  const std::vector<TextRunnerToken> history(2200, 1);
+  Expect(!scheduler->Submit(history, 2, 0.0F).Wait().cancelled,
+         "history request completes");
+  control->advance_delay_us = 500;
+  auto decoder = scheduler->Submit({2, 20}, 2000, 0.0F);
+  while (advances() == 0)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  // Diverges after the history's 2,048-token checkpoint: no live frontier
+  // continues it, so admission restores that checkpoint from RAM.
+  std::vector<TextRunnerToken> branch(history.begin(), history.begin() + 2100);
+  branch.push_back(9);
+  armed = true;
+  const auto restored = scheduler->Submit(branch, 2, 0.0F).Wait();
+  control->advance_delay_us = 0;
+  Expect(restoring && restored.cache_hit && restored.cache_restore_bytes > 0,
+         "the branch restores a RAM checkpoint");
+  Expect(decoded == beside,
+         beside   ? "the decoder advances while the restore copies"
+         : engine ? "a restore shorter than a decode round stops the decoder"
+                  : "without an engine the restore stops the decoder");
+  Expect(!decoder.Wait().cancelled, "the decoder completes");
+  scheduler.reset();
+}
+
+void TestRestoreCopiesRunBesideDecoders() {
+  CheckRestoreBesideDecoders(true);
+  CheckRestoreBesideDecoders(false);
+  CheckRestoreBesideDecoders(true, false);
+}
+
 void TestCapturedDecoderResumesBeforeMorePrefill() {
   auto control = std::make_shared<FakeControl>();
   control->max_context = 4096;
@@ -3130,8 +3357,10 @@ void TestCapturedPrefillResumesBeforeRepeatedPeerPrefill() {
         release.acquire();
       }
     };
-    // Keep the production prompt unit and model profile. The peer is longer
-    // than that unit, so it has another turn after the held prefill.
+    // Keep the production prompt unit and a model pass wider than it, which
+    // a lone prompt keeps while a session is free. The peer is longer than
+    // that unit, so it has another turn after the held prefill.
+    control->scheduling = gufo::ext::TextSchedulingProfile{.pass_tokens = 4096};
     auto scheduler = MakeScheduler(control, older_waiter ? 3 : 2);
     auto first =
         scheduler->Submit(std::vector<TextRunnerToken>(2200, 1), 3, 0.0F);
@@ -3587,6 +3816,40 @@ void TestPromptProgressCancellation() {
   }
 }
 
+// A client cancels a stream, then replays its answer as text in the next
+// prompt (#1154, #1213). The replay must continue the cancelled frontier even
+// when it arrives while that stream is still decoding: otherwise the same
+// request samples from a different tokenization once the frontier is free.
+void TestRetryDuringCancelledStreamAlignsToItsFrontier() {
+  for (const std::size_t capacity : {1U, 2U}) {
+    auto control = std::make_shared<FakeControl>();
+    control->snapshots = true;
+    control->incremental_text_is_exact = true;
+    control->block_advance_label = 1;
+    auto scheduler = MakeScheduler(control, capacity);
+    std::atomic<bool> disconnected{false};
+    auto stream = scheduler->Submit(
+        {1, 10}, 8, 0.0F, [&] { return disconnected.load(); }, true);
+    // The stream is decoding its first token, 100, when its client
+    // disconnects and sends the retry.
+    control->WaitForAdvance(1);
+    disconnected = true;
+    // Pieces "10" and "0" replay the text of the sampled token 100.
+    auto retry = scheduler->Submit({1, 10, 10, 0, 7}, 1, 0.0F);
+    control->ReleaseAdvance();
+    const auto cancelled = stream.Wait();
+    const auto resumed = retry.Wait();
+    Expect(cancelled.cancelled && cancelled.tokens == ExpectedTokens(1, 1),
+           "the stream is cancelled after its first token");
+    Expect(resumed.prompt_tokens == 4 && resumed.cached_prompt_tokens == 3,
+           "a retry submitted during the cancelled stream continues its "
+           "frontier at capacity " +
+               std::to_string(capacity) + " (prompt " +
+               std::to_string(resumed.prompt_tokens) + ", cached " +
+               std::to_string(resumed.cached_prompt_tokens) + ")");
+  }
+}
+
 void TestIgnoreEosIsRequestScoped() {
   auto control = std::make_shared<FakeControl>();
   control->eos_after = 0;
@@ -3790,6 +4053,24 @@ void TestReasoningTokenCount() {
   Expect(count({"\n", "<a>\n", "x", "</a>"}, State::kTextAfterThought) == 0,
          "text after reasoning the prompt closed has no reasoning");
   Expect(count({}, State::kThought) == 0, "no output counts nothing");
+
+  // Pieces may carry markup the raw tokens do not spell; framing tokens may
+  // have empty pieces.
+  const auto in_text = [&markup](const Pieces& pieces, State initial) {
+    std::string text;
+    std::vector<std::size_t> ends;
+    for (const auto& piece : pieces) {
+      text += piece;
+      ends.push_back(text.size());
+    }
+    return gufo::server::CountReasoningTokens(text, ends, initial, markup);
+  };
+  Expect(in_text({"<a>\nx", "y", "", "</a>z"}, State::kAuto) == 2,
+         "emitted reasoning counts the tokens that carry it");
+  Expect(in_text({"", "", "z"}, State::kAuto) == 0,
+         "emitted text with no reasoning counts nothing");
+  Expect(in_text({"x", "</a>", "z"}, State::kThought) == 1,
+         "emitted reasoning the prompt opened counts to the close");
 }
 
 std::vector<TextRunnerToken> LabeledPrompt(TextRunnerToken label,
@@ -4019,6 +4300,7 @@ int main() {
   TestBackendPreservesModelSamplingPreset();
   TestBackendRejectsInvalidSamplingDefaults();
 #endif
+  TestRetryDuringCancelledStreamAlignsToItsFrontier();
   TestTokenLogprobs();
   TestReasoningTokenCount();
   TestPublicationWaitUsesRecentSubstantialPrefill();
@@ -4094,6 +4376,7 @@ int main() {
   TestRetainedHistoryBeatsSharedPrefixWait();
   TestAwaitedCheckpointSurvivesCachePressure();
   TestRunnerCanSkipUnusedFinalAdvance();
+  TestRetainedCappedReplyExecutesFinalToken();
   TestRunnerCanReuseExactIncrementalText();
   TestGenerationTraceRecordsPromptAndOutput();
   TestMultiTokenDecodePublishesDraftMetricsAndDisablesPrefixReuse();
@@ -4130,6 +4413,7 @@ int main() {
   TestZeroPendingLimitsAdmitOnlyFreeSessions();
   TestSharedStateWaitsInOrder();
   TestSharedStatePausesThenPreempts();
+  TestRestoreCopiesRunBesideDecoders();
   TestPromptStateAdmissionBudget();
   TestPromptAdmissionTracksLiveHeadroom();
   TestPromptAdmissionRollsBackFailedEnqueue();
@@ -4151,6 +4435,8 @@ int main() {
   TestRunnerFailureInvalidatesAndDoesNotPoisonReplacement();
   TestDeviceLossIsStickyAndReported();
   TestIdleDeviceProbe();
+  TestIdleNotifiesRunnerWhileIdle();
+  TestHostShortfallRefusesAdmission();
   TestStallMonitor();
   Expect(
       gufo::server::detail::RequestsProcessing().load() == 0 &&

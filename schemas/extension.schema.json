@@ -305,6 +305,14 @@
               },
               "voices": {
                 "type": "boolean"
+              },
+              "hardware_queues": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 7
+              },
+              "hip": {
+                "type": "boolean"
               }
             },
             "additionalProperties": false

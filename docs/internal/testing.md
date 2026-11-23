@@ -73,6 +73,19 @@ bad IEND CRCs, nonempty IEND and stray IDAT after text are rejected.
 APNG metadata is ignored while decoding the default image. Libpng only
 writes fixtures; no frozen decoder remains.
 
+`jpeg_decode_test` compares the Rust JPEG decoder with the libjpeg-turbo path
+it replaced, frozen in `tests/core/jpeg_reference.cpp`. libjpeg-turbo writes
+every case: gray, YCbCr from 4:4:4 to 4:1:0, RGB, CMYK and YCCK, baseline,
+progressive, optimized, restart intervals and qualities from 1 to 100, at sizes
+that end inside an MCU, plus EXIF orientations, metadata, framing errors,
+truncations and bit flips. Pixels must stay within 6 of the reference and 1.0
+on average; the border of an image with subsampled chroma may differ by 40.
+Arithmetic coding, lossless JPEG, DNL markers, scans that end early and an AC
+run past coefficient 63 are listed deviations, each with the outcome the Rust
+decoder must return. A flipped entropy-coded or Huffman table bit that the
+reference rejects may decode. Only the test links libjpeg-turbo.
+`jpeg_decode_test --corpus DIR... [--repeat N]` compares and times real photos.
+
 `wav_decode_test` checks PCM16 values, the strict caller's status mapping,
 truncation and limits, and propagation of C++ callback exceptions. Rust WAV
 unit tests cover wider sample formats, float clamping, chunk layouts and limits.
@@ -126,6 +139,70 @@ and queue limits. Rust tests cover protocol rejections and buffer reuse;
 `check-pr`. The frozen C++ decoders were retired after their ports shipped in
 v0.34.0 or earlier. The audio decoder has no frozen C++ oracle; its independent
 symphonia PCM and numerical resampler checks remain.
+
+`gguf_header_test` compares the Rust GGUF header parser, through
+`GgufReader::OpenMemory`, with a frozen copy of the 0.35.0 C++ parser in
+`tests/core/gguf_header_reference.cpp`. Generated headers cover every metadata
+value and array item type, alignments, tensor ranks, known and unknown storage
+types, unsized tensors and data layouts; deterministic mutations truncate, flip,
+overwrite, insert and erase bytes; further headers hold arrays around the
+parser's block size and fill each charge of the descriptor budget to its last
+byte and one byte past it. Each must open with the same version, alignment,
+metadata and tensors, whose strings and data point at the same bytes, or fail
+with the same message, with and without `allow_unsized_tensors`. Only a header
+over the descriptor budget fails with its own message, which names the limit
+where 0.35.0 reported a malformed or over-long entry. Every rejection must be
+reached. GGUF files given as arguments are compared and timed too. It
+runs in `check-pr`; the crate's Rust tests cover the check order, the budget and
+the C ABI.
+
+`json_parse_test` compares the Rust JSON parser, through `json::parse`, with a
+frozen copy of the 0.35.0 C++ parser in `tests/core/json_reference.hpp`.
+Literals, number grids, every byte and escape in strings, surrogate pairs,
+nesting around the depth limit of 128 and generated documents with
+deterministic mutations, and every truncation of those under 600 bytes, must
+give the same values, number tokens and member order, or fail with the same
+message. Further texts hold a 1 MiB string with bad bytes inserted and objects
+of 5,000 keys, with and without a duplicate. Numbers whose 700,000-digit
+mantissa offsets an exponent beyond 65,535 must give fixed values, and with
+libstdc++ also those of the reference. Every rejection must be reached, and
+every allocation of the C++ builder is failed once, for a value and for a
+rejection: its exception must reach the caller. It runs in `check-pr`; the
+crate's Rust tests cover the integer fast path, the string scan, the switch to
+a key set, failed allocations and the C ABI.
+
+`json_schema_test` compares the Rust JSON Schema compiler, through
+`JsonSchemaRegex` and the string and number lexemes, with a frozen copy of
+the 0.35.0 C++ compiler in `tests/core/json_schema_reference.hpp`. Patterns
+from a grid of atoms and quantifiers, every string format, fixtures and their
+deterministic mutations, properties of strings such as
+`\p{RGI_Emoji_Flag_Sequence}`, ill-formed UTF-8 and the size, nesting, repetition
+and state limits must compile to the same DFA tables, step the same way in
+`Advance`, `CanFinish` and `CanAdvance`, or fail with the same exception and
+message. String schemas over length, `pattern` and `format` grids must match
+generated JSON strings byte by byte with the same canonical mask states;
+number schemas over bound, exclusivity and `multipleOf` grids must agree on
+every prefix of up to three bytes and on generated longer ones. It runs in
+`check-pr`; the crate's Rust tests cover the decimal arithmetic, the keywords,
+a few languages and rejections, and the C ABI.
+
+`cache_disk_manifest_test` compares the Rust disk manifest codec and CRC-64
+(`src/core/cache_manifest`), through `src/cache/disk.hpp`, with a frozen copy
+of the 0.35.0 C++ code in `tests/cache/disk_manifest_reference.cpp`. Generated
+manifests cover row, window and private-state components of random geometry,
+format versions 2 and 3, and each limit reached and exceeded: 2 Mi tokens,
+64 KiB of input, 256 components and 65,536 payload references. They must
+encode to the same bytes, and one or two changed fields must make both sides
+reject a manifest or encode it identically. Every encoding, the same bytes
+under each format version and past the reference limit, its truncations
+(all of them under 1 KiB), and byte changes, insertions and erasures, each
+also re-signed so the structure behind the checksum is checked, must decode to
+the same manifest with the same capacities, or be rejected by both, and plan
+the same metadata. Checksums over every length to 1,100 bytes and random
+lengths to 1 MiB, offsets and seeds must match both reference paths, also when
+chained. It runs in `check-pr` in about 1.5 s; the crate's Rust tests cover
+both checksum paths against a bitwise definition, truncations, the callbacks
+and the C ABI. `cache_disk_test` checks the store around it.
 
 The hosted Rust check uses Cargo's default test profile, with overflow checks
 and debug assertions enabled. The Windows job builds the Rust library and C++

@@ -3,6 +3,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -124,6 +125,9 @@ public:
   /// it returns there instead of to the free pages.
   void SetHome(hipMemGenericAllocationHandle_t handle,
                const std::shared_ptr<PageLender>& lender);
+  /// Forgets the lender of a page about to be released to the driver, so a
+  /// later page with the same handle value never goes there.
+  void ClearHome(hipMemGenericAllocationHandle_t handle);
 
   [[nodiscard]] const hipMemAllocationProp& prop() const noexcept {
     return prop_;
@@ -133,11 +137,45 @@ public:
   }
   [[nodiscard]] PagePoolStats Stats() const;
 
+  /// Gives up to `bytes` of free pages back to the driver, and so to the
+  /// host, and returns the bytes released; the pool makes pages again as
+  /// regions need them. Releasing waits for the device: call it only while
+  /// no GPU work is in flight.
+  std::size_t ReleaseFree(std::size_t bytes);
+
+  // Remaps and what must follow them. Memory mapped at an address that
+  // just lost a mapping is not reachable there until the device has been
+  // idle (RemapBarrier): a page that replaces another is filled or cleared
+  // only after the barrier. Regions queue that work here; SettleRemaps()
+  // runs the barrier once for everything queued, then the work.
+
+  /// Maps `handle` a second time, at a scratch address, as the source of a
+  /// copy queued with QueueCopy(). Null when no scratch address is free
+  /// (SettleRemaps() frees them all) or the driver refuses.
+  [[nodiscard]] std::byte* AliasForCopy(hipMemGenericAllocationHandle_t handle);
+  /// After the barrier: copy one page from `source` (an AliasForCopy()
+  /// address; `keep` holds its page until then) to `destination`.
+  void QueueCopy(std::byte* destination, const std::byte* source,
+                 std::shared_ptr<void> keep);
+  /// After the barrier: clear `bytes` at `destination`.
+  void QueueClear(std::byte* destination, std::size_t bytes);
+  /// Runs the barrier when a remap waits for one (RemapBarrier::Pending())
+  /// or work is queued, then the queued work, and waits for it. False when a
+  /// copy or a clear failed. Call it after a batch of Region::PrepareWrite()
+  /// or Region::Restore() calls and before the device uses those rows, on
+  /// the thread that runs the model, between its launches. Without remaps
+  /// it costs two atomic reads.
+  [[nodiscard]] bool SettleRemaps();
+  static constexpr std::size_t kScratchPages = 64;
+
   /// Free pages kept for map-ahead and first writes.
   static constexpr std::size_t kLowPages = 256;
   static constexpr std::size_t kHighPages = 512;
-  /// The working set created at load: 8 GiB, about 200 ms.
-  static constexpr std::size_t kWarmCapBytes = std::size_t{8} << 30;
+  /// No working set is created at load (fork): with a 100+ GiB model on a
+  /// 128 GiB host an 8 GiB warm-up took the page cache and free 2 MiB
+  /// blocks, and serving then ran under kswapd and compaction (prefill
+  /// 1,550 -> 850 tok/s, about 3,000 compaction stalls per request set).
+  static constexpr std::size_t kWarmCapBytes = 0;
   /// Pages taken from lenders per pass: 128 MiB, a bounded eviction.
   static constexpr std::size_t kBorrowBatchPages = 64;
 
@@ -157,8 +195,8 @@ private:
 
   int device_;
   std::function<bool(std::uint64_t)> may_create_;
-  std::function<std::uint64_t()> host_available_;
-  std::uint64_t floor_bytes_;
+  [[maybe_unused]] std::function<std::uint64_t()> host_available_;
+  [[maybe_unused]] std::uint64_t floor_bytes_;
   hipMemAllocationProp prop_{};
   hipMemAccessDesc access_{};
 
@@ -169,6 +207,19 @@ private:
   /// Released by a region; handed out before new pages.
   std::vector<hipMemGenericAllocationHandle_t> recycled_;
   hipStream_t zero_stream_{nullptr};
+  struct Fixup {
+    std::byte* destination;
+    const std::byte* source;  // Null: clear.
+    std::size_t bytes;
+    std::shared_ptr<void> keep;
+  };
+  /// One SettleRemaps() at a time; never held with mutex_.
+  std::mutex settle_mutex_;
+  std::mutex fixup_mutex_;
+  std::vector<Fixup> fixups_;
+  std::atomic<std::size_t> queued_{0};
+  std::byte* scratch_{nullptr};
+  std::size_t scratch_used_{0};
   std::unordered_map<const Region*, Job> jobs_;
   bool exportable_{false};
   /// Lenders, and the lender each lent page belongs to. lender_mutex_ is

@@ -51,6 +51,10 @@ int qfn_mmq_dense_kq_vec(int weight_type, const void* W, const float* X_f32,
                          float* out_f32, int M, int K, int n_tokens,
                          hipStream_t stream);
 
+// Q4_K dense projection (the MTP draft head) of 1-8 caller-quantized rows.
+int qfn_mmq_q4_K_dense_vec_preq(const void* W, const void* X_q8, float* out,
+                                int M, int N, int K, hipStream_t stream);
+
 // Q3_K/Q4_K/Q5_K/Q8_0 gate/up for 1–64 rows, with the SwiGLU result in out.
 // Rows that share an expert read and decode its weights once.
 int qfn_mmq_moe_gated_vec(int weight_type, const void* gate, const void* up,

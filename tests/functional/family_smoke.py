@@ -9,8 +9,9 @@ host) can run it next to a downloaded gufo bundle:
 Each family runs gufo once and checks one property against a committed
 reference: EmbeddingGemma 2 vectors against sentence-transformers goldens,
 Qwen3-ASR against a reviewed transcript, Qwen3-TTS speech back through
-Qwen3-ASR, and a Qwen LLM on one greedy arithmetic answer through
-`gufo prompt`. The broader suites (embeddings.py, asr_service.py, ...) stay
+Qwen3-ASR, a Qwen LLM on one greedy arithmetic answer through
+`gufo prompt`, and a Loom package on the same answer and one forced tool call
+through `gufo serve llm`. The broader suites (embeddings.py, asr_service.py, ...) stay
 the quality gate.
 """
 
@@ -19,7 +20,9 @@ import base64
 import io
 import json
 import math
+import os
 import re
+import shutil
 import socket
 import struct
 import subprocess
@@ -99,19 +102,19 @@ def server(binary, service, model, extra, log_path, timeout):
     with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
         try:
-            started = time.monotonic()
+            started = time.perf_counter()
             while True:
                 if process.poll() is not None:
                     raise RuntimeError(f"{service} server exited with {process.returncode} "
                                        f"before /ready; see {log_path}")
-                if time.monotonic() - started > timeout:
+                if time.perf_counter() - started > timeout:
                     raise TimeoutError(f"{service} server not ready after {timeout} s")
                 try:
                     request(url + "/ready", timeout=5)
                     break
                 except (urllib.error.URLError, ConnectionError, TimeoutError):
                     time.sleep(1)
-            print(f"{service} ready in {time.monotonic() - started:.1f} s", flush=True)
+            print(f"{service} ready in {time.perf_counter() - started:.1f} s", flush=True)
             yield url
             if process.poll() is not None:
                 raise RuntimeError(f"{service} server exited during the check")
@@ -240,7 +243,58 @@ def check_llm(args):
     return "greedy 6 x 7 = 42"
 
 
-FAMILIES = {"embedding": check_embedding, "asr": check_asr, "tts": check_tts, "llm": check_llm}
+def link_tree(source, dest):
+    """Links every file under `source` at the same path under `dest`, keeping
+    files already there: hard links where the volume allows, else symbolic."""
+    for path in sorted(source.rglob("*")):
+        target = dest / path.relative_to(source)
+        if path.is_dir() or target.exists():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(path.resolve(), target)
+        except OSError:
+            os.symlink(path.resolve(), target)
+
+
+def check_loom(args):
+    # The package and its GGUF as downloaded separately, linked into the
+    # layout `gufo model install` writes: each origin's files at their
+    # repository paths in the package directory.
+    package = args.log_dir / "loom-package"
+    shutil.rmtree(package, ignore_errors=True)
+    link_tree(args.model, package)
+    link_tree(args.checkpoint, package)
+    extra = ["--served-model-name", "loom"]
+    thinking_off = {"chat_template_kwargs": {"enable_thinking": False}}
+    with server(args.binary, "llm", package, extra,
+                args.log_dir / "loom-server.log", args.startup_timeout) as url:
+        answer = request(url + "/v1/chat/completions", {
+            "model": "loom", "temperature": 0, "max_tokens": 32, **thinking_off,
+            "messages": [{"role": "user",
+                          "content": "What is 6 times 7? Answer with the number only."}]})
+        text = answer["choices"][0]["message"]["content"] or ""
+        print(f"  answer: {text!r}")
+        assert re.search(r"\b42\b", text), "the greedy answer does not contain 42"
+        # A required tool choice samples on the host from the package's logits.
+        tool = request(url + "/v1/chat/completions", {
+            "model": "loom", "temperature": 0, "max_tokens": 128, **thinking_off,
+            "tool_choice": "required",
+            "tools": [{"type": "function", "function": {
+                "name": "get_weather", "description": "Get the weather for a city.",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
+                               "required": ["city"]}}}],
+            "messages": [{"role": "user", "content": "What is the weather in Paris?"}]})
+    calls = tool["choices"][0]["message"].get("tool_calls") or []
+    print(f"  tool calls: {json.dumps(calls)}")
+    assert calls and calls[0]["function"]["name"] == "get_weather", "no get_weather call"
+    city = json.loads(calls[0]["function"]["arguments"]).get("city", "")
+    assert "paris" in city.lower(), f"the call names {city!r}, not Paris"
+    return "greedy 6 x 7 = 42 and a required get_weather call for Paris"
+
+
+FAMILIES = {"embedding": check_embedding, "asr": check_asr, "tts": check_tts, "llm": check_llm,
+            "loom": check_loom}
 
 
 def main():
@@ -248,17 +302,22 @@ def main():
     parser.add_argument("family", choices=sorted(FAMILIES))
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True,
-                        help="Model directory, or the GGUF file for llm")
+                        help="Model directory, the GGUF file for llm, or the package for loom")
+    parser.add_argument("--checkpoint", type=Path,
+                        help="loom: directory holding the package's GGUF files at their "
+                             "repository paths")
     parser.add_argument("--asr-model", type=Path, help="tts: Qwen3-ASR directory for a round trip")
     parser.add_argument("--npu", action="store_true", help="Run embedding, ASR or TTS on the NPU")
     parser.add_argument("--startup-timeout", type=int, default=900)
     parser.add_argument("--log-dir", type=Path, default=Path("."))
     args = parser.parse_args()
-    if args.npu and args.family == "llm":
+    if args.npu and args.family in ("llm", "loom"):
         parser.error("--npu is supported only for embedding, asr and tts")
+    if (args.family == "loom") != (args.checkpoint is not None):
+        parser.error("--checkpoint is required for loom, and only for it")
     args.log_dir.mkdir(parents=True, exist_ok=True)
 
-    started = time.monotonic()
+    started = time.perf_counter()
     try:
         summary = FAMILIES[args.family](args)
     except Exception as error:
@@ -267,7 +326,7 @@ def main():
             print(f"--- {log.name} (tail) ---", file=sys.stderr)
             print(log.read_text(encoding="utf-8", errors="replace")[-4000:], file=sys.stderr)
         return 1
-    print(f"PASS {args.family}: {summary} ({time.monotonic() - started:.1f} s)")
+    print(f"PASS {args.family}: {summary} ({time.perf_counter() - started:.1f} s)")
     return 0
 
 

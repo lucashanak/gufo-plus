@@ -48,7 +48,7 @@ if (ENGINE_ENABLE_HIP)
     ${QFN_MMQ_DIR}/qfn_mmq.hip.cpp
     ${QFN_MMQ_DIR}/mmid.hip.cpp
     ${QFN_MMQ_DIR}/mmvq.hip.cpp
-    ${QFN_MMQ_DIR}/moe_wave64.hip.cpp
+    ${QFN_MMQ_DIR}/moe_wave32.hip.cpp
     ${QFN_MMQ_DIR}/quantize.hip.cpp
     ${QFN_MMQ_DIR}/getrows.hip.cpp
     ${QFN_MMQ_DIR}/mmq_formats_a.hip.cpp
@@ -57,8 +57,6 @@ if (ENGINE_ENABLE_HIP)
 
   add_library(gufo_qwen38_flash_next_mmq STATIC ${QFN_MMQ_SOURCES})
   set_source_files_properties(${QFN_MMQ_SOURCES} PROPERTIES LANGUAGE HIP)
-  set_source_files_properties(${QFN_MMQ_DIR}/moe_wave64.hip.cpp
-    PROPERTIES COMPILE_OPTIONS "-mwavefrontsize64")
   # Embedding rows must equal the CPU dequantization bit for bit: no fused
   # or reassociated products.
   set_source_files_properties(${QFN_MMQ_DIR}/getrows.hip.cpp
@@ -70,7 +68,7 @@ if (ENGINE_ENABLE_HIP)
   target_compile_definitions(gufo_qwen38_flash_next_mmq PRIVATE
     GGML_HIP_NO_VMM ENGINE_ENABLE_HIP=1)
   target_compile_options(gufo_qwen38_flash_next_mmq PRIVATE
-    $<$<COMPILE_LANGUAGE:HIP>:-O3;${GUFO_CLANG_OPTION}-ffast-math;${GUFO_CLANG_OPTION}-fno-finite-math-only;-Wno-unused-value;-Wno-unused-command-line-argument>)
+    $<$<COMPILE_LANGUAGE:HIP>:${GUFO_CLANG_OPTION}-O3;${GUFO_CLANG_OPTION}-ffast-math;${GUFO_CLANG_OPTION}-fno-finite-math-only;-Wno-unused-value;-Wno-unused-command-line-argument>)
   target_include_directories(gufo_qwen38_flash_next_mmq SYSTEM PUBLIC ${QFN_MMQ_DIR})
   target_link_libraries(gufo_qwen38_flash_next_mmq PUBLIC hip::host roc::hipblas)
 endif()
@@ -117,7 +115,7 @@ if(TARGET gufo_qwen38_flash_next_hip)
   target_compile_definitions(gufo_qwen38_flash_next_hip PRIVATE QFN_ROCM_BUILD=1)
   target_compile_options(gufo_qwen38_flash_next_hip PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O2>
-    $<$<COMPILE_LANGUAGE:HIP>:-O3;${GUFO_CLANG_OPTION}-ffast-math;${GUFO_CLANG_OPTION}-fno-finite-math-only;-Wno-unused-command-line-argument>)
+    $<$<COMPILE_LANGUAGE:HIP>:${GUFO_CLANG_OPTION}-O3;${GUFO_CLANG_OPTION}-ffast-math;${GUFO_CLANG_OPTION}-fno-finite-math-only;-Wno-unused-command-line-argument>)
   target_include_directories(gufo_qwen38_flash_next_hip SYSTEM PUBLIC
     ${HIPCUB_INCLUDE_DIR}
     ${ROCPRIM_INCLUDE_DIR}

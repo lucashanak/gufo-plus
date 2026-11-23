@@ -21,15 +21,27 @@
   rustPlatform,
   rocmPackages,
   libuuid,
+  python3,
   # XRT with the amdxdna plugin (.devops/nix/xrt): the NPU runtime. Null
   # only for revisions that predate it (the CI timing baseline).
   xrt ? null,
   # The IRON toolchain (.devops/nix/iron): compiles the in-tree NPU designs
   # (src/core/npu/kernels) into share/gufo/npu. Null builds without them.
   iron ? null,
+  # The Loom runtime (.devops/nix/hrx/loom-runtime.nix) of the loom extension,
+  # found through pkg-config. Null builds it from source, which the sandbox
+  # cannot download.
+  loomRuntime ? null,
   releaseVersion ? null,
   extensionsFromLock ? false,
   extensions ? [ ],
+  # Devlab correctness binary: the gpu-test configuration (BUILD_TESTING=ON),
+  # which keeps the serving, memory and cache assertions and the checked Rust
+  # profile that the production configuration compiles out.
+  checked ? false,
+  # With `checked`: CTest labels whose test executables the package also
+  # builds and bundles (tools/ci/ctest_bundle.py), for Devlab's GPU runners.
+  ctestLabels ? [ ],
   revision,
   sourceRoot ? ../..,
 }:
@@ -54,6 +66,8 @@ let
   # The CI timing baseline builds an older revision with this definition;
   # before the Rust audio decoder, EmbeddingGemma 2 linked libsndfile and soxr.
   hasRustAudio = builtins.pathExists (sourceRoot + "/src/core/audio_decode/Cargo.toml");
+  # Before the Rust JPEG decoder, every build linked libjpeg-turbo.
+  hasRustJpeg = builtins.pathExists (sourceRoot + "/src/core/jpeg_decode/Cargo.toml");
   # A store path has no Git metadata. A flake input or fetcher result still
   # names its commit (`dirtyRev` ends in "-dirty") or at least the hash of its
   # tree; a plain path names nothing.
@@ -136,10 +150,12 @@ let
   };
 in
 assert lib.versions.majorMinor rocmPackages.clr.version == "10.1";
-stdenv.mkDerivation {
-  pname = "gufo";
+assert ctestLabels == [ ] || checked;
+stdenv.mkDerivation ({
+  pname = if checked then "gufo-checked" else "gufo";
   version = packageVersion;
-  src = productionSource;
+  # Test builds configure the test tree, so they need the full source.
+  src = if checked then sourceRoot else productionSource;
   # The extension SDK pins the build toolchain, so it lives in its own output:
   # the runtime closure stays free of compilers and development libraries.
   outputs = [ "out" ] ++ lib.optional hasExtensionSdk "sdk";
@@ -151,13 +167,12 @@ stdenv.mkDerivation {
     makeWrapper
     rustToolchain
     rocmPackages.clr
-  ];
+  ] ++ lib.optional checked python3;
 
   buildInputs = [
     icu
     curl
     libpng
-    libjpeg
     libwebp
     libopus
     openssl
@@ -169,17 +184,20 @@ stdenv.mkDerivation {
     rocmPackages.rocprim
     rocmPackages.rocwmma
     rocmPackages.rocblas
-  ] ++ lib.optionals (!hasRustAudio) [
+  ]
+  # The JPEG decoder test writes its cases and checks them with libjpeg-turbo.
+  ++ lib.optional (checked || !hasRustJpeg) libjpeg
+  ++ lib.optionals (!hasRustAudio) [
     libsndfile
     soxr
   ] ++ lib.optionals (xrt != null) [
     xrt
     libuuid
-  ];
+  ] ++ lib.optional (loomRuntime != null) loomRuntime;
 
   cmakeFlags = [
     "-DCMAKE_BUILD_TYPE=RelWithDebInfo"
-    "-DBUILD_TESTING=OFF"
+    "-DBUILD_TESTING=${if checked then "ON" else "OFF"}"
     "-DGUFO_EXTENSIONS_FROM_LOCK=${if extensionsFromLock then "ON" else "OFF"}"
     "-DGUFO_RELEASE_VERSION=${versionLabel}"
     "-DGUFO_REVISION=${revision}"
@@ -190,6 +208,9 @@ stdenv.mkDerivation {
   ++ lib.optional (npuDesigns != null) "-DGUFO_NPU_PREBUILT_DESIGNS=${npuDesigns}/share/gufo/npu"
   ++ lib.optional (iron != null && npuDesigns == null) "-DGUFO_IRON_PYTHON=${iron}/bin/python3"
   ++ lib.optional hasExtensionSdk "-DGUFO_SDK_INSTALL_DIR=${placeholder "sdk"}/lib/gufo/sdk"
+  # Its own build phase keeps Ninja, which nixpkgs selects only for the
+  # default one.
+  ++ lib.optionals checked [ "-GNinja" "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON" ]
   ++ lib.optionals (extensions != [ ]) [
     "-DGUFO_EXTENSION_DIRS=${lib.concatMapStringsSep ";" (ext: "${ext}") extensions}"
     "-DGUFO_EXTENSION_DIR_REVISIONS=${lib.concatMapStringsSep ";" extensionRevision extensions}"
@@ -201,6 +222,10 @@ stdenv.mkDerivation {
   # can then reuse a stale HIP object, including one from the timing baseline.
   preConfigure = cargoSetup + lib.optionalString (iron != null && npuDesigns == null) ''
     export PEANO_INSTALL_DIR=${iron.peano}
+  '' + lib.optionalString checked ''
+    # Test executables built only from HIP sources link through the HIP
+    # compiler's C driver, which adds no C++ runtime. Production links none.
+    cmakeFlagsArray+=("-DCMAKE_HIP_STANDARD_LIBRARIES=-lstdc++ -lm")
   '' + ''
     ccache_dir=/tmp/gufo-ccache
     if [[ -d "$ccache_dir" && -w "$ccache_dir" ]]; then
@@ -275,7 +300,7 @@ stdenv.mkDerivation {
   '';
 
   passthru = {
-    inherit releaseVersion revision rocmPackages rocmRuntime extensionsFromLock xrt iron npuDesigns;
+    inherit releaseVersion revision rocmPackages rocmRuntime extensionsFromLock xrt iron npuDesigns checked ctestLabels;
     extensionMetadata = import ./extension-metadata.nix {
       inherit lib sourceRoot extensions extensionsFromLock;
     };
@@ -295,4 +320,31 @@ stdenv.mkDerivation {
     platforms = [ "x86_64-linux" ];
     mainProgram = "gufo";
   };
-}
+} // lib.optionalAttrs checked {
+  # BUILD_TESTING=ON adds every test target to `all`; build only what the
+  # package installs, and install without building `all`.
+  buildPhase = ''
+    runHook preBuild
+    targets=(gufo)
+    if ninja -t targets all | grep -q '^gufo_npu_xrt:'; then
+      targets+=(gufo_npu_xrt)
+    fi
+  '' + lib.optionalString (ctestLabels != [ ]) ''
+    tests=$(python3 ../tools/ci/ctest_bundle.py targets --build . \
+      ${lib.concatMapStringsSep " " (label: "--label ${lib.escapeShellArg label}") ctestLabels})
+    targets+=($tests)
+  '' + ''
+    ninja -j"$NIX_BUILD_CORES" "''${targets[@]}"
+    runHook postBuild
+  '';
+  installPhase = ''
+    runHook preInstall
+    cmake --install .
+  '' + lib.optionalString (ctestLabels != [ ]) ''
+    python3 ../tools/ci/ctest_bundle.py collect --build . --source "$(cd .. && pwd)" \
+      ${lib.concatMapStringsSep " " (label: "--label ${lib.escapeShellArg label}") ctestLabels} \
+      --output "$out"
+  '' + ''
+    runHook postInstall
+  '';
+})

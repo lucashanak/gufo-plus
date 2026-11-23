@@ -41,6 +41,21 @@ uses:
 | `gufo_ext_cache` | The component cache and, with HIP, its transfer and host-memory helpers | all |
 | `gufo_ext_hip` | The HIP compile definitions and include paths the public HIP headers need | HIP only |
 
+## Model directories
+
+`--model` can name a directory instead of a GGUF. The provider whose
+`probe(model_root)` accepts it creates the runner, with
+`TextRunnerOptions::model_path` set to the directory and no GGUF reader. A
+provider with a runner but no drivers of its own gets `prompt`, `chat` and
+`bench` through the server's backend.
+
+## Session state
+
+Declare a session's buffers in a `mem::StateDeclaration` (`gufo/ext/state.hpp`)
+and allocate them with `mem::SessionState::Create`; return its account from
+`state_account()`, claim the declaration's `Bytes` and `ContextBytes`, and call
+`Ensure` before each write ([state memory](internal/state-memory.md)).
+
 ## Continuation
 
 Every text runner supports continuation through the component cache. The cache
@@ -75,7 +90,9 @@ refuses to load one that leaves a field at zero. While other sessions decode,
 Gufo bounds each prompt pass with it so they don't wait for all of it:
 
 - `pass_tokens` is the width Gufo uses for a prompt beside decoders, normally
-  the model's own prefill pass. A prompt running alone isn't bounded.
+  the model's own prefill pass. A prompt running alone gets it too while
+  another session is free, so an arrival waits for at most one such pass; with
+  every session taken it isn't bounded.
 - `max_layer_groups` is how many layer groups one such pass may be split into.
   One runs every pass unsplit, so decoders wait for the whole pass.
 - `max_yield_decode_width` is how many sessions one decode step between groups

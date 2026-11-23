@@ -85,8 +85,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "gufo-cache-manifest"
+version = "0.0.0"
+dependencies = [
+ "gufo-ffi",
+]
+
+[[package]]
 name = "gufo-ffi"
 version = "0.0.0"
+
+[[package]]
+name = "gufo-gguf"
+version = "0.0.0"
+dependencies = [
+ "gufo-ffi",
+]
 
 [[package]]
 name = "gufo-http"
@@ -94,6 +108,29 @@ version = "0.0.0"
 dependencies = [
  "gufo-ffi",
  "httparse",
+]
+
+[[package]]
+name = "gufo-jpeg-decode"
+version = "0.0.0"
+dependencies = [
+ "gufo-ffi",
+ "zune-core",
+ "zune-jpeg",
+]
+
+[[package]]
+name = "gufo-json"
+version = "0.0.0"
+dependencies = [
+ "gufo-ffi",
+]
+
+[[package]]
+name = "gufo-json-schema"
+version = "0.0.0"
+dependencies = [
+ "gufo-ffi",
 ]
 
 [[package]]
@@ -114,7 +151,12 @@ version = "0.0.0"
 dependencies = [
  "gufo-audio-decode",
  "gufo-base64",
+ "gufo-cache-manifest",
+ "gufo-gguf",
  "gufo-http",
+ "gufo-jpeg-decode",
+ "gufo-json",
+ "gufo-json-schema",
  "gufo-png-decode",
  "gufo-websocket",
 ]
@@ -356,3 +398,18 @@ name = "zlib-rs"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
+
+[[package]]
+name = "zune-core"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d56377fd46368984a170bc5aac5567e52ca5da874caa60bea39fcbca78fb658b"
+
+[[package]]
+name = "zune-jpeg"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
+dependencies = [
+ "zune-core",
+]

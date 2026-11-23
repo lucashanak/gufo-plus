@@ -335,7 +335,6 @@
               pkgsSys.icu
               pkgsSys.curl
               pkgsSys.libpng
-              pkgsSys.libjpeg
               pkgsSys.libwebp
               pkgsSys.libopus
               rustToolchain
@@ -468,6 +467,9 @@
               # The NPU runtime links XRT on Linux.
               gufoPackages.${system}.xrt-amdxdna
               pkgsSys.libuuid
+              # The loom extension's runtime, which the sandbox cannot build
+              # from source (its configure step downloads dependencies).
+              gufoPackages.${system}.loom-runtime
             ];
             src = testSource;
           } (cargoSetup + rustCacheSetup + ''
@@ -685,14 +687,35 @@
           h3-quality = h3QualityCheck;
           h3-ml-quality = h3MlQualityCheck;
           tests = testCheck;
+          model-sync =
+            assert import ./.devops/nix/model-sync-tests.nix {
+              pkgs = pkgsSys;
+              defaultPackage = self.packages.${system}.default;
+            };
+            pkgsSys.runCommand "check-model-sync" { nativeBuildInputs = [ pkgsSys.python3 ]; } ''
+              cp ${./.devops/nix/model-sync-tests.py} model-sync-tests.py
+              cp ${./.devops/nix/model-sync.py} model-sync.py
+              python3 model-sync-tests.py
+              touch $out
+            '';
           mk-serve = mkServeCheck;
           mk-serve-nixos = mkServeNixosCheck;
         }
       );
     in
     {
+      nixosModules.model-sync = import ./.devops/nix/model-sync-module.nix { inherit self; };
       lib = {
         inherit releaseVersion revision;
+        mkModelSync =
+          {
+            pkgs,
+            gufo ? self.packages.${pkgs.stdenv.hostPlatform.system}.default,
+            ...
+          }@args:
+          pkgs.callPackage ./.devops/nix/mk-model-sync.nix { inherit gufo; } (
+            builtins.removeAttrs args [ "pkgs" "gufo" ]
+          );
         mkGufoServe =
           {
             pkgs ? null,
@@ -741,6 +764,9 @@
           # Official artifacts select this output from a tagged source. The
           # default package remains visibly developmental on moving branches.
           release = base.override { inherit releaseVersion; extensionsFromLock = true; };
+          # The gpu-test configuration with its assertions, which Devlab's
+          # functional correctness runs against (docs: tests/functional/README.md).
+          checked = base.override { checked = true; };
           # gufo with its extension SDK, for `gufo extension install`.
           sdk = gufoPackages.${system}.extensionModules.withSdk base;
           release-sdk = gufoPackages.${system}.extensionModules.withSdk
@@ -775,6 +801,8 @@
           # XRT with its amdxdna plugin, as the Gufo package links it.
           xrt-amdxdna = gufoPackages.${system}.xrt-amdxdna;
           iron = gufoPackages.${system}.iron;
+          # The Loom runtime the loom extension loads.
+          loom-runtime = gufoPackages.${system}.loom-runtime;
         }
       );
 
@@ -792,6 +820,9 @@
               pkgs.${system}.sox
               pkgs.${system}.rocmPackages.gfx1151.rocprofiler-sdk
               pkgs.${system}.sqlite
+              # The test presets build jpeg_decode_test, whose cases and
+              # reference decoder use libjpeg-turbo; the package does not.
+              pkgs.${system}.libjpeg
               # Debugging and repository work. The test presets build
               # RelWithDebInfo with assertions, and contributors commit with
               pkgs.${system}.gdb

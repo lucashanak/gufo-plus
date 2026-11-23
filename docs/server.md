@@ -112,7 +112,8 @@ cut the JSON short.
 Vision models accept images as `image_url` parts in Chat Completions,
 `input_image` in Responses and `image` blocks in Messages, also inside tool
 results. Send PNG, JPEG or WebP as a data URL or a public HTTPS URL; Gufo
-refuses private and loopback addresses.
+refuses private and loopback addresses. Arithmetic-coded and lossless JPEG
+files are rejected; see [image inputs](internal/server.md).
 
 All images in a request share 20 MiB of encoded data and 15 seconds of
 downloading, and each can have up to 32 megapixels. There's no fixed number of
@@ -223,3 +224,10 @@ because loading and reading the disk cache take a while.
 Gufo never logs prompts or replies, and never runs tool calls, commands or
 generated code. Only the opt-in [`--trace`](troubleshooting.md#content-trace)
 file records content.
+
+Gufo keeps HTTP/1.1 connections open for sequential requests, so a reverse
+proxy can reuse upstream connections. An HTTP/1.0 request or `Connection: close`
+closes the connection after its response. An idle connection closes after 5
+seconds, after 100 requests, or earlier when a new client needs its slot, so a
+pooled client should retry a request that fails on a reused connection before
+any response arrives.
