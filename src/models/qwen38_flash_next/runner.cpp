@@ -6,6 +6,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <span>
@@ -953,6 +955,16 @@ std::shared_ptr<ext::TextModelRunner> CreateQwenFlashNextTextRunner(
     std::uint32_t rows = rocm::Executor::kWideRows;
     while (rows > 8 && fit(rows) == mem::SessionFit::Kind::kRefused)
       rows -= 8;
+    // EXPERIMENT ONLY: report and optionally force the copy width.
+    std::fprintf(stderr,
+                 "EXP copy_rows=%u free=%zu session=%zu demand=%zu "
+                 "deferred=%zu fit64=%d\n",
+                 rows, free_bytes, model->SessionBytes(mode, max_context),
+                 model->DemandMappedBytes(mode, max_context),
+                 model->DeferredScratchBytes(),
+                 static_cast<int>(fit(rocm::Executor::kWideRows)));
+    if (const char* forced = std::getenv("GUFO_EXP_COPY_ROWS"))
+      rows = static_cast<std::uint32_t>(std::strtoul(forced, nullptr, 10));
     model->LimitCopyRows(rows);
   }
   std::string model_fingerprint = options.disk_cache.model_artifact_fingerprint;
