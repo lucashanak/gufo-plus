@@ -506,7 +506,8 @@ QwenToolCallScan ScanQwenToolCall(std::string_view text, bool partial) {
             } else if (after.starts_with(QwenToolSyntax::kFunctionClose)) {
               after = left(after.substr(QwenToolSyntax::kFunctionClose.size()));
               if (after.starts_with(QwenToolSyntax::kCallClose)) {
-                // Stray closing tags a model echoes after a call are framing.
+                // Stray closing tags a model echoes after a call are framing,
+                // so a value cannot end with the call's own closing tags.
                 auto rest =
                     left(after.substr(QwenToolSyntax::kCallClose.size()));
                 for (bool stray = true; stray;) {
@@ -546,7 +547,9 @@ QwenToolCallScan ScanQwenToolCall(std::string_view text, bool partial) {
         }
         if (framed >= barrier)
           framed = std::string_view::npos;
-        if (framed == std::string_view::npos && !partial)
+        // Once the next call has opened, every closer before it is settled.
+        if (framed == std::string_view::npos &&
+            (!partial || barrier != std::string_view::npos))
           framed = fallback;
         close = framed == std::string_view::npos ? framed : framed + 1;
         // Never recover a nested example from inside an unfinished value.
@@ -564,7 +567,9 @@ QwenToolCallScan ScanQwenToolCall(std::string_view text, bool partial) {
                                                       : std::string_view("\n");
           value.remove_prefix(frame.size());
           if (hold != std::string_view::npos)
-            value = body.substr(frame.size(), hold - frame.size());
+            // Without a canonical header the closer may begin at the frame.
+            value = body.substr(frame.size(),
+                                hold > frame.size() ? hold - frame.size() : 0);
           value = BeforePartialDelimiter(value, "\n</parameter>\n");
           value = BeforePartialDelimiter(value, "\n</parameter>\r\n");
           if (frame == "\r\n" && value.ends_with('\r'))

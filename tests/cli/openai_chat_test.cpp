@@ -1394,6 +1394,12 @@ void TestQwenToolBoundariesAndSchema() {
              "<function=f>\n<parameter=text>\n2\n</parameter>\n</function>\n"
              "</tool_call>",
              2, R"({"text":"2"})"},
+        // An empty framed value after a compact parameter: the closer
+        // begins at the frame newline, streamed or not.
+        Case{"<tool_call>\n<function=f>\n<parameter=count>42</parameter>\n"
+             "<parameter=text>\n</parameter>\n<parameter=flag>\ntrue\n"
+             "</parameter>\n</function>\n</tool_call>",
+             1, R"({"count":42,"text":"","flag":true})"},
         // Two calls: the first closes before the second opens
         // (the last call's arguments are compared).
         Case{"<tool_call>\n<function=f>\n<parameter=text>\na\n</parameter>\n"
