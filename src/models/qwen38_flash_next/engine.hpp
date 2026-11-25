@@ -13,6 +13,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "src/families/qwen/draft_vocab/draft_vocab.hpp"
@@ -414,6 +415,16 @@ private:
   MtpLengthController draft_length_;
   /// Index of tokens_ for prompt lookup (single-session MTP drafts).
   speculative::PromptLookup<> lookup_;
+  /// The prompt's tool results as the model writes them back (numbered
+  /// listings without numbers, JSON literals unescaped; lookup_sources.hpp),
+  /// tokenized and indexed beside lookup_. Rebuilt at a request's first step.
+  std::vector<std::int32_t> derived_tokens_;
+  speculative::PromptLookup<> derived_lookup_;
+  /// A tool result's token hash -> its derived tokens: a long agent session
+  /// re-sends every earlier result, and each is decoded and tokenized once.
+  std::unordered_map<std::uint64_t, std::vector<std::int32_t>> derived_cache_;
+  std::vector<std::int32_t> derived_tail_;  ///< AppendLookup scratch
+  void RebuildDerivedLookup();
   /// Verification rows (anchor included) the next copy-only cycle of a
   /// greedy session decoding alone may use; 0 before the first. A copy
   /// accepted whole at this width doubles it up to max_copy_rows(); any

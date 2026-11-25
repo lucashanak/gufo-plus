@@ -18,6 +18,7 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/lookup_sources.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
@@ -1350,6 +1351,8 @@ struct Session::PendingDecode {
   std::uint32_t lookup{0};
   /// Committed index the copied tokens were taken from.
   std::size_t lookup_start{0};
+  /// The copy came from derived_tokens_, and lookup_start indexes them.
+  bool lookup_derived{false};
   /// Identical copy budget in isolated and batched execution; zero on the
   /// request's first speculative step.
   std::size_t lookup_cap{0};
@@ -1388,21 +1391,47 @@ bool Session::AppendLookup(PendingDecode& pending, bool stop_at_eos,
   if (stop_at_eos && model_->IsStopToken(pending.chain.back())) {
     return false;
   }
-  const auto match = lookup_.Find(
-      tokens_, pending.chain,
-      pending.sampled ? speculative::PromptLookup<>::kSampledMinMatch
-                      : speculative::PromptLookup<>::kMinMatch,
-      require_resume);
+  const auto gate = pending.sampled
+                        ? speculative::PromptLookup<>::kSampledMinMatch
+                        : speculative::PromptLookup<>::kMinMatch;
+  auto match = lookup_.Find(tokens_, pending.chain, gate, require_resume);
+  const std::int32_t* source = tokens_.data();
+  std::size_t source_end = lookup_.IndexedTokens();
+  bool derived = false;
+  // The same context, matched against the tool results as the model writes
+  // them back. Find extends a match backwards through the query alone while
+  // it holds more than kMaxMatch tokens; the longer match wins.
+  constexpr std::size_t kTail = speculative::PromptLookup<>::kMaxMatch + 1;
+  if (!derived_tokens_.empty() &&
+      tokens_.size() + pending.chain.size() >= kTail) {
+    const auto from_chain = std::min(pending.chain.size(), kTail);
+    const auto from_tokens = kTail - from_chain;
+    derived_tail_.assign(
+        tokens_.end() - static_cast<std::ptrdiff_t>(from_tokens),
+        tokens_.end());
+    derived_tail_.insert(
+        derived_tail_.end(),
+        pending.chain.end() - static_cast<std::ptrdiff_t>(from_chain),
+        pending.chain.end());
+    const auto alternative = derived_lookup_.Find(
+        derived_tokens_, derived_tail_, gate, require_resume);
+    if (alternative.length > match.length) {
+      match = alternative;
+      source = derived_tokens_.data();
+      source_end = derived_tokens_.size();
+      derived = true;
+    }
+  }
   if (match.length == 0) {
     return false;
   }
-  const std::size_t available = std::min(cap - pending.chain.size(),
-                                         lookup_.IndexedTokens() - match.start);
+  const std::size_t available =
+      std::min(cap - pending.chain.size(), source_end - match.start);
   if (available < minimum)
     return false;
   std::size_t count = 0;
   for (; count < available; ++count) {
-    const std::int32_t token = tokens_[match.start + count];
+    const std::int32_t token = source[match.start + count];
     pending.chain.push_back(token);
     if (pending.sampled) {
       // A point-mass proposal: accepted with the target's p(token), and a
@@ -1422,8 +1451,66 @@ bool Session::AppendLookup(PendingDecode& pending, bool stop_at_eos,
   }
   pending.lookup = static_cast<std::uint32_t>(count);
   pending.lookup_start = match.start;
+  pending.lookup_derived = derived;
   pending.width = pending.chain.size();
   return count != 0;
+}
+
+void Session::RebuildDerivedLookup() {
+  derived_tokens_.clear();
+  derived_lookup_.Clear();
+  const auto& tokenizer = model_->tokenizer();
+  const auto open = tokenizer.Encode("<tool_response>");
+  const auto close = tokenizer.Encode("</tool_response>");
+  if (open.size() != 1 || close.size() != 1)
+    return;
+  const auto open_id = static_cast<std::int32_t>(open[0]);
+  const auto close_id = static_cast<std::int32_t>(close[0]);
+  // Short results rarely hold a file; the cap bounds the index of a very
+  // long agent session.
+  constexpr std::size_t kMinResultTokens = 32;
+  constexpr std::size_t kMaxDerivedTokens = std::size_t{1} << 20;
+  std::unordered_map<std::uint64_t, std::vector<std::int32_t>> kept;
+  std::vector<tokenization::TokenId> ids;
+  for (std::size_t i = 0; i < tokens_.size(); ++i) {
+    if (tokens_[i] != open_id)
+      continue;
+    std::size_t j = i + 1;
+    while (j < tokens_.size() && tokens_[j] != close_id &&
+           tokens_[j] != open_id)
+      ++j;
+    if (j >= tokens_.size() || tokens_[j] != close_id) {
+      i = j - 1;
+      continue;
+    }
+    const auto result =
+        std::span<const std::int32_t>(tokens_).subspan(i + 1, j - i - 1);
+    i = j;
+    if (result.size() < kMinResultTokens)
+      continue;
+    std::uint64_t hash = 0xcbf29ce484222325ULL ^ result.size();
+    for (const auto token : result)
+      hash = (hash ^ static_cast<std::uint32_t>(token)) * 0x100000001b3ULL;
+    std::vector<std::int32_t> derived;
+    if (const auto found = derived_cache_.find(hash);
+        found != derived_cache_.end()) {
+      derived = std::move(found->second);
+    } else {
+      ids.assign(result.begin(), result.end());
+      for (const auto& text : LookupSources::Texts(tokenizer.Decode(ids))) {
+        const auto encoded =
+            tokenizer.Encode(text, {.parse_special_tokens = false});
+        derived.insert(derived.end(), encoded.begin(), encoded.end());
+      }
+    }
+    if (derived_tokens_.size() + derived.size() <= kMaxDerivedTokens)
+      derived_tokens_.insert(derived_tokens_.end(), derived.begin(),
+                             derived.end());
+    kept.emplace(hash, std::move(derived));
+  }
+  // Only this prompt's results stay cached: the next turn re-sends them.
+  derived_cache_ = std::move(kept);
+  derived_lookup_.Extend(derived_tokens_);
 }
 
 bool Session::PrepareDecode(const DecodeRequest& request,
@@ -1560,7 +1647,10 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   // a peer must not change a sampled request's proposals or RNG sequence.
   // A request's first speculative step copies nothing (see
   // speculative::PromptLookup<>).
-  pending->lookup_cap = lookup_.Step(base) ? cap : 0;
+  const bool copies = lookup_.Step(base);
+  if (!copies)
+    RebuildDerivedLookup();
+  pending->lookup_cap = copies ? cap : 0;
   if (pending->lookup_cap != 0) {
     lookup_.Extend(tokens_, sampled);
   }
@@ -1857,8 +1947,8 @@ bool Session::FinishDecode(const DecodeRequest& request,
   stats_.lookup += pending.lookup;
   stats_.lookup_accepted += keep - 1 - mtp_accepted;
   if (pending.lookup != 0) {
-    lookup_.Observe(pending.lookup_start, pending.lookup,
-                    keep - 1 - mtp_accepted);
+    (pending.lookup_derived ? derived_lookup_ : lookup_)
+        .Observe(pending.lookup_start, pending.lookup, keep - 1 - mtp_accepted);
     // Only a copy-only cycle that may verify wide sets the width
     // (PrepareDecode): two whole copies in a row at the current width
     // double it, and any rejected copy returns it to the ordinary width.
