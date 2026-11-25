@@ -7,6 +7,7 @@
 #include <string_view>
 
 #include "src/core/crypto/sha256.hpp"
+#include "src/core/prompt_too_long.hpp"
 #include "src/families/qwen/control_tokens/control_tokens.hpp"
 #include "src/families/qwen/vision/image_cache.hpp"
 
@@ -301,9 +302,11 @@ Prompt Prepare(const tokenization::QwenTokenizer& tokenizer,
     auto tokens = tokenization::QwenChatTemplate::EncodeRendered(
         tokenizer, *rendered, begin, end, content_spans, tok_options);
     if (tokens.size() > max_context - prompt.tokens.size()) {
-      throw std::length_error(
+      throw PromptTooLong(
+          prompt.tokens.size() + tokens.size(),
+          max_context == 0 ? 0 : max_context - 1,
           "prompt exceeds the " + std::to_string(max_context) +
-          "-token context; increase --context or shorten the conversation");
+              "-token context; increase --context or shorten the conversation");
     }
     prompt.tokens.insert(prompt.tokens.end(), tokens.begin(), tokens.end());
   };

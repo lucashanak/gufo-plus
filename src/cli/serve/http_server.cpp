@@ -50,6 +50,7 @@
 #include "src/core/json.hpp"
 #include "src/core/platform/net.hpp"
 #include "src/core/platform/shutdown_signal.hpp"
+#include "src/core/prompt_too_long.hpp"
 #include "src/core/rust/callback.hpp"
 #include "src/core/utf8.hpp"
 #include "src/families/qwen/text/chat_template.hpp"
@@ -1350,6 +1351,14 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
       req, b, chat, max_tokens, sampling_config,
       body.find("stream") != nullptr && body.find("stream")->as_bool(),
       RequestedModel(body, b));
+} catch (const PromptTooLong& error) {
+  // Anthropic's wording: Claude Code compacts the conversation when it sees
+  // it, instead of failing the turn.
+  const auto message = "prompt is too long: " + std::to_string(error.tokens()) +
+                       " tokens > " + std::to_string(error.maximum()) +
+                       " maximum";
+  return Err(400, "Bad Request", message.c_str(), "invalid_request_error",
+             "context_length_exceeded");
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
              "context_length_exceeded");

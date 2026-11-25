@@ -1121,6 +1121,17 @@ void TestCompatibilityRequests() {
                                ? "context_length_exceeded"
                                : "invalid_prompt") != std::string::npos);
     }
+    // Messages names the sizes in Anthropic's wording, which Claude Code
+    // answers by compacting; other endpoints keep the server's message.
+    server.backend->failure = 9;
+    const auto too_long = server.Post(endpoint.path, body.dump());
+    ExpectStatus(too_long, 400);
+    assert(too_long.find("context_length_exceeded") != std::string::npos);
+    assert((too_long.find("prompt is too long: 300000 tokens > 262143 "
+                          "maximum") != std::string::npos) ==
+           (std::string_view(endpoint.path) == "/v1/messages"));
+    assert((too_long.find("prompt exceeds the context") != std::string::npos) !=
+           (std::string_view(endpoint.path) == "/v1/messages"));
     server.backend->failure = 0;
     assert(last.client_id == "127.0.0.1");
     assert(last.max_tokens == 1 && last.sampling.temperature == 0.6F &&

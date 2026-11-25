@@ -28,6 +28,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
+#include "src/core/prompt_too_long.hpp"
 #include "src/mem/ledger.hpp"
 #include "src/sched/policy.hpp"
 
@@ -3072,10 +3073,12 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   }
   const auto context = impl_->runner_pool->runner().Descriptor().max_context;
   if (prompt.size() >= context) {
-    throw std::length_error("prompt has " + std::to_string(prompt.size()) +
+    throw PromptTooLong(prompt.size(), context == 0 ? 0 : context - 1,
+                        "prompt has " + std::to_string(prompt.size()) +
                             " tokens but the context is " +
                             std::to_string(context) +
-                            "; increase --context or shorten the conversation");
+                            "; increase --context or shorten the "
+                            "conversation");
   }
   const std::size_t available = context - prompt.size();
   const std::size_t prompt_tokens = prompt.size();
