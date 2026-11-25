@@ -60,6 +60,12 @@ void CheckJson() {
                   "alpha beta gamma delta\nepsilon zeta eta theta\n"
                   "iota kappa lambda mu",
           "a listing inside a literal was not stripped");
+  texts = LookupSources::Texts(
+      R"({"s":"a lone \ud800 surrogate inside a long enough literal with\n)"
+      R"(a newline so that it counts"})");
+  Require(
+      texts.size() == 1 && texts[0].find("\xEF\xBF\xBD") != std::string::npos,
+      "a lone surrogate was not replaced");
   Require(LookupSources::Texts(R"({"a":"no escapes in this fairly long )"
                                R"(string value that has none at all"})")
               .empty(),

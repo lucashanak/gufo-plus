@@ -461,12 +461,14 @@ QwenToolCallScan ScanQwenToolCall(std::string_view text, bool partial) {
             canonical_parameters ? (body.starts_with("\r\n") ? 2 : 1) : 0;
         // A value may quote the call's closing tags on their own lines (a
         // file written through a tool, a parser fixture). A closer ends the
-        // value only when another parameter follows, or the call's closing
-        // tags and then another call or the end of the reply. While the
-        // reply is still arriving, a closer at its current end only holds
-        // the value back. Without such a closer, a complete reply ends the
-        // value at the last closer followed by the call's closing tags, so
-        // a call followed by prose still parses.
+        // value when another parameter follows, or the call's closing tags
+        // and then another call or the end of the reply. A closer whose
+        // closing tags are followed by prose ends the value only when no
+        // later closer of this value (before the next call opener) does: a
+        // call followed by prose still parses, and prose never joins two
+        // calls. While the reply is arriving, the first closer that may
+        // still end the value holds it back, so streamed argument text is a
+        // prefix of the final value whichever closer ends it.
         const auto left = [](std::string_view value) {
           while (!value.empty() &&
                  std::isspace(static_cast<unsigned char>(value.front())) != 0)
@@ -477,9 +479,14 @@ QwenToolCallScan ScanQwenToolCall(std::string_view text, bool partial) {
                                   std::string_view tag) {
           return value.size() < tag.size() && tag.starts_with(value);
         };
+        const auto held = [&](std::size_t at) {
+          if (partial && hold == std::string_view::npos)
+            hold = at;
+        };
         auto framed = body.find("\n</parameter>", frame);
         auto fallback = std::string_view::npos;
-        while (framed != std::string_view::npos) {
+        auto barrier = std::string_view::npos;
+        while (framed != std::string_view::npos && framed < barrier) {
           const auto tail =
               body.substr(framed + std::string_view("\n</parameter>").size());
           // Compact legacy headers also admit compact closers. A canonical
@@ -495,9 +502,7 @@ QwenToolCallScan ScanQwenToolCall(std::string_view text, bool partial) {
             if (after.empty() ||
                 prefix_of(after, QwenToolSyntax::kParameterOpen) ||
                 prefix_of(after, QwenToolSyntax::kFunctionClose)) {
-              // Only an unfinished reply can still complete the call here.
-              if (partial && hold == std::string_view::npos)
-                hold = framed;
+              held(framed);
             } else if (after.starts_with(QwenToolSyntax::kFunctionClose)) {
               after = left(after.substr(QwenToolSyntax::kFunctionClose.size()));
               if (after.starts_with(QwenToolSyntax::kCallClose)) {
@@ -520,22 +525,27 @@ QwenToolCallScan ScanQwenToolCall(std::string_view text, bool partial) {
                 if (rest.starts_with(QwenToolSyntax::kCallOpen) ||
                     (rest.empty() && !partial))
                   break;
-                if (rest.empty() ||
-                    prefix_of(rest, QwenToolSyntax::kCallOpen)) {
-                  if (hold == std::string_view::npos)
-                    hold = framed;
+                if (partial && (rest.empty() ||
+                                prefix_of(rest, QwenToolSyntax::kCallOpen))) {
+                  held(framed);
                 } else {
-                  fallback = framed;
+                  // Prose (or, in a complete reply, a truncated opener).
+                  held(framed);
+                  if (fallback == std::string_view::npos) {
+                    fallback = framed;
+                    barrier = body.find(QwenToolSyntax::kCallOpen, framed);
+                  }
                 }
-              } else if (partial && hold == std::string_view::npos &&
-                         (after.empty() ||
-                          prefix_of(after, QwenToolSyntax::kCallClose))) {
-                hold = framed;
+              } else if (after.empty() ||
+                         prefix_of(after, QwenToolSyntax::kCallClose)) {
+                held(framed);
               }
             }
           }
           framed = body.find("\n</parameter>", framed + 1);
         }
+        if (framed >= barrier)
+          framed = std::string_view::npos;
         if (framed == std::string_view::npos && !partial)
           framed = fallback;
         close = framed == std::string_view::npos ? framed : framed + 1;

@@ -1388,6 +1388,12 @@ void TestQwenToolBoundariesAndSchema() {
         Case{"<tool_call>\n<function=f>\n<parameter=text>\nhi\n</parameter>\n"
              "</function>\n</tool_call>\nDone.",
              1, R"({"text":"hi"})"},
+        // Prose between two calls never joins them.
+        Case{"<tool_call>\n<function=f>\n<parameter=text>\n1\n</parameter>\n"
+             "</function>\n</tool_call>\nNow the second.\n<tool_call>\n"
+             "<function=f>\n<parameter=text>\n2\n</parameter>\n</function>\n"
+             "</tool_call>",
+             2, R"({"text":"2"})"},
         // Two calls: the first closes before the second opens
         // (the last call's arguments are compared).
         Case{"<tool_call>\n<function=f>\n<parameter=text>\na\n</parameter>\n"

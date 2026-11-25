@@ -1494,7 +1494,8 @@ void Session::RebuildDerivedLookup() {
     std::vector<std::int32_t> derived;
     if (const auto found = derived_cache_.find(hash);
         found != derived_cache_.end()) {
-      derived = std::move(found->second);
+      // A copy: the same result may appear again in this prompt.
+      derived = found->second;
     } else {
       ids.assign(result.begin(), result.end());
       for (const auto& text : LookupSources::Texts(tokenizer.Decode(ids))) {

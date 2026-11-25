@@ -199,6 +199,8 @@ private:
               Hex4(text, i + 3, &low) && low >= 0xDC00 && low < 0xE000) {
             code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
             i += 6;
+          } else if (code >= 0xD800 && code < 0xE000) {
+            code = 0xFFFD;  // a lone surrogate is not valid UTF-8
           }
           AppendUtf8(code, raw);
           break;
