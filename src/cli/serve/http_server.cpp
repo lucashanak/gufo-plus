@@ -409,13 +409,17 @@ bool ReadTextContent(const json::Value* content, std::string* out,
                      std::string* thought = nullptr,
                      tokenization::ChatMessage* image_message = nullptr,
                      core::ImageReadBudget* image_budget = nullptr,
-                     std::string* error = nullptr) {
+                     std::string* error = nullptr, bool tool_changes = false) {
   if (content == nullptr)
     return false;
   if (content->is_string()) {
     *out = content->get_str();
   } else if (content->is_array()) {
     for (const auto& part : content->items()) {
+      // Messages system turns carry tool changes beside their text; the tool
+      // declarations already applied them (ParseAnthropicToolControls).
+      if (tool_changes && IsAnthropicToolChange(part))
+        continue;
       if (thought != nullptr && part.is_object() &&
           part.member_str("type") == "thinking") {
         const auto* thinking = part.find("thinking");
@@ -553,7 +557,8 @@ bool ReadTextMessages(const json::Value* input,
                            message.role == tokenization::ChatRole::kUser
                                ? &message
                                : nullptr,
-                           &image_budget, &error)) {
+                           &image_budget, &error,
+                           message.role == tokenization::ChatRole::kSystem)) {
         if (parse_error && !error.empty())
           *parse_error = std::move(error);
         return false;

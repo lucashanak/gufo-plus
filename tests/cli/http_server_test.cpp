@@ -1795,9 +1795,88 @@ void TestCompatibilityRequests() {
   assert(history[4].role == gufo::tokenization::ChatRole::kUser &&
          history[4].content == "thanks");
 
+  // Claude Code's tool search returns tool_reference blocks; each reads as a
+  // line naming the loaded tool.
+  response_body(server.Post("/v1/messages", R"({"tools":)" + weather_tool +
+                                                R"(,"messages":[
+        {"role":"user","content":"find a weather tool"},
+        {"role":"assistant","content":[{"type":"tool_use","id":"toolu_s",
+          "name":"ToolSearch","input":{"query":"weather"}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_s",
+          "content":[{"type":"text","text":"Found:"},
+            {"type":"tool_reference","tool_name":"get_weather"},
+            {"type":"tool_reference","tool_name":"get_forecast"}]}]}]})"));
+  {
+    const auto sent = server.backend->LastCall().chat.messages;
+    assert(sent.size() == 3 &&
+           sent[2].role == gufo::tokenization::ChatRole::kTool &&
+           sent[2].content ==
+               "Found:\nTool loaded: get_weather\nTool loaded: get_forecast\n");
+  }
+  // tool_addition / tool_removal in system turns change the declared tools in
+  // order: a reference re-enables or withdraws a declared tool, a definition
+  // declares one after the request's tools. The turn keeps its text.
+  const std::string tool_changes_tools = R"([
+      {"name":"bash","input_schema":{"type":"object"}},
+      {"name":"search","input_schema":{"type":"object"},"defer_loading":true}])";
+  response_body(server.Post("/v1/messages", R"({"tools":)" +
+                                                tool_changes_tools +
+                                                R"(,"messages":[
+        {"role":"user","content":"hi"},
+        {"role":"system","content":[{"type":"text","text":"Tools changed."},
+          {"type":"tool_removal","tool":{"type":"tool_reference","name":"bash"}},
+          {"type":"tool_addition","tool":{"type":"tool_reference",
+            "name":"search"}},
+          {"type":"tool_addition","tool":{"type":"tool_definition",
+            "definition":{"name":"db_query","description":"Query",
+              "input_schema":{"type":"object"}}}}]},
+        {"role":"user","content":"go"}]})"));
+  {
+    const auto chat = server.backend->LastCall().chat;
+    assert(chat.tools.size() == 2 && chat.tools[0].name == "search" &&
+           chat.tools[1].name == "db_query" &&
+           chat.tools[1].description == "Query");
+    assert(chat.messages.size() == 3 &&
+           chat.messages[1].role == gufo::tokenization::ChatRole::kSystem &&
+           chat.messages[1].content == "Tools changed.");
+  }
+  response_body(server.Post("/v1/messages", R"({"tools":)" +
+                                                tool_changes_tools +
+                                                R"(,"messages":[
+        {"role":"user","content":"hi"},
+        {"role":"system","content":[
+          {"type":"tool_removal","tool":{"type":"tool_reference","name":"bash"}}]},
+        {"role":"system","content":[
+          {"type":"tool_addition","tool":{"type":"tool_reference","name":"bash"}}]},
+        {"role":"user","content":"go"}]})"));
+  {
+    const auto chat = server.backend->LastCall().chat;
+    assert(chat.tools.size() == 2 && chat.tools[0].name == "bash" &&
+           chat.tools[1].name == "search");
+  }
+
   const auto calls_before = server.backend->calls.load();
   for (const auto& invalid : std::vector<std::string>{
            R"({"messages":[{"role":"user","content":"hi"}],"tools":{}})",
+           // A tool change outside a system turn, naming an undeclared tool,
+           // removing by value, or without a tool.
+           R"({"messages":[{"role":"user","content":[{"type":"tool_addition",
+               "tool":{"type":"tool_reference","name":"bash"}}]}],
+               "tools":)" +
+               tool_changes_tools + "}",
+           R"({"messages":[{"role":"user","content":"hi"},{"role":"system",
+               "content":[{"type":"tool_addition","tool":{
+               "type":"tool_reference","name":"missing"}}]}],"tools":)" +
+               tool_changes_tools + "}",
+           R"({"messages":[{"role":"user","content":"hi"},{"role":"system",
+               "content":[{"type":"tool_removal","tool":{
+               "type":"tool_definition","definition":{"name":"bash",
+               "input_schema":{}}}}]}],"tools":)" +
+               tool_changes_tools + "}",
+           R"({"messages":[{"role":"user","content":"hi"},{"role":"system",
+               "content":[{"type":"tool_addition"}]}]})",
+           R"({"messages":[{"role":"user","content":[{"type":"tool_result",
+               "tool_use_id":"toolu_1","content":[{"type":"tool_reference"}]}]}]})",
            R"({"messages":[{"role":"user","content":"hi"}],
                "tools":[{"type":"web_search_20250305","name":"web_search"}]})",
            R"({"messages":[{"role":"user","content":"hi"}],

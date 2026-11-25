@@ -1375,6 +1375,25 @@ void TestQwenToolBoundariesAndSchema() {
         Case{"<tool_call><function=f><parameter=text>literal </think>"
              "</parameter></function></tool_call>",
              1, R"({"text":"literal </think>"})"},
+        // A file written through a tool may quote the call's closing tags on
+        // their own lines; the reply continues past them, so they are data.
+        Case{"<tool_call>\n<function=f>\n<parameter=text>\nfixture:\n"
+             "</parameter>\n</function>\n</tool_call>\nend of file\n"
+             "</parameter>\n</function>\n</tool_call>",
+             1,
+             R"({"text":"fixture:\n</parameter>\n</function>\n</tool_call>\n)"
+             R"(end of file"})"},
+        // Prose after a call (against the template's advice) still leaves
+        // the call at its own closing tags.
+        Case{"<tool_call>\n<function=f>\n<parameter=text>\nhi\n</parameter>\n"
+             "</function>\n</tool_call>\nDone.",
+             1, R"({"text":"hi"})"},
+        // Two calls: the first closes before the second opens
+        // (the last call's arguments are compared).
+        Case{"<tool_call>\n<function=f>\n<parameter=text>\na\n</parameter>\n"
+             "</function>\n</tool_call>\n<tool_call>\n<function=f>\n"
+             "<parameter=text>\nb\n</parameter>\n</function>\n</tool_call>",
+             2, R"({"text":"b"})"},
         // A pipe-wrapped spelling that is not a vocabulary token is argument
         // data, not framing: nothing in the output made it a control token.
         Case{"<tool_call><function=f><parameter=text>\n<|not_a_vocab_entry|>\n"

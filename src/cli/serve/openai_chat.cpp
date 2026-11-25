@@ -1636,7 +1636,8 @@ void ParseQwenCalls(
       continue;
     }
     const auto marker_begin = cursor;
-    const auto scan = tokenization::ScanQwenToolCall(text.substr(marker_begin));
+    const auto scan =
+        tokenization::ScanQwenToolCall(text.substr(marker_begin), partial);
     if (!scan.matched || !scan.call) {
       cursor = marker_begin + scan.progress;
       if (cursor == marker_begin)
@@ -3549,36 +3550,145 @@ std::optional<HttpResponse> ParseOpenAiResponseControls(const json::Value& body,
   return {};
 }
 
+bool IsAnthropicToolChange(const json::Value& block) {
+  if (!block.is_object())
+    return false;
+  const auto type = block.member_str("type");
+  return type == "tool_addition" || type == "tool_removal";
+}
+
+namespace {
+
+// The tool_addition / tool_removal blocks of the request's system turns, in
+// order. Each names a declared tool (tool_reference) or, for an addition,
+// defines one by value (tool_definition).
+std::optional<HttpResponse> CollectAnthropicToolChanges(
+    const json::Value& body, std::vector<const json::Value*>* changes) {
+  const auto* messages = body.find("messages");
+  if (messages == nullptr || !messages->is_array())
+    return {};
+  for (const auto& item : messages->items()) {
+    const auto* content = item.is_object() ? item.find("content") : nullptr;
+    if (content == nullptr || !content->is_array())
+      continue;
+    for (const auto& block : content->items()) {
+      if (!IsAnthropicToolChange(block))
+        continue;
+      if (item.member_str("role") != "system")
+        return Error(400, "Bad Request",
+                     "tool_addition and tool_removal blocks are only allowed "
+                     "in messages with role \"system\"",
+                     "invalid_tools");
+      const auto* tool = block.find("tool");
+      const auto kind =
+          tool != nullptr && tool->is_object() ? tool->member_str("type") : "";
+      const bool reference = kind == "tool_reference" &&
+                             tool->find("name") != nullptr &&
+                             tool->find("name")->is_string();
+      const bool definition = kind == "tool_definition" &&
+                              block.member_str("type") == "tool_addition" &&
+                              tool->find("definition") != nullptr &&
+                              tool->find("definition")->is_object();
+      if (!reference && !definition)
+        return Error(400, "Bad Request",
+                     "a tool change needs a tool_reference with a name, or "
+                     "(tool_addition only) a tool_definition",
+                     "invalid_tools");
+      changes->push_back(&block);
+    }
+  }
+  return {};
+}
+
+}  // namespace
+
 std::optional<HttpResponse> ParseAnthropicToolControls(const json::Value& body,
                                                        ChatRequest* chat) {
   const auto* tools = body.find("tools");
   const auto* choice = body.find("tool_choice");
-  if (tools == nullptr && choice == nullptr)
+  std::vector<const json::Value*> changes;
+  if (auto error = CollectAnthropicToolChanges(body, &changes))
+    return error;
+  if (tools == nullptr && choice == nullptr && changes.empty())
     return {};
   // Rewrite the Messages declarations as Chat tools so validation, schema
   // constraints and tool framing stay on the single Chat tool path.
+  const auto convert = [](const json::Value& tool,
+                          json::Value* out) -> std::optional<HttpResponse> {
+    if (!tool.is_object() || tool.member_str("type", "custom") != "custom" ||
+        !tool.contains("input_schema"))
+      return Error(400, "Bad Request",
+                   "only custom tools with an input_schema are supported",
+                   "invalid_tools");
+    json::Value function = json::Value::object();
+    for (const auto* key : {"name", "description"})
+      if (const auto* value = tool.find(key))
+        function[key] = *value;
+    function["parameters"] = *tool.find("input_schema");
+    *out = json::Value::object();
+    (*out)["type"] = "function";
+    (*out)["function"] = std::move(function);
+    return {};
+  };
   json::Value converted = json::Value::object();
-  if (tools != nullptr) {
-    if (!tools->is_array())
+  if (tools != nullptr || !changes.empty()) {
+    if (tools != nullptr && !tools->is_array())
       return Error(400, "Bad Request", "'tools' must be an array",
                    "invalid_tools");
-    auto functions = json::Value::array();
-    for (const auto& tool : tools->items()) {
-      if (!tool.is_object() || tool.member_str("type", "custom") != "custom" ||
-          !tool.contains("input_schema"))
-        return Error(400, "Bad Request",
-                     "only custom tools with an input_schema are supported",
-                     "invalid_tools");
-      json::Value function = json::Value::object();
-      for (const auto* key : {"name", "description"})
-        if (const auto* value = tool.find(key))
-          function[key] = *value;
-      function["parameters"] = *tool.find("input_schema");
-      json::Value wrapped = json::Value::object();
-      wrapped["type"] = "function";
-      wrapped["function"] = std::move(function);
-      functions.push_back(std::move(wrapped));
+    // Declared tools by name, in declaration order; a removed tool keeps its
+    // slot so adding it back restores its place.
+    std::vector<std::pair<std::string, json::Value>> declared;
+    std::vector<bool> active;
+    const auto slot = [&](std::string_view name) {
+      for (std::size_t i = 0; i < declared.size(); ++i)
+        if (declared[i].first == name)
+          return i;
+      return declared.size();
+    };
+    if (tools != nullptr) {
+      for (const auto& tool : tools->items()) {
+        json::Value wrapped;
+        if (auto error = convert(tool, &wrapped))
+          return error;
+        declared.emplace_back(tool.member_str("name"), std::move(wrapped));
+        active.push_back(true);
+      }
     }
+    // Every declared tool, defer_loading or not, is already in the prompt:
+    // an addition by reference only re-enables a removed tool. Additions by
+    // value are declared after the request's own tools.
+    for (const auto* change : changes) {
+      const auto& tool = *change->find("tool");
+      const bool addition = change->member_str("type") == "tool_addition";
+      if (tool.member_str("type") == "tool_definition") {
+        const auto& definition = *tool.find("definition");
+        json::Value wrapped;
+        if (auto error = convert(definition, &wrapped))
+          return error;
+        const auto name = definition.member_str("name");
+        const auto at = slot(name);
+        if (at == declared.size()) {
+          declared.emplace_back(name, std::move(wrapped));
+          active.push_back(true);
+        } else {
+          declared[at].second = std::move(wrapped);
+          active[at] = true;
+        }
+        continue;
+      }
+      const auto name = tool.member_str("name");
+      const auto at = slot(name);
+      if (at == declared.size())
+        return Error(400, "Bad Request",
+                     "tool change references tool '" + name +
+                         "', which is not declared in tools",
+                     "invalid_tools");
+      active[at] = addition;
+    }
+    auto functions = json::Value::array();
+    for (std::size_t i = 0; i < declared.size(); ++i)
+      if (active[i])
+        functions.push_back(std::move(declared[i].second));
     converted["tools"] = std::move(functions);
   }
   if (choice != nullptr) {
@@ -3684,6 +3794,22 @@ bool ParseAnthropicToolMessage(const json::Value& item,
       return ParseAnthropicImage(part, target, budget, error);
     return read_text(part, &target->content);
   };
+  // A tool search result names the tools it loaded. Every declared tool is
+  // already in the prompt, so each reference reads as one line naming it.
+  const auto read_result_part = [&](const json::Value& part,
+                                    tokenization::ChatMessage* target) {
+    if (!part.is_object() || part.member_str("type") != "tool_reference")
+      return read_part(part, target);
+    const auto* name = part.find("tool_name");
+    if (name == nullptr || !name->is_string() || name->str().empty()) {
+      *error = "tool_reference blocks require a tool_name";
+      return false;
+    }
+    if (!target->content.empty() && target->content.back() != '\n')
+      target->content.push_back('\n');
+    target->content += "Tool loaded: " + name->str() + "\n";
+    return true;
+  };
   if (role == "assistant") {
     tokenization::ChatMessage message(tokenization::ChatRole::kAssistant, "");
     for (const auto& part : content->items()) {
@@ -3746,11 +3872,13 @@ bool ParseAnthropicToolMessage(const json::Value& item,
       if (output->is_string()) {
         result.content = output->str();
       } else if (!output->is_array()) {
-        *error = "tool_result content must be a string, text or image blocks";
+        *error =
+            "tool_result content must be a string, text, image or "
+            "tool_reference blocks";
         return false;
       } else {
         for (const auto& block : output->items())
-          if (!read_part(block, &result))
+          if (!read_result_part(block, &result))
             return false;
       }
     }

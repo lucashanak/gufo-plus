@@ -95,8 +95,12 @@ struct QwenToolCallScan {
 };
 
 /// Scans the Qwen call beginning at `text[0]`, if any. Schema interpretation,
-/// argument coercion and OpenAI shaping stay with the API surface.
-[[nodiscard]] QwenToolCallScan ScanQwenToolCall(std::string_view text);
+/// argument coercion and OpenAI shaping stay with the API surface. `text`
+/// runs to the end of the reply, or to its current end when `partial`: a
+/// framed value ends only at a closer followed by another parameter, or the
+/// call's closing tags and another call or the end of the reply.
+[[nodiscard]] QwenToolCallScan ScanQwenToolCall(std::string_view text,
+                                                bool partial = false);
 
 enum class QwenReasoningEffort : std::uint8_t {
   kLow,

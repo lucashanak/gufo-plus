@@ -46,9 +46,12 @@ bool ParseOpenAiResponseMessage(const json::Value& item,
 std::optional<ReasoningEffort> ParseReasoningEffortName(std::string_view value);
 
 /// Messages tools and tool_choice, mapped onto the Chat tool declarations so
-/// framing, schema constraints and replayed tool turns match Chat.
+/// framing, schema constraints and replayed tool turns match Chat. The
+/// tool_addition / tool_removal blocks of system turns are applied in order.
 std::optional<HttpResponse> ParseAnthropicToolControls(const json::Value& body,
                                                        ChatRequest* chat);
+/// Whether a Messages content block is a tool_addition or tool_removal.
+bool IsAnthropicToolChange(const json::Value& block);
 /// One Messages image block (base64 or HTTPS URL source), appended to the
 /// message at the current end of its text.
 bool ParseAnthropicImage(const json::Value& block,

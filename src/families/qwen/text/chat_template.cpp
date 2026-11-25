@@ -405,7 +405,7 @@ std::string_view BeforePartialDelimiter(std::string_view value,
 
 }  // namespace
 
-QwenToolCallScan ScanQwenToolCall(std::string_view text) {
+QwenToolCallScan ScanQwenToolCall(std::string_view text, bool partial) {
   QwenToolCallScan result;
   if (!text.starts_with(QwenToolSyntax::kCallOpen))
     return result;
@@ -444,6 +444,8 @@ QwenToolCallScan ScanQwenToolCall(std::string_view text) {
       const std::string spelled(body.substr(0, parameter_name_end));
       body.remove_prefix(parameter_name_end + 1);
       auto close = body.find(QwenToolSyntax::kParameterClose);
+      // The first closer that may still end the value once more arrives.
+      auto hold = std::string_view::npos;
       const bool framed_value =
           body.starts_with('\n') || body.starts_with("\r\n");
       canonical_parameters &= framed_value;
@@ -457,7 +459,26 @@ QwenToolCallScan ScanQwenToolCall(std::string_view text) {
         // constrained call into several (#1096).
         const std::size_t frame =
             canonical_parameters ? (body.starts_with("\r\n") ? 2 : 1) : 0;
+        // A value may quote the call's closing tags on their own lines (a
+        // file written through a tool, a parser fixture). A closer ends the
+        // value only when another parameter follows, or the call's closing
+        // tags and then another call or the end of the reply. While the
+        // reply is still arriving, a closer at its current end only holds
+        // the value back. Without such a closer, a complete reply ends the
+        // value at the last closer followed by the call's closing tags, so
+        // a call followed by prose still parses.
+        const auto left = [](std::string_view value) {
+          while (!value.empty() &&
+                 std::isspace(static_cast<unsigned char>(value.front())) != 0)
+            value.remove_prefix(1);
+          return value;
+        };
+        const auto prefix_of = [](std::string_view value,
+                                  std::string_view tag) {
+          return value.size() < tag.size() && tag.starts_with(value);
+        };
         auto framed = body.find("\n</parameter>", frame);
+        auto fallback = std::string_view::npos;
         while (framed != std::string_view::npos) {
           const auto tail =
               body.substr(framed + std::string_view("\n</parameter>").size());
@@ -467,10 +488,56 @@ QwenToolCallScan ScanQwenToolCall(std::string_view text) {
           if (tail.starts_with('\n') || tail.starts_with("\r\n") ||
               (!canonical_parameters &&
                (TrimAscii(tail).starts_with(QwenToolSyntax::kFunctionClose) ||
-                TrimAscii(tail).starts_with(QwenToolSyntax::kParameterOpen))))
-            break;
+                TrimAscii(tail).starts_with(QwenToolSyntax::kParameterOpen)))) {
+            auto after = left(tail);
+            if (after.starts_with(QwenToolSyntax::kParameterOpen))
+              break;
+            if (after.empty() ||
+                prefix_of(after, QwenToolSyntax::kParameterOpen) ||
+                prefix_of(after, QwenToolSyntax::kFunctionClose)) {
+              // Only an unfinished reply can still complete the call here.
+              if (partial && hold == std::string_view::npos)
+                hold = framed;
+            } else if (after.starts_with(QwenToolSyntax::kFunctionClose)) {
+              after = left(after.substr(QwenToolSyntax::kFunctionClose.size()));
+              if (after.starts_with(QwenToolSyntax::kCallClose)) {
+                // Stray closing tags a model echoes after a call are framing.
+                auto rest =
+                    left(after.substr(QwenToolSyntax::kCallClose.size()));
+                for (bool stray = true; stray;) {
+                  stray = false;
+                  for (const std::string_view tag :
+                       {QwenToolSyntax::kFunctionClose,
+                        QwenToolSyntax::kParameterClose,
+                        QwenToolSyntax::kCallClose,
+                        std::string_view("</invoke>")}) {
+                    if (rest.starts_with(tag)) {
+                      rest = left(rest.substr(tag.size()));
+                      stray = true;
+                    }
+                  }
+                }
+                if (rest.starts_with(QwenToolSyntax::kCallOpen) ||
+                    (rest.empty() && !partial))
+                  break;
+                if (rest.empty() ||
+                    prefix_of(rest, QwenToolSyntax::kCallOpen)) {
+                  if (hold == std::string_view::npos)
+                    hold = framed;
+                } else {
+                  fallback = framed;
+                }
+              } else if (partial && hold == std::string_view::npos &&
+                         (after.empty() ||
+                          prefix_of(after, QwenToolSyntax::kCallClose))) {
+                hold = framed;
+              }
+            }
+          }
           framed = body.find("\n</parameter>", framed + 1);
         }
+        if (framed == std::string_view::npos && !partial)
+          framed = fallback;
         close = framed == std::string_view::npos ? framed : framed + 1;
         // Never recover a nested example from inside an unfinished value.
         result.progress =
@@ -486,6 +553,8 @@ QwenToolCallScan ScanQwenToolCall(std::string_view text) {
           const auto frame = body.starts_with("\r\n") ? std::string_view("\r\n")
                                                       : std::string_view("\n");
           value.remove_prefix(frame.size());
+          if (hold != std::string_view::npos)
+            value = body.substr(frame.size(), hold - frame.size());
           value = BeforePartialDelimiter(value, "\n</parameter>\n");
           value = BeforePartialDelimiter(value, "\n</parameter>\r\n");
           if (frame == "\r\n" && value.ends_with('\r'))
