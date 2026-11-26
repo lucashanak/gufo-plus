@@ -447,9 +447,16 @@ private:
   bool Moe(const DeviceLayer& l, const float* x, float* out,
            std::uint32_t n_tokens, std::string* error_msg,
            bool last_only = false) const;
+  /// Whether a decode MoE of `n_tokens` rows runs its top-k, routed input
+  /// quantization and grouping tables inside the shared-expert launches
+  /// (MoeSharedPrologue, MoeSharedDownGroups).
+  bool MoePrologue(const DeviceLayer& l, std::uint32_t n_tokens) const;
   /// Runs routed experts after the router and shared expert are ready.
+  /// `prologue`: Moe ran the MoePrologue launches for these rows, so the
+  /// routed vector kernels read s_.x_q8_moe and the grouping tables.
   bool MoeExperts(const DeviceLayer& l, const float* x, float* out,
-                  std::uint32_t n_tokens, std::string* error_msg) const;
+                  std::uint32_t n_tokens, std::string* error_msg,
+                  bool prologue = false) const;
   bool MoeBatch(const DeviceLayer& l, const float* x, float* out,
                 std::uint32_t rows, std::string* error) const;
   /// Selects the greedy token or compact candidates from full MTP logits.
@@ -481,6 +488,11 @@ private:
     void* x_half;   ///< activations narrowed to the weight's 16-bit type
     void* x_q8[2];  ///< Q8_1 activations of a decode batch, alternating
     void* x_q8t;    ///< tiled Q8 activations of a wide batch (W8A8 route)
+    /// Decode MoE prologue outputs (MoePrologue): the Q8_1 rows of the
+    /// routed gate/up input and both routed grouping tables.
+    void* x_q8_moe;
+    std::int32_t* slot_groups;
+    std::int32_t* row_groups;
     float* res;
     float* xn;  ///< RMSNorm of res, the input of the next sub-block
     float* block_out;

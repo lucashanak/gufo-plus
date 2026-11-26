@@ -572,9 +572,11 @@ void mul_mat_vec_moe_rows_grouped_dispatch(const void* weights, ggml_type type,
                                            const int32_t* ids, int32_t* groups,
                                            float* output, int k, int rows,
                                            int n_rows, int input_stride,
-                                           hipStream_t stream) {
+                                           hipStream_t stream,
+                                           bool groups_ready) {
   GGML_ASSERT(n_rows > 0 && n_rows <= 64 && k % ggml_blck_size(type) == 0);
-  group_moe_rows<<<1, 64, 0, stream>>>(ids, groups, n_rows);
+  if (!groups_ready)
+    group_moe_rows<<<1, 64, 0, stream>>>(ids, groups, n_rows);
   const dim3 grid((rows + 7) / 8, n_rows);
   const dim3 block(32, 4);
   switch (type) {
@@ -799,8 +801,9 @@ void mul_mat_vec_moe_gated(const void* gate, const void* up, ggml_type type,
                            const block_q8_1* input, const int32_t* ids,
                            int32_t* groups, float* output, int k, int rows,
                            int tokens, int experts_used, int input_stride,
-                           hipStream_t stream) {
+                           hipStream_t stream, bool groups_ready) {
   GGML_ASSERT(tokens > 0 && tokens <= MMVQ_MAX_ROUTED_BATCH);
+  GGML_ASSERT(!groups_ready || (tokens > 1 && tokens <= MMVQ_MAX_BATCH_SIZE));
   if (tokens > MMVQ_MAX_BATCH_SIZE) {
     GGML_ASSERT(type == GGML_TYPE_Q4_K && groups && experts_used <= 32);
     group_moe_batch<<<(tokens * experts_used + 127) / 128, 128, 0, stream>>>(
@@ -811,8 +814,9 @@ void mul_mat_vec_moe_gated(const void* gate, const void* up, ggml_type type,
   }
   if (tokens > 1) {
     GGML_ASSERT(groups && experts_used <= 32);
-    group_moe_slots<<<(tokens * experts_used + 127) / 128, 128, 0, stream>>>(
-        ids, groups, tokens, experts_used);
+    if (!groups_ready)
+      group_moe_slots<<<(tokens * experts_used + 127) / 128, 128, 0, stream>>>(
+          ids, groups, tokens, experts_used);
     if (type == GGML_TYPE_Q4_K) {
       launch_moe_grouped<GGML_TYPE_Q4_K>(gate, up, input, groups, output, k,
                                          rows, tokens, experts_used,

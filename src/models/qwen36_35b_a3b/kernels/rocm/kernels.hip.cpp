@@ -2155,6 +2155,182 @@ __global__ void RouterTopKKernel(const float* logits, std::uint32_t stride,
                             ids + t * k, weights + t * k, n_experts, k);
 }
 
+/// The vendored MMVQ tier's 36-byte block_q8_1: F16 scale and sum, then 32
+/// codes.
+struct Q8_1Block {
+  __half2 ds;
+  std::int8_t qs[32];
+};
+static_assert(sizeof(Q8_1Block) == 36, "block_q8_1 layout");
+
+// Literal copies of the tier's warp_reduce_max<32> and warp_reduce_sum<32>
+// (mmq/common.hpp), the reductions of its quantize_q8_1.
+__device__ __forceinline__ float Q8_1WarpMax(float x) {
+#pragma unroll
+  for (int offset = 32 / 2; offset > 0; offset >>= 1) {
+    x = fmaxf(x, __shfl_xor(x, offset, 32));
+  }
+  return x;
+}
+
+__device__ __forceinline__ float Q8_1WarpSum(float x) {
+#pragma unroll
+  for (int offset = 32 / 2; offset > 0; offset >>= 1) {
+    x += __shfl_xor(x, offset, 32);
+  }
+  return x;
+}
+
+/// One lane of the tier's quantize_q8_1 (mmq/quantize.hip.cpp), copied
+/// literally: the routed experts read these bytes in place of the tier's
+/// own, so they must be identical. `x` is the row (`ne00` values), `i0` the
+/// lane's element of the padded row and `i_cont` its index across all
+/// padded rows. All 32 lanes of a group call it together.
+__device__ __forceinline__ void QuantizeQ8_1Lane(const float* __restrict__ x,
+                                                 void* __restrict__ vy,
+                                                 const std::int64_t ne00,
+                                                 const std::int64_t i0,
+                                                 const std::int64_t i_cont) {
+  Q8_1Block* y = (Q8_1Block*)vy;
+
+  const std::int64_t ib = i_cont / 32;   // block index
+  const std::int64_t iqs = i_cont % 32;  // quant index
+
+  const float xi = i0 < ne00 ? x[i0] : 0.0f;
+  float amax = fabsf(xi);
+  float sum = xi;
+
+  amax = Q8_1WarpMax(amax);
+  sum = Q8_1WarpSum(sum);
+
+  const float d = amax / 127.0f;
+  const std::int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+  y[ib].qs[iqs] = q;
+
+  if (iqs > 0) {
+    return;
+  }
+
+  y[ib].ds = make_half2(d, sum);
+}
+
+/// group_moe_slots (mmq/mmvq.hip.cpp) for one anchor, copied verbatim: one
+/// anchor per expert, with each token's slot mask, for the gated vector
+/// kernels of 2-8 tokens. Layout groups[anchor * (tokens + 1)].
+__device__ __forceinline__ void GroupMoeSlot(const std::int32_t* ids,
+                                             std::int32_t* groups, int anchor,
+                                             int tokens, int experts_used) {
+  if (anchor >= tokens * experts_used)
+    return;
+  const int expert = ids[anchor];
+  std::int32_t* group = groups + anchor * (tokens + 1);
+  group[0] = -1;
+  if (expert < 0) {
+    group[0] = -2;
+    return;
+  }
+  for (int i = 0; i < anchor; ++i)
+    if (ids[i] == expert)
+      return;
+  group[0] = expert;
+  for (int t = 0; t < tokens; ++t) {
+    std::uint32_t slots = 0;
+    for (int j = 0; j < experts_used; ++j)
+      if (ids[t * experts_used + j] == expert)
+        slots |= std::uint32_t{1} << j;
+    group[t + 1] = static_cast<std::int32_t>(slots);
+  }
+}
+
+/// group_moe_rows (mmq/mmvq.hip.cpp) for one row, copied verbatim: the
+/// grouping of up to 64 single-expert down-projection rows. Layout
+/// groups[3 * row].
+__device__ __forceinline__ void GroupMoeRow(const std::int32_t* ids,
+                                            std::int32_t* groups, int row,
+                                            int n_rows) {
+  if (row >= n_rows)
+    return;
+  const int expert = ids[row];
+  std::int32_t* group = groups + 3 * row;
+  if (expert < 0) {
+    group[0] = -2;
+    return;
+  }
+  for (int i = 0; i < row; ++i) {
+    if (ids[i] == expert) {
+      group[0] = -1;
+      return;
+    }
+  }
+  std::uint64_t mask = 0;
+  for (int i = row; i < n_rows; ++i)
+    if (ids[i] == expert)
+      mask |= std::uint64_t{1} << i;
+  group[0] = expert;
+  group[1] = static_cast<std::int32_t>(static_cast<std::uint32_t>(mask));
+  group[2] = static_cast<std::int32_t>(static_cast<std::uint32_t>(mask >> 32));
+}
+
+/// Decode MoE prologue in the shared expert's gate/up launch. Block roles,
+/// first to last: kTokens RouterTopKKernel<512> rows; kTokens * chunks
+/// quantize_q8_1 blocks writing the routed gate/up input (one 256-value
+/// chunk of a row padded to chunks * 256 each, the tier's layout); then
+/// DenseQ6KVecKernel<kTokens, 1>'s blocks for the shared gate/up/SwiGLU.
+/// No role reads what another writes.
+template<unsigned kTokens>
+__launch_bounds__(256) __global__ void MoeSharedGateUpPrologueKernel(
+    const float* logits, std::uint32_t stride, std::int32_t* ids,
+    float* weights, std::uint32_t n_experts, std::uint32_t used,
+    const float* __restrict__ x, void* __restrict__ x_q8, std::uint32_t chunks,
+    const std::uint8_t* __restrict__ gate, const std::uint8_t* __restrict__ up,
+    float* __restrict__ y, std::uint32_t rows, std::uint32_t k) {
+  const std::uint32_t block = blockIdx.x;
+  const std::uint32_t quantize_end = kTokens + kTokens * chunks;
+  if (block < kTokens) {
+    RouterTopKRow<512>(logits + static_cast<std::size_t>(block) * stride,
+                       ids + block * used, weights + block * used, n_experts,
+                       used);
+  } else if (block < quantize_end) {
+    const std::uint32_t q = block - kTokens;
+    const std::uint32_t row = q / chunks;
+    const std::int64_t padded = static_cast<std::int64_t>(chunks) * 256;
+    const std::int64_t i0 =
+        static_cast<std::int64_t>(q % chunks) * 256 + threadIdx.x;
+    QuantizeQ8_1Lane(x + static_cast<std::size_t>(row) * k, x_q8, k, i0,
+                     row * padded + i0);
+  } else {
+    DenseQ6KVecRows<kTokens, 1>(block - quantize_end, gate, up, x, y, rows, k);
+  }
+}
+
+/// The shared expert's down launch with one leading block that writes the
+/// routed grouping tables from the top-k ids: group_moe_slots' table for
+/// the gated experts (slot_groups, 2-8 tokens) and group_moe_rows' for the
+/// down rows (row_groups, tokens * used rows). The other blocks are
+/// DenseQ6KVecKernel<kTokens, kRows>'s, ungated.
+template<unsigned kTokens, unsigned kRows>
+__launch_bounds__(256) __global__
+    void MoeSharedDownGroupsKernel(const std::uint8_t* __restrict__ w,
+                                   const float* __restrict__ x,
+                                   float* __restrict__ y, std::uint32_t rows,
+                                   std::uint32_t k,
+                                   const std::int32_t* __restrict__ ids,
+                                   std::uint32_t used,
+                                   std::int32_t* __restrict__ slot_groups,
+                                   std::int32_t* __restrict__ row_groups) {
+  if (blockIdx.x == 0) {
+    const int i = static_cast<int>(threadIdx.x);
+    if (slot_groups != nullptr)
+      GroupMoeSlot(ids, slot_groups, i, static_cast<int>(kTokens),
+                   static_cast<int>(used));
+    if (row_groups != nullptr)
+      GroupMoeRow(ids, row_groups, i, static_cast<int>(kTokens * used));
+  } else {
+    DenseQ6KVecRows<kTokens, kRows>(blockIdx.x - 1, w, nullptr, x, y, rows, k);
+  }
+}
+
 /// grid (tokens, dim chunks of kThreads).
 __global__ void MoeEpilogueKernel(const float* expert_out, const float* weights,
                                   const float* shared_out, const float* gate,
@@ -5204,6 +5380,84 @@ void RouterTopK(const float* logits, std::uint32_t stride, std::int32_t* ids,
     hipLaunchKernelGGL((RouterTopKKernel<1024>), dim3(n_tokens), dim3(kThreads),
                        0, stream, logits, stride, ids, weights, n_experts, k);
   }
+}
+
+bool MoeSharedPrologue(const float* logits, std::uint32_t stride,
+                       std::int32_t* ids, float* weights,
+                       std::uint32_t n_experts, std::uint32_t used,
+                       const float* x, void* x_q8, const void* gate,
+                       const void* up, float* y, std::uint32_t tokens,
+                       std::uint32_t rows, std::uint32_t k,
+                       hipStream_t stream) {
+  // RouterTopKRow<512> and DenseQ6KVecRows assume 256-thread blocks; a
+  // multiple of 512 is its own Q8_1 padding.
+  if (tokens == 0 || tokens > 8 || k % 512 != 0 || rows == 0 ||
+      n_experts == 0 || n_experts > 512 || used == 0 || used > 32 ||
+      gate == nullptr || up == nullptr || x_q8 == nullptr || kThreads != 256)
+    return false;
+  const auto* gb = static_cast<const std::uint8_t*>(gate);
+  const auto* ub = static_cast<const std::uint8_t*>(up);
+  const std::uint32_t chunks = k / 256;
+  // The shared gate/up keeps DenseQ6KVec's gated grid: one row per wave.
+  const dim3 grid(tokens + tokens * chunks + (rows + 7) / 8);
+  switch (tokens) {
+#define GUFO_MOE_PROLOGUE(T)                                                   \
+  case T:                                                                      \
+    hipLaunchKernelGGL((MoeSharedGateUpPrologueKernel<T>), grid, dim3(256), 0, \
+                       stream, logits, stride, ids, weights, n_experts, used,  \
+                       x, x_q8, chunks, gb, ub, y, rows, k);                   \
+    break;
+    GUFO_MOE_PROLOGUE(1)
+    GUFO_MOE_PROLOGUE(2)
+    GUFO_MOE_PROLOGUE(3)
+    GUFO_MOE_PROLOGUE(4)
+    GUFO_MOE_PROLOGUE(5)
+    GUFO_MOE_PROLOGUE(6)
+    GUFO_MOE_PROLOGUE(7)
+    GUFO_MOE_PROLOGUE(8)
+#undef GUFO_MOE_PROLOGUE
+  }
+  return true;
+}
+
+bool MoeSharedDownGroups(const void* w, const float* x, float* y,
+                         std::uint32_t tokens, std::uint32_t rows,
+                         std::uint32_t k, const std::int32_t* ids,
+                         std::uint32_t used, std::int32_t* slot_groups,
+                         std::int32_t* row_groups, hipStream_t stream) {
+  // The group block has one thread per slot anchor and per down row.
+  if (tokens == 0 || tokens > 8 || k % 512 != 0 || rows == 0 || used == 0 ||
+      ids == nullptr || kThreads != 256 ||
+      (slot_groups != nullptr && (tokens < 2 || used > 32)) ||
+      (row_groups != nullptr && (tokens * used < 2 || tokens * used > 64)))
+    return false;
+  const auto* wb = static_cast<const std::uint8_t*>(w);
+  // DenseQ6KVec's ungated choice: two rows per wave from two tokens.
+  const std::uint32_t per_wave = tokens >= 2 && rows >= 2048 ? 2 : 1;
+  const dim3 grid(1 + (rows + 8 * per_wave - 1) / (8 * per_wave));
+  switch (tokens) {
+#define GUFO_MOE_DOWN(T)                                                       \
+  case T:                                                                      \
+    if (per_wave == 2)                                                         \
+      hipLaunchKernelGGL((MoeSharedDownGroupsKernel<T, 2>), grid, dim3(256),   \
+                         0, stream, wb, x, y, rows, k, ids, used, slot_groups, \
+                         row_groups);                                          \
+    else                                                                       \
+      hipLaunchKernelGGL((MoeSharedDownGroupsKernel<T, 1>), grid, dim3(256),   \
+                         0, stream, wb, x, y, rows, k, ids, used, slot_groups, \
+                         row_groups);                                          \
+    break;
+    GUFO_MOE_DOWN(1)
+    GUFO_MOE_DOWN(2)
+    GUFO_MOE_DOWN(3)
+    GUFO_MOE_DOWN(4)
+    GUFO_MOE_DOWN(5)
+    GUFO_MOE_DOWN(6)
+    GUFO_MOE_DOWN(7)
+    GUFO_MOE_DOWN(8)
+#undef GUFO_MOE_DOWN
+  }
+  return true;
 }
 
 void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,

@@ -353,12 +353,18 @@ int q36_mmq_moe_impl(
     return 0;
 }
 
+// X_q8 (optional, gated 1-8 tokens) is X already quantized by
+// q36_mmq_quantize_q8_1's layout. ready_groups (optional) already holds the
+// grouping table this call would build: group_moe_slots' for gated 2-8
+// tokens, group_moe_rows' for grouped single-expert rows.
 static int moe_vector_projection(int weight_type, const void* W,
                                  const float* X_f32, const int32_t* ids,
                                  float* out_f32, int M, int K, int n_tokens,
                                  int n_experts, int n_expert_used,
                                  hipStream_t stream, const void* W_b,
-                                 float* out_b, bool gated) {
+                                 float* out_b, bool gated,
+                                 const void* X_q8 = nullptr,
+                                 const int32_t* ready_groups = nullptr) {
   constexpr const char* tag = "q36_mmq_moe_vec";
   const auto type = static_cast<ggml_type>(weight_type);
   if (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K &&
@@ -368,7 +374,7 @@ static int moe_vector_projection(int weight_type, const void* W,
     return -1;
   }
 
-  if (!W || !X_f32 || !ids || !out_f32 ||
+  if (!W || !(X_f32 || X_q8) || !ids || !out_f32 ||
       (gated ? !W_b : bool(W_b) != bool(out_b))) {
     fprintf(stderr, "%s: null pointer\n", tag);
     return -1;
@@ -415,6 +421,14 @@ static int moe_vector_projection(int weight_type, const void* W,
       !gated && !W_b && n_expert_used == 1 && n_tokens > 1 && n_tokens <= 64 &&
       (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
        type == GGML_TYPE_Q6_K);
+  if ((X_q8 && !(gated && n_tokens <= MMVQ_MAX_BATCH_SIZE)) ||
+      (ready_groups &&
+       !(gated ? n_tokens > 1 && n_tokens <= MMVQ_MAX_BATCH_SIZE
+               : grouped_rows))) {
+    fprintf(stderr, "%s: precomputed input or groups do not fit this call\n",
+            tag);
+    return -1;
+  }
   const size_t group_bytes =
       grouped_rows ? size_t(n_tokens) * 3 * sizeof(int32_t)
       : gated && n_tokens > 1
@@ -425,30 +439,38 @@ static int moe_vector_projection(int weight_type, const void* W,
                        sizeof(int32_t))
           : 0;
   ggml_hip_pool_alloc<char> src1_q8_1_pool;
-  src1_q8_1_pool.alloc(ctx->pool(), nbytes_q8_1 + group_bytes);
-  char* src1_q8_1_ptr = src1_q8_1_pool.get();
+  const char* input = static_cast<const char*>(X_q8);
+  int32_t* groups = const_cast<int32_t*>(ready_groups);
+  hipError_t err = hipSuccess;
+  if (!input || (!groups && group_bytes)) {
+    src1_q8_1_pool.alloc(ctx->pool(), nbytes_q8_1 + group_bytes);
+    char* src1_q8_1_ptr = src1_q8_1_pool.get();
+    if (!groups)
+      groups = reinterpret_cast<int32_t*>(src1_q8_1_ptr + nbytes_q8_1);
+    if (!input) {
+      quantize_row_q8_1_hip(X_f32, nullptr, (void*)src1_q8_1_ptr, type, K,
+                            (int64_t)K, (int64_t)K, (int64_t)K * n_tokens,
+                            ne10_padded, 1, n_tokens, 1, stream);
 
-  quantize_row_q8_1_hip(X_f32, nullptr, (void*)src1_q8_1_ptr, type, K,
-                        (int64_t)K, (int64_t)K, (int64_t)K * n_tokens,
-                        ne10_padded, 1, n_tokens, 1, stream);
-
-  hipError_t err = hipGetLastError();
-  if (err != hipSuccess) {
-    fprintf(stderr, "%s: quantize_row_q8_1_hip failed: %s\n", tag,
-            hipGetErrorString(err));
-    return -2;
+      err = hipGetLastError();
+      if (err != hipSuccess) {
+        fprintf(stderr, "%s: quantize_row_q8_1_hip failed: %s\n", tag,
+                hipGetErrorString(err));
+        return -2;
+      }
+      input = src1_q8_1_ptr;
+    }
   }
 
   const int input_stride = ne10_padded / QK8_1;
   if (gated) {
     if (n_tokens > MMVQ_MAX_BATCH_SIZE &&
-        hipMemsetAsync(src1_q8_1_ptr + nbytes_q8_1, 0, sizeof(int32_t),
-                       stream) != hipSuccess)
+        hipMemsetAsync(groups, 0, sizeof(int32_t), stream) != hipSuccess)
       return -2;
-    mul_mat_vec_moe_gated(
-        W, W_b, type, reinterpret_cast<const block_q8_1*>(src1_q8_1_ptr), ids,
-        reinterpret_cast<int32_t*>(src1_q8_1_ptr + nbytes_q8_1), out_f32, K, M,
-        n_tokens, n_expert_used, input_stride, stream);
+    mul_mat_vec_moe_gated(W, W_b, type,
+                          reinterpret_cast<const block_q8_1*>(input), ids,
+                          groups, out_f32, K, M, n_tokens, n_expert_used,
+                          input_stride, stream, ready_groups != nullptr);
     err = hipGetLastError();
     if (err != hipSuccess) {
       fprintf(stderr, "%s: gated vector launch failed: %s\n", tag,
@@ -459,9 +481,8 @@ static int moe_vector_projection(int weight_type, const void* W,
   }
   if (grouped_rows) {
     mul_mat_vec_moe_rows_grouped_dispatch(
-        W, type, reinterpret_cast<const block_q8_1*>(src1_q8_1_ptr), ids,
-        reinterpret_cast<int32_t*>(src1_q8_1_ptr + nbytes_q8_1), out_f32, K, M,
-        n_tokens, input_stride, stream);
+        W, type, reinterpret_cast<const block_q8_1*>(input), ids, groups,
+        out_f32, K, M, n_tokens, input_stride, stream, ready_groups != nullptr);
     err = hipGetLastError();
     if (err != hipSuccess) {
       fprintf(stderr, "%s: grouped vector launch failed: %s\n", tag,
@@ -476,7 +497,7 @@ static int moe_vector_projection(int weight_type, const void* W,
     const void* weights = projection == 0 ? W : W_b;
     float* output = projection == 0 ? out_f32 : out_b;
     mul_mat_vec_moe_dispatch(
-        weights, type, reinterpret_cast<const block_q8_1*>(src1_q8_1_ptr), ids,
+        weights, type, reinterpret_cast<const block_q8_1*>(input), ids,
         output, K, M, n_tokens, n_expert_used, input_stride, stream);
 
     err = hipGetLastError();
@@ -509,6 +530,34 @@ extern "C" int q36_mmq_moe_gated_vec(int weight_type, const void* gate,
   return moe_vector_projection(weight_type, gate, x, ids, out, m, k, tokens,
                                experts, experts_used, stream, up, nullptr,
                                true);
+}
+
+extern "C" int q36_mmq_moe_gated_vec_preq(
+    int weight_type, const void* gate, const void* up, const void* x_q8_1,
+    const int32_t* slot_groups, const int32_t* ids, float* out, int m, int k,
+    int tokens, int experts, int experts_used, hipStream_t stream) {
+  if (!x_q8_1 || (tokens > 1) != (slot_groups != nullptr)) {
+    fprintf(stderr, "q36_mmq_moe_gated_vec_preq: missing input or groups\n");
+    return -1;
+  }
+  return moe_vector_projection(weight_type, gate, nullptr, ids, out, m, k,
+                               tokens, experts, experts_used, stream, up,
+                               nullptr, true, x_q8_1, slot_groups);
+}
+
+extern "C" int q36_mmq_moe_vec_groups(int weight_type, const void* W,
+                                      const float* X_f32, const int32_t* ids,
+                                      const int32_t* row_groups, float* out,
+                                      int M, int K, int n_tokens,
+                                      int n_experts, int n_expert_used,
+                                      hipStream_t stream) {
+  if (!row_groups) {
+    fprintf(stderr, "q36_mmq_moe_vec_groups: missing groups\n");
+    return -1;
+  }
+  return moe_vector_projection(weight_type, W, X_f32, ids, out, M, K,
+                               n_tokens, n_experts, n_expert_used, stream,
+                               nullptr, nullptr, false, nullptr, row_groups);
 }
 
 extern "C" int q36_mmq_q8_0_moe_raw(const void* W, const float* X,

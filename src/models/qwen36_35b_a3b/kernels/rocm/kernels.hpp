@@ -366,6 +366,31 @@ void RouterTopK(const float* logits, std::uint32_t stride, std::int32_t* ids,
                 float* weights, std::uint32_t n_tokens, std::uint32_t n_experts,
                 std::uint32_t k, hipStream_t stream);
 
+/// Decode MoE prologue for 1-8 rows in one launch, three independent block
+/// roles: RouterTopK over `logits` (n_experts <= 512, used <= 32); the
+/// routed gate/up input x quantized to Q8_1 into x_q8, byte for byte what
+/// q36_mmq_quantize_q8_1(x, x_q8, tokens, k) writes; and DenseQ6KVec(gate,
+/// x, y, tokens, rows, k, stream, up), the shared expert's SwiGLU rows.
+/// False (nothing launched) unless k is a multiple of 512.
+bool MoeSharedPrologue(const float* logits, std::uint32_t stride,
+                       std::int32_t* ids, float* weights,
+                       std::uint32_t n_experts, std::uint32_t used,
+                       const float* x, void* x_q8, const void* gate,
+                       const void* up, float* y, std::uint32_t tokens,
+                       std::uint32_t rows, std::uint32_t k, hipStream_t stream);
+
+/// DenseQ6KVec(w, x, y, tokens, rows, k, stream) plus one block that writes,
+/// from ids [tokens][used], the grouping tables the routed vector kernels
+/// otherwise build themselves: slot_groups for the gated experts (2-8
+/// tokens, used <= 32; tokens * used * (tokens + 1) values) and row_groups
+/// for the down rows (2-64 rows of tokens * used; 3 values each). Either
+/// table may be null. False (nothing launched) for unsupported shapes.
+bool MoeSharedDownGroups(const void* w, const float* x, float* y,
+                         std::uint32_t tokens, std::uint32_t rows,
+                         std::uint32_t k, const std::int32_t* ids,
+                         std::uint32_t used, std::int32_t* slot_groups,
+                         std::int32_t* row_groups, hipStream_t stream);
+
 /// out[t][i] = sum_s weights[t][s] * expert_out[t*k + s][i]
 ///           + sigmoid(gate[t * gate_stride]) * shared[t][i].
 void MoeEpilogue(const float* expert_out, const float* weights,

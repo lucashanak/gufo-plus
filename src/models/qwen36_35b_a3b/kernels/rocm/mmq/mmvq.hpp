@@ -31,17 +31,21 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
                              int input_stride, hipStream_t stream);
 // Routed rows with one expert each, up to 64: each distinct expert's weights
 // are read once. Results equal mul_mat_vec_moe_dispatch with one expert.
+// With groups_ready, groups already holds group_moe_rows' table for ids.
 void mul_mat_vec_moe_rows_grouped_dispatch(const void* weights, ggml_type type,
                                            const block_q8_1* input,
                                            const int32_t* ids, int32_t* groups,
                                            float* output, int k, int rows,
                                            int n_rows, int input_stride,
-                                           hipStream_t stream);
+                                           hipStream_t stream,
+                                           bool groups_ready = false);
+// With groups_ready (2-8 tokens), groups already holds group_moe_slots'
+// table for ids.
 void mul_mat_vec_moe_gated(const void* gate, const void* up, ggml_type type,
                            const block_q8_1* input, const int32_t* ids,
                            int32_t* groups, float* output, int k, int rows,
                            int tokens, int experts_used, int input_stride,
-                           hipStream_t stream);
+                           hipStream_t stream, bool groups_ready = false);
 
 void mul_mat_vec_moe_batch_wave64(const void* gate, const void* up,
                                  const block_q8_1* input, const int32_t* groups,

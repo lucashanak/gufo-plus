@@ -43,6 +43,28 @@ int q36_mmq_moe_gated_vec(int weight_type, const void* gate, const void* up,
                           int k, int tokens, int experts, int experts_used,
                           hipStream_t stream);
 
+// q36_mmq_moe_gated_vec for 1-8 tokens over x already quantized as
+// q36_mmq_quantize_q8_1(x, x_q8_1, tokens, k) writes it. For 2-8 tokens,
+// slot_groups holds the gated grouping table for ids (MoeSharedDownGroups);
+// for one token it is null. Same kernels and results as the unquantized
+// entry, without its quantization and grouping launches.
+int q36_mmq_moe_gated_vec_preq(int weight_type, const void* gate,
+                               const void* up, const void* x_q8_1,
+                               const int32_t* slot_groups, const int32_t* ids,
+                               float* out, int m, int k, int tokens,
+                               int experts, int experts_used,
+                               hipStream_t stream);
+
+// q36_mmq_moe_vec for 2-64 single-expert Q4_K/Q5_K/Q6_K rows
+// (n_expert_used 1) whose grouping table row_groups was already written
+// for ids (MoeSharedDownGroups). Same kernels and results, without the
+// grouping launch.
+int q36_mmq_moe_vec_groups(int weight_type, const void* W, const float* X_f32,
+                           const int32_t* ids, const int32_t* row_groups,
+                           float* out, int M, int K, int n_tokens,
+                           int n_experts, int n_expert_used,
+                           hipStream_t stream);
+
 size_t q36_mmq_q8_1_bytes(int N, int K);
 
 int q36_mmq_quantize_q8_1(const float* X_f32, void* X_q8, int N, int K,

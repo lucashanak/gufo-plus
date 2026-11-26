@@ -98,6 +98,8 @@ bool MatrixRows(std::uint32_t rows) {
 bool ExpertMatrixRows(std::uint32_t rows) {
   return prefill_phase || rows > 4 * kVecBatch;
 }
+/// The routed vector tier groups at most this many single-expert down rows.
+constexpr std::uint32_t kMoeGroupRows = 64;
 
 /// Key-tile splits of a narrow attention batch (decode at depth). Fixed, so
 /// a row's reduction order does not depend on the batch or context.
@@ -367,6 +369,16 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   }
   s.x_q8t =
       Alloc<std::uint8_t>(a, Q8TiledBytes(T, model.max_q8_cols()), error_msg);
+  s.x_q8_moe =
+      Alloc<std::uint8_t>(a,
+                          q36_mmq_q8_1_bytes(static_cast<int>(kVecBatch),
+                                             static_cast<int>(c.hidden_size)),
+                          error_msg);
+  s.slot_groups = Alloc<std::int32_t>(a,
+                                      static_cast<std::size_t>(kVecBatch) *
+                                          c.num_experts_used * (kVecBatch + 1),
+                                      error_msg);
+  s.row_groups = Alloc<std::int32_t>(a, 3 * kMoeGroupRows, error_msg);
   s.res = f32(T * hidden);
   s.xn = f32(T * hidden);
   s.block_out = f32(T * hidden);
@@ -1454,6 +1466,24 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   if (!Dense(l.router, x, s_.router, n_tokens, error_msg)) {
     return false;
   }
+  if (!last_only && MoePrologue(l, n_tokens)) {
+    // Decode rows: top-k and the routed input's Q8_1 rows run as extra
+    // blocks of the shared gate/up launch, the grouping tables as one of
+    // the shared down launch. Neither shared projection reads them.
+    shexp_half_ready_ = false;
+    if (!MoeSharedPrologue(
+            s_.router, c.num_experts + 1, s_.ids, s_.weights, c.num_experts,
+            used, x, s_.x_q8_moe, l.shexp_gate.data, l.shexp_up.data,
+            s_.shexp_up, n_tokens, l.shexp_up.rows, l.shexp_up.cols, stream_) ||
+        !MoeSharedDownGroups(
+            l.shexp_down.data, s_.shexp_up, s_.shexp_out, n_tokens,
+            l.shexp_down.rows, l.shexp_down.cols, s_.ids, used,
+            n_tokens > 1 ? s_.slot_groups : nullptr, s_.row_groups, stream_)) {
+      AssignError(error_msg, "MoE prologue rejected its shape");
+      return false;
+    }
+    return MoeExperts(l, x, out, n_tokens, error_msg, true);
+  }
   RouterTopK(s_.router, c.num_experts + 1, s_.ids, s_.weights, n_tokens,
              c.num_experts, used, stream_);
   if (ExpertMatrixRows(n_tokens)) {
@@ -1510,9 +1540,42 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   return MoeExperts(l, x, out, n_tokens, error_msg);
 }
 
+bool Executor::MoePrologue(const DeviceLayer& l, std::uint32_t n_tokens) const {
+  // Exactly the shapes for which Moe would otherwise run RouterTopK<512>,
+  // DenseQ6KVec for the shared gate/up and down, the gated routed vector
+  // kernels and the grouped down rows, each quantizing or grouping itself.
+  const Config& c = config();
+  const std::uint32_t used = c.num_experts_used;
+  const DeviceTensor& gate = l.ffn_gate_exps;
+  const DeviceTensor& up = l.ffn_up_exps;
+  const DeviceTensor& down = l.ffn_down_exps;
+  const bool shared_q6k =
+      l.shexp_up.type == GgmlType::kQ6_K &&
+      l.shexp_gate.type == GgmlType::kQ6_K &&
+      l.shexp_down.type == GgmlType::kQ6_K &&
+      l.shexp_up.rows == l.shexp_gate.rows &&
+      l.shexp_up.cols == l.shexp_gate.cols &&
+      l.shexp_up.cols == c.hidden_size && l.shexp_up.cols % 512 == 0 &&
+      l.shexp_down.cols == l.shexp_up.rows && l.shexp_down.cols % 512 == 0;
+  const bool gated_vec =
+      gate.type == up.type && gate.rows == up.rows && gate.cols == up.cols &&
+      gate.experts == up.experts && gate.cols == c.hidden_size &&
+      (gate.type == GgmlType::kQ4_K || gate.type == GgmlType::kQ5_K ||
+       gate.type == GgmlType::kQ8_0);
+  const std::uint32_t slots = n_tokens * used;
+  const bool grouped_down =
+      (down.type == GgmlType::kQ4_K || down.type == GgmlType::kQ5_K ||
+       down.type == GgmlType::kQ6_K) &&
+      down.cols == gate.rows && slots > 1 && slots <= kMoeGroupRows;
+  return n_tokens >= 1 && n_tokens <= kVecBatch && !MatrixRows(n_tokens) &&
+         !ExpertMatrixRows(n_tokens) && used >= 1 && used <= 32 &&
+         c.num_experts >= 1 && c.num_experts <= 512 && shared_q6k &&
+         gated_vec && grouped_down;
+}
+
 bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
-                          std::uint32_t n_tokens,
-                          std::string* error_msg) const {
+                          std::uint32_t n_tokens, std::string* error_msg,
+                          bool prologue) const {
   const Config& c = config();
   const std::uint32_t used = c.num_experts_used;
   const std::uint32_t slots = n_tokens * used;
@@ -1596,6 +1659,28 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
                        reinterpret_cast<__half*>(s_.down_e), c.hidden_size,
                        c.expert_ff, stream_)) {
       AssignError(error_msg, "routed F16 down GEMM failed");
+      return false;
+    }
+  } else if (prologue) {
+    // GatedExperts' and Experts' vector calls for these rows, reading the
+    // quantized input and grouping tables the shared-expert launches wrote.
+    const DeviceTensor& a = l.ffn_gate_exps;
+    const DeviceTensor& d = l.ffn_down_exps;
+    if (q36_mmq_moe_gated_vec_preq(
+            static_cast<int>(a.type), a.data, l.ffn_up_exps.data, s_.x_q8_moe,
+            n_tokens > 1 ? s_.slot_groups : nullptr, s_.ids, s_.gate_e,
+            static_cast<int>(a.rows), static_cast<int>(a.cols),
+            static_cast<int>(n_tokens), static_cast<int>(a.experts),
+            static_cast<int>(used), stream_) != 0) {
+      AssignError(error_msg, "gated expert vector projection failed");
+      return false;
+    }
+    if (q36_mmq_moe_vec_groups(
+            static_cast<int>(d.type), d.data, s_.gate_e, s_.ids, s_.row_groups,
+            s_.down_e, static_cast<int>(d.rows), static_cast<int>(d.cols),
+            static_cast<int>(slots), static_cast<int>(d.experts), 1,
+            stream_) != 0) {
+      AssignError(error_msg, "expert GEMM failed");
       return false;
     }
   } else {
