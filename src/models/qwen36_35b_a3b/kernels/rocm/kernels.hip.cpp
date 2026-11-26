@@ -258,49 +258,64 @@ __device__ __forceinline__ void Q6KRowsDot(const std::uint8_t* __restrict__ w0,
 /// Each wave computes kRows consecutive rows. With `up`, w is the gate and
 /// each output is SiLU(gate) * up, in SwigluKernel's arithmetic; the two
 /// rows are separate sums as in two ungated projections.
+/// One 256-thread block's share (`block` in place of blockIdx.x), with no
+/// early exit, so a larger kernel can run it as one of its block roles.
+template<unsigned kTokens, unsigned kRows>
+__device__ __forceinline__ void DenseQ6KVecRows(
+    std::uint32_t block, const std::uint8_t* __restrict__ w,
+    const std::uint8_t* __restrict__ up, const float* __restrict__ x,
+    float* __restrict__ y, std::uint32_t rows, std::uint32_t k) {
+  const std::uint32_t lane = threadIdx.x % warpSize;
+  const std::uint32_t row0 =
+      (block * (blockDim.x / warpSize) + threadIdx.x / warpSize) * kRows;
+  if (row0 < rows) {
+    const std::size_t row_bytes = static_cast<std::size_t>(k / 256) * 210;
+    bool ragged = false;
+    // A ragged tail recomputes the last row; only real rows are written.
+    if constexpr (kRows > 1) {
+      ragged = row0 + kRows > rows;
+      if (ragged) {
+        for (std::uint32_t r = row0; r < rows; ++r) {
+          float one[1][kTokens] = {};
+          Q6KRowsDot<kTokens, 1>(w + r * row_bytes, row_bytes, x, k, lane, one);
+          if (lane == 0)
+            for (unsigned t = 0; t < kTokens; ++t)
+              y[static_cast<std::size_t>(t) * rows + r] = one[0][t];
+        }
+      }
+    }
+    if (!ragged) {
+      float acc[kRows][kTokens] = {};
+      Q6KRowsDot<kTokens, kRows>(w + row0 * row_bytes, row_bytes, x, k, lane,
+                                 acc);
+      if (up != nullptr) {
+        float u[kRows][kTokens] = {};
+        Q6KRowsDot<kTokens, kRows>(up + row0 * row_bytes, row_bytes, x, k, lane,
+                                   u);
+#pragma unroll
+        for (unsigned r = 0; r < kRows; ++r)
+#pragma unroll
+          for (unsigned t = 0; t < kTokens; ++t)
+            acc[r][t] = SiluF(acc[r][t]) * u[r][t];
+      }
+      if (lane == 0) {
+#pragma unroll
+        for (unsigned r = 0; r < kRows; ++r)
+#pragma unroll
+          for (unsigned t = 0; t < kTokens; ++t)
+            y[static_cast<std::size_t>(t) * rows + row0 + r] = acc[r][t];
+      }
+    }
+  }
+}
+
 template<unsigned kTokens, unsigned kRows>
 __launch_bounds__(256) __global__
     void DenseQ6KVecKernel(const std::uint8_t* __restrict__ w,
                            const std::uint8_t* __restrict__ up,
                            const float* __restrict__ x, float* __restrict__ y,
                            std::uint32_t rows, std::uint32_t k) {
-  const std::uint32_t lane = threadIdx.x % warpSize;
-  const std::uint32_t row0 =
-      (blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize) * kRows;
-  if (row0 >= rows)
-    return;
-  const std::size_t row_bytes = static_cast<std::size_t>(k / 256) * 210;
-  // A ragged tail recomputes the last row; only real rows are written.
-  if constexpr (kRows > 1) {
-    if (row0 + kRows > rows) {
-      for (std::uint32_t r = row0; r < rows; ++r) {
-        float one[1][kTokens] = {};
-        Q6KRowsDot<kTokens, 1>(w + r * row_bytes, row_bytes, x, k, lane, one);
-        if (lane == 0)
-          for (unsigned t = 0; t < kTokens; ++t)
-            y[static_cast<std::size_t>(t) * rows + r] = one[0][t];
-      }
-      return;
-    }
-  }
-  float acc[kRows][kTokens] = {};
-  Q6KRowsDot<kTokens, kRows>(w + row0 * row_bytes, row_bytes, x, k, lane, acc);
-  if (up != nullptr) {
-    float u[kRows][kTokens] = {};
-    Q6KRowsDot<kTokens, kRows>(up + row0 * row_bytes, row_bytes, x, k, lane, u);
-#pragma unroll
-    for (unsigned r = 0; r < kRows; ++r)
-#pragma unroll
-      for (unsigned t = 0; t < kTokens; ++t)
-        acc[r][t] = SiluF(acc[r][t]) * u[r][t];
-  }
-  if (lane == 0) {
-#pragma unroll
-    for (unsigned r = 0; r < kRows; ++r)
-#pragma unroll
-      for (unsigned t = 0; t < kTokens; ++t)
-        y[static_cast<std::size_t>(t) * rows + row0 + r] = acc[r][t];
-  }
+  DenseQ6KVecRows<kTokens, kRows>(blockIdx.x, w, up, x, y, rows, k);
 }
 
 /// Q4_K/Q5_K sub-block scale and min (ggml get_scale_min_k4).
@@ -2050,16 +2065,18 @@ __global__ void AttentionMergeKernel(const float* partials, float* out,
 
 // Keep the original block-wide softmax reduction. Selection then stays in
 // one wave's registers, retaining probability ordering and lowest-index ties.
+// Every thread of a 256-thread block calls it for one row (`ids`/`weights`
+// point at the row's k slots). It has no early exit and ends on a barrier,
+// so a block may call it from one role of a larger kernel.
 template<unsigned MaxExperts>
-__global__ void RouterTopKKernel(const float* logits, std::uint32_t stride,
-                                 std::int32_t* ids, float* weights,
-                                 std::uint32_t n_experts, std::uint32_t k) {
+__device__ __forceinline__ void RouterTopKRow(const float* src,
+                                              std::int32_t* ids, float* weights,
+                                              std::uint32_t n_experts,
+                                              std::uint32_t k) {
   __shared__ float probs[1024];
   __shared__ float shared[32];
   __shared__ std::uint32_t chosen[32];
   __shared__ float chosen_p[32];
-  const std::uint32_t t = blockIdx.x;
-  const float* src = logits + static_cast<std::size_t>(t) * stride;
   float local_max = -INFINITY;
   for (std::uint32_t e = threadIdx.x; e < n_experts; e += blockDim.x) {
     local_max = fmaxf(local_max, src[e]);
@@ -2076,56 +2093,66 @@ __global__ void RouterTopKKernel(const float* logits, std::uint32_t stride,
   }
   __syncthreads();
 
-  if (threadIdx.x >= 32)
-    return;
-  constexpr unsigned Items = MaxExperts / 32;
-  float values[Items];
-#pragma unroll
-  for (unsigned j = 0; j < Items; ++j) {
-    unsigned e = threadIdx.x + j * 32;
-    values[j] = e < n_experts ? probs[e] : -1.0f;
-  }
-  for (unsigned slot = 0; slot < k; ++slot) {
-    float best = -1.0f;
-    unsigned index = 0xffffffffu;
+  if (threadIdx.x < 32) {
+    constexpr unsigned Items = MaxExperts / 32;
+    float values[Items];
 #pragma unroll
     for (unsigned j = 0; j < Items; ++j) {
       unsigned e = threadIdx.x + j * 32;
-      if (values[j] > best) {
-        best = values[j];
-        index = e;
-      }
+      values[j] = e < n_experts ? probs[e] : -1.0f;
     }
+    for (unsigned slot = 0; slot < k; ++slot) {
+      float best = -1.0f;
+      unsigned index = 0xffffffffu;
 #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      float other = __shfl_xor(best, offset);
-      unsigned oi = __shfl_xor(index, offset);
-      if (other > best || (other == best && oi < index)) {
-        best = other;
-        index = oi;
+      for (unsigned j = 0; j < Items; ++j) {
+        unsigned e = threadIdx.x + j * 32;
+        if (values[j] > best) {
+          best = values[j];
+          index = e;
+        }
+      }
+#pragma unroll
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        float other = __shfl_xor(best, offset);
+        unsigned oi = __shfl_xor(index, offset);
+        if (other > best || (other == best && oi < index)) {
+          best = other;
+          index = oi;
+        }
+      }
+      if (threadIdx.x == 0) {
+        chosen[slot] = index;
+        chosen_p[slot] = best;
+      }
+#pragma unroll
+      for (unsigned j = 0; j < Items; ++j) {
+        if (threadIdx.x + j * 32 == index)
+          values[j] = -1.0f;
       }
     }
     if (threadIdx.x == 0) {
-      chosen[slot] = index;
-      chosen_p[slot] = best;
-    }
-#pragma unroll
-    for (unsigned j = 0; j < Items; ++j) {
-      if (threadIdx.x + j * 32 == index)
-        values[j] = -1.0f;
-    }
-  }
-  if (threadIdx.x == 0) {
-    float sum = 0.0f;
-    for (std::uint32_t slot = 0; slot < k; ++slot) {
-      sum += chosen_p[slot];
-    }
-    sum = fmaxf(sum, 6.103515625e-5f);
-    for (std::uint32_t slot = 0; slot < k; ++slot) {
-      ids[t * k + slot] = static_cast<std::int32_t>(chosen[slot]);
-      weights[t * k + slot] = chosen_p[slot] / sum;
+      float sum = 0.0f;
+      for (std::uint32_t slot = 0; slot < k; ++slot) {
+        sum += chosen_p[slot];
+      }
+      sum = fmaxf(sum, 6.103515625e-5f);
+      for (std::uint32_t slot = 0; slot < k; ++slot) {
+        ids[slot] = static_cast<std::int32_t>(chosen[slot]);
+        weights[slot] = chosen_p[slot] / sum;
+      }
     }
   }
+  __syncthreads();
+}
+
+template<unsigned MaxExperts>
+__global__ void RouterTopKKernel(const float* logits, std::uint32_t stride,
+                                 std::int32_t* ids, float* weights,
+                                 std::uint32_t n_experts, std::uint32_t k) {
+  const std::uint32_t t = blockIdx.x;
+  RouterTopKRow<MaxExperts>(logits + static_cast<std::size_t>(t) * stride,
+                            ids + t * k, weights + t * k, n_experts, k);
 }
 
 /// grid (tokens, dim chunks of kThreads).
