@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 #include "src/families/qwen/hip_common/attention_policy.hpp"
 #include "src/families/qwen/kernels/attention_decode_split_k.hpp"
@@ -130,8 +131,9 @@ __launch_bounds__(192) __global__
 // the per-row kernels bit for bit. The block walks the union of its rows'
 // partitions, loads the next tile into registers while the current one is
 // consumed, and scores two tokens before their in-order softmax steps.
-// 8-bit rows dequantize while fetching, so the tile holds the f16(scale *
-// code) values the per-row Kv8 kernel stages and the arithmetic is unchanged.
+// 8-bit rows prefetch the raw codes and scales and dequantize them while
+// staging, so the tile holds the f16(scale * code) values the per-row Kv8
+// kernel stages and the arithmetic is unchanged.
 template<unsigned Rows, unsigned Lanes, unsigned Tile, bool Kv8>
 __launch_bounds__(Rows * 6 * Lanes) __global__
     void QwenVerifySharedRowsAttentionPartialsKernel(
@@ -190,7 +192,11 @@ __launch_bounds__(Rows * 6 * Lanes) __global__
   const unsigned stage_token = threadIdx.x / vectors_per_token;
   const unsigned stage_element = (threadIdx.x % vectors_per_token) * 8;
   const bool stages = stage_token < Tile;
-  uint4 next_key, next_value;
+  // 8-bit rows hold the undecoded bytes across the tile (at most six
+  // registers instead of eight), and their dequantization waits until
+  // staging so the loads stay in flight while the current tile is scored.
+  using Prefetch = std::conditional_t<Kv8, kv8::Codes8, uint4>;
+  Prefetch next_key, next_value;
   // A tail tile restages the last token in its unused slots; no row reads
   // them, and every load stays inside the union.
   const auto fetch = [&](std::size_t begin) {
@@ -203,10 +209,10 @@ __launch_bounds__(Rows * 6 * Lanes) __global__
         const auto in_row =
             static_cast<std::uint32_t>(kv_head * head_dim + stage_element);
         const auto width = static_cast<std::uint32_t>(kv_width);
-        next_key = kv8::LoadHalf8(
+        next_key = kv8::LoadCodes8(
             reinterpret_cast<const std::uint8_t*>(k_cache) + row_offset, width,
             in_row);
-        next_value = kv8::LoadHalf8(
+        next_value = kv8::LoadCodes8(
             reinterpret_cast<const std::uint8_t*>(v_cache) + row_offset, width,
             in_row);
       } else {
@@ -222,9 +228,16 @@ __launch_bounds__(Rows * 6 * Lanes) __global__
   for (std::size_t begin = union_begin; begin < union_end; begin += Tile) {
     const std::size_t tile_end = min(begin + Tile, union_end);
     if (stages) {
-      *reinterpret_cast<uint4*>(keys[stage_token] + stage_element) = next_key;
-      *reinterpret_cast<uint4*>(values[stage_token] + stage_element) =
-          next_value;
+      if constexpr (Kv8) {
+        *reinterpret_cast<uint4*>(keys[stage_token] + stage_element) =
+            kv8::DequantHalf8(next_key);
+        *reinterpret_cast<uint4*>(values[stage_token] + stage_element) =
+            kv8::DequantHalf8(next_value);
+      } else {
+        *reinterpret_cast<uint4*>(keys[stage_token] + stage_element) = next_key;
+        *reinterpret_cast<uint4*>(values[stage_token] + stage_element) =
+            next_value;
+      }
     }
     __syncthreads();
     if (tile_end < union_end) {
@@ -307,7 +320,11 @@ void LaunchVerifySplitKAttentionHalfPartialsWave64(
     }
   };
   if (kv8) {
-    if (shared_rows.template operator()<true>())
+    // Below the F16 path's shared-KV threshold, 8-bit rows keep the per-row
+    // kernel they ran before sharing (short contexts: unmeasured either way).
+    if (static_cast<std::size_t>(start_pos) + 1 >=
+            kSharedKvDecodeAttentionMinContext &&
+        shared_rows.template operator()<true>())
       return;
     QwenVerifySplitKAttentionHalfPartialsWave64Kernel<true>
         <<<dim3(num_kv_heads / 2, rows, splits), 192, 0, stream>>>(

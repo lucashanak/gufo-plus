@@ -90,17 +90,37 @@ __device__ __forceinline__ float4 LoadFloat4(const std::uint8_t* row,
                      __high2float(hi));
 }
 
+/// The bytes LoadHalf8 reads: eight codes and the scale of their block.
+struct Codes8 {
+  uint2 codes;
+  __half scale;
+};
+
+/// Eight consecutive codes starting at `element` (a multiple of eight) of a
+/// row of `width` values, with their block's scale, still quantized. Kernels
+/// that prefetch into registers keep these and call DequantHalf8 later.
+__device__ __forceinline__ Codes8 LoadCodes8(const std::uint8_t* row,
+                                             std::uint32_t width,
+                                             std::uint32_t element) {
+  const uint2 codes = *reinterpret_cast<const uint2*>(row + element);
+  const __half scale =
+      reinterpret_cast<const __half*>(row + width)[element / kBlock];
+  return Codes8{codes, scale};
+}
+
+/// The eight packed F16 values f16(scale * code) of LoadCodes8's bytes.
+__device__ __forceinline__ uint4 DequantHalf8(const Codes8& raw) {
+  const uint2 lo = DequantWord(raw.codes.x, raw.scale);
+  const uint2 hi = DequantWord(raw.codes.y, raw.scale);
+  return make_uint4(lo.x, lo.y, hi.x, hi.y);
+}
+
 /// Eight consecutive values starting at `element` (a multiple of eight) as
 /// eight packed F16 values, the bytes an FP16 row holds there.
 __device__ __forceinline__ uint4 LoadHalf8(const std::uint8_t* row,
                                            std::uint32_t width,
                                            std::uint32_t element) {
-  const uint2 codes = *reinterpret_cast<const uint2*>(row + element);
-  const __half scale =
-      reinterpret_cast<const __half*>(row + width)[element / kBlock];
-  const uint2 lo = DequantWord(codes.x, scale);
-  const uint2 hi = DequantWord(codes.y, scale);
-  return make_uint4(lo.x, lo.y, hi.x, hi.y);
+  return DequantHalf8(LoadCodes8(row, width, element));
 }
 #endif  // defined(ENGINE_ENABLE_HIP) && defined(__HIP__)
 

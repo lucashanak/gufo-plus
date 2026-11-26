@@ -852,7 +852,8 @@ static void LaunchSplitKAttentionHalfPartials(
   // Share each KV tile across its six query heads in both scalar decoding
   // and verification. Rows retain independent causal endpoints and scratch.
   if (num_heads == 6 * num_kv_heads &&
-      static_cast<std::size_t>(start_pos) + 1 >= 512) {
+      static_cast<std::size_t>(start_pos) + 1 >=
+          detail::kSharedKvDecodeAttentionMinContext) {
     if (rows > 1 && num_kv_heads % 2 == 0) {
       // Three wave64 per pair of KV heads; same arithmetic and scratch.
       detail::LaunchVerifySplitKAttentionHalfPartialsWave64(

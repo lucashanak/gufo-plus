@@ -14,6 +14,10 @@ inline constexpr std::uint32_t kTiledAttentionQueryHeads{24};
 inline constexpr std::uint32_t kTiledAttentionKvHeads{4};
 inline constexpr std::uint32_t kTiledAttentionHeadDim{256};
 inline constexpr std::size_t kSplitKDecodeAttentionMinContext{128};
+// From this causal length on, F16 split-K decode and verification share each
+// KV tile across a KV head's six query heads (and, for 2-8 verification
+// rows, across the rows); 8-bit verification rows share across rows from it.
+inline constexpr std::size_t kSharedKvDecodeAttentionMinContext{512};
 inline constexpr std::uint32_t kSplitKDecodeAttentionMaxSplits{32};
 inline constexpr std::uint32_t kFusedQkNormMaxHeadDim{256};
 

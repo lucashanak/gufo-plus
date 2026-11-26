@@ -197,10 +197,12 @@ void TestVerification(Planes& planes, std::mt19937& rng) {
   const std::size_t row_scratch =
       gufo::hip::detail::DecodeAttentionScratchElements(kHeads, kHeadDim);
   // Every shared-row width (2-8) and a wide segment (9), at shallow starts
-  // whose F16 control takes the per-head kernel and at deep ones whose F16
-  // control takes the shared-row kernel; the planes hold 3,200 positions.
+  // whose F16 control takes the per-head kernel and the 8-bit rows the
+  // per-row kernel (up to 510), and at deep ones where both take the
+  // shared-row kernel (from 511, the kSharedKvDecodeAttentionMinContext
+  // boundary); the planes hold 3,200 positions.
   for (const std::uint32_t start :
-       {20U, 200U, 511U, 700U, 1999U, 3000U, 3190U}) {
+       {20U, 200U, 510U, 511U, 700U, 1999U, 3000U, 3190U}) {
     for (std::size_t rows = 2; rows <= 9; ++rows) {
       if (start + rows > 3200U)
         continue;
