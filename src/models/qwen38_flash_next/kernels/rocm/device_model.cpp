@@ -10,14 +10,21 @@
 #include <gufo/ext/experimental/managed_alloc.hpp>
 #include <gufo/ext/experimental/weight_upload.hpp>
 #include <initializer_list>
+#include <iomanip>
+#include <sstream>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
+#include "src/models/qwen38_flash_next/weight_source.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
+
+namespace flash_next = ext::qwen::flash_next;
+
 namespace {
 
 /// The quantized GEMM tier reads whole 256-element k-iterations, so a row
@@ -122,8 +129,111 @@ struct Uploader {
   bool ok{true};
   std::uint32_t shard_base{0};
   std::uint64_t requested{0};
+  /// Uploads the tensors with format_state; null for a GGUF upload.
+  flash_next::WeightSource* source{nullptr};
+  /// Bytes the measuring walk requested: the whole upload.
+  std::uint64_t measured{0};
 
   [[nodiscard]] bool Measuring() const noexcept { return weights == nullptr; }
+
+  /// What a weight source's Upload sees of this walk.
+  struct Context final : flash_next::UploadContext {
+    Uploader& up;
+    explicit Context(Uploader& uploader) : up(uploader) {}
+    [[nodiscard]] bool Measuring() const noexcept override {
+      return up.Measuring();
+    }
+    [[nodiscard]] bool Allocate(void** pointer, std::size_t size) override {
+      *pointer = nullptr;
+      if (up.Allocate(pointer, size) != hipSuccess)
+        return false;
+      if (!up.Measuring()) {
+        up.allocations.push_back(*pointer);
+        up.bytes += size;
+      }
+      return true;
+    }
+    // The measuring walk copies nothing.
+    [[nodiscard]] bool CopyFromRegion(std::uint32_t region,
+                                      std::uint64_t offset, std::size_t size,
+                                      void* device) override {
+      return up.Measuring() || up.stager.Copy(up.shard_base + region, offset,
+                                              size, device, up.error);
+    }
+    [[nodiscard]] bool Finish() override {
+      return up.Measuring() || up.stager.Finish(up.error);
+    }
+    void Fail(std::string_view message) override {
+      up.Fail(std::string(message));
+    }
+  };
+
+  /// Queues one payload copy from a mapped region, or from host memory the
+  /// weight source prepared (kHostShard).
+  [[nodiscard]] bool Source(const TensorRef& t, std::size_t size,
+                            void* device) {
+    if (t.shard == kHostShard) {
+      if (hipMemcpy(device, t.data, size, hipMemcpyHostToDevice) == hipSuccess)
+        return true;
+      if (error != nullptr)
+        *error = "host tensor copy failed";
+      return false;
+    }
+    return stager.Copy(shard_base + t.shard, t.file_offset, size, device,
+                       error);
+  }
+
+  DeviceTensor CopyFormat(const TensorRef& t,
+                          const flash_next::UploadHint& hint) {
+    if (source == nullptr) {
+      Fail("no weight source uploads " + std::string(t.name));
+      return {};
+    }
+    Context context(*this);
+    const flash_next::Tensor d = source->Upload(t, hint, context);
+    if (!ok || Measuring())
+      return {};
+    if (d.empty() || d.format_state() == nullptr) {
+      Fail("weight source upload failed for " + std::string(t.name));
+      return {};
+    }
+    // No GGUF route reads an encoded tensor: every type-gated kernel choice
+    // (Q8_0 GEMVs, WMMA experts, tiled projections) declines kI32.
+    DeviceTensor device = FromTensor(d);
+    device.type = core::GgmlType::kI32;
+    return device;
+  }
+
+  /// A tensor with format_state outside the projections the stages run:
+  /// its bytes would reach a raw GGUF kernel.
+  bool RejectFormat(const TensorRef& t) {
+    if (t.format_state == nullptr)
+      return false;
+    Fail("encoded tensor " + std::string(t.name) +
+         " is only supported on a stage-run projection");
+    return true;
+  }
+
+  /// A failed allocation of `size` bytes for `name`. The placement and the
+  /// share already allocated tell a full device heap (hipMalloc) from
+  /// system-wide GPU memory that other processes hold (managed).
+  void FailAllocation(std::string_view name, std::size_t size) {
+    std::ostringstream message;
+    message << "device allocation failed for " << name << " (" << size
+            << " bytes";
+    if (weights != nullptr) {
+      constexpr double kGib = 1024.0 * 1024.0 * 1024.0;
+      message << std::fixed << std::setprecision(1) << "; "
+              << static_cast<double>(requested - size) / kGib << " of "
+              << static_cast<double>(measured) / kGib
+              << " GiB of weights allocated, as "
+              << (weights->placement() == hip::Placement::kMalloc
+                      ? "device memory"
+                      : "managed memory");
+    }
+    message << ')';
+    Fail(message.str());
+  }
 
   void Fail(const std::string& message) {
     if (ok && error != nullptr) {
@@ -172,6 +282,8 @@ struct Uploader {
     std::size_t rows = 0;
     std::size_t raw = 0;
     for (const TensorRef* t : parts) {
+      if (RejectFormat(*t))
+        return d;
       if (t->empty() || t->type != first.type || t->cols != first.cols ||
           t->experts != 1 ||
           t->cols % gufo::quant::QuantizedBlockElements(t->type) != 0) {
@@ -185,9 +297,12 @@ struct Uploader {
     const std::size_t q8 = rows * q8_row;
     void* raw_ptr = nullptr;
     void* q8_ptr = nullptr;
-    if (Allocate(&raw_ptr, raw + kTailMargin) != hipSuccess ||
-        Allocate(&q8_ptr, q8 + kTailMargin) != hipSuccess) {
-      Fail("device allocation failed for " + std::string(first.name));
+    if (Allocate(&raw_ptr, raw + kTailMargin) != hipSuccess) {
+      FailAllocation(first.name, raw + kTailMargin);
+      return d;
+    }
+    if (Allocate(&q8_ptr, q8 + kTailMargin) != hipSuccess) {
+      FailAllocation(first.name, q8 + kTailMargin);
       return d;
     }
     if (Measuring()) {
@@ -200,8 +315,8 @@ struct Uploader {
     std::size_t offset = 0;
     std::size_t row0 = 0;
     for (const TensorRef* t : parts) {
-      if (!stager.Copy(shard_base + t->shard, t->file_offset, t->SizeBytes(),
-                       static_cast<std::uint8_t*>(raw_ptr) + offset, error)) {
+      if (!Source(*t, t->SizeBytes(),
+                  static_cast<std::uint8_t*>(raw_ptr) + offset)) {
         Fail("upload failed for " + std::string(t->name));
         return d;
       }
@@ -245,11 +360,22 @@ struct Uploader {
     return d;
   }
 
+  /// A projection the executor runs through Dense / Experts, which hand
+  /// encoded tensors to the stages (Linear, LinearGroup).
+  DeviceTensor Projection(const TensorRef& t,
+                          const flash_next::UploadHint& hint = {}) {
+    if (t.empty() || !ok)
+      return {};
+    if (t.format_state != nullptr)
+      return CopyFormat(t, hint);
+    return Copy(t);
+  }
+
   /// `rows_only`: the file's rows as they are, without the Q8_0 copy a
   /// K-quant projection carries (a table that is only gathered from).
   DeviceTensor Copy(const TensorRef& t, bool rows_only = false) {
     DeviceTensor d;
-    if (t.empty() || !ok) {
+    if (t.empty() || !ok || RejectFormat(t)) {
       return d;
     }
     if (t.experts == 1 && !rows_only && DecodeKQuant(t.type)) {
@@ -258,8 +384,7 @@ struct Uploader {
     const std::size_t size = t.SizeBytes();
     void* ptr = nullptr;
     if (Allocate(&ptr, size + kTailMargin) != hipSuccess) {
-      Fail("device allocation failed for " + std::string(t.name) + " (" +
-           std::to_string(size) + " bytes)");
+      FailAllocation(t.name, size + kTailMargin);
       return d;
     }
     if (Measuring()) {
@@ -267,7 +392,7 @@ struct Uploader {
     }
     allocations.push_back(ptr);
     bytes += size + kTailMargin;
-    if (!stager.Copy(shard_base + t.shard, t.file_offset, size, ptr, error)) {
+    if (!Source(t, size, ptr)) {
       Fail("upload failed for " + std::string(t.name) +
            (error != nullptr ? ": " + *error : std::string()));
       return d;
@@ -292,7 +417,7 @@ struct Uploader {
   // quantization-block boundary without dequantizing or changing any weight.
   void SplitMtpProjection(const TensorRef& t, DeviceTensor& embedding,
                           DeviceTensor& hidden) {
-    if (t.empty() || !ok)
+    if (t.empty() || !ok || RejectFormat(t))
       return;
     const auto combined = Copy(t);
     if (!ok || (!Measuring() && !stager.Finish(error))) {
@@ -355,6 +480,8 @@ struct Uploader {
       return t == core::GgmlType::kF32 || t == core::GgmlType::kBF16;
     };
     for (const TensorRef* t : parts) {
+      if (RejectFormat(*t))
+        return d;
       if (t->empty() || t->cols != (*parts.begin())->cols ||
           (type == core::GgmlType::kQ8_0 ? t->type != type
                                          : !wide(type) || !wide(t->type))) {
@@ -391,8 +518,7 @@ struct Uploader {
           offset += wide_rows.size() * sizeof(float);
           continue;
         }
-        if (!stager.Copy(shard_base + t->shard, t->file_offset, t->SizeBytes(),
-                         dst, error)) {
+        if (!Source(*t, t->SizeBytes(), dst)) {
           Fail("upload failed for " + std::string(t->name));
           return d;
         }
@@ -459,10 +585,13 @@ struct Uploader {
       return Copy(t);
     }
     DeviceTensor d;
+    if (RejectFormat(t)) {
+      return d;
+    }
     const std::size_t count = t.ElementCount();
     void* ptr = nullptr;
     if (Allocate(&ptr, count * sizeof(float) + kTailMargin) != hipSuccess) {
-      Fail("device allocation failed for " + std::string(t.name));
+      FailAllocation(t.name, count * sizeof(float) + kTailMargin);
       return d;
     }
     if (Measuring()) {
@@ -512,7 +641,7 @@ struct Uploader {
     const auto stackable = [](std::initializer_list<const TensorRef*> parts) {
       const core::GgmlType type = (*parts.begin())->type;
       for (const TensorRef* t : parts) {
-        if (t->empty() || t->type != type ||
+        if (t->empty() || t->format_state != nullptr || t->type != type ||
             (type != core::GgmlType::kQ8_0 && !DecodeKQuant(type)) ||
             t->cols != (*parts.begin())->cols) {
           return false;
@@ -523,8 +652,8 @@ struct Uploader {
     if (l.linear && stackable({&l.ssm_qkv, &l.ssm_gate})) {
       d.ssm_in = Stack({&l.ssm_qkv, &l.ssm_gate});
     } else {
-      d.ssm_qkv = Copy(l.ssm_qkv);
-      d.ssm_gate = Copy(l.ssm_gate);
+      d.ssm_qkv = Projection(l.ssm_qkv);
+      d.ssm_gate = Projection(l.ssm_gate);
     }
     d.ssm_conv1d = Copy(l.ssm_conv1d);
     if (l.linear) {
@@ -533,19 +662,19 @@ struct Uploader {
     d.ssm_dt = Copy(l.ssm_dt);
     d.ssm_a = Copy(l.ssm_a);
     d.ssm_norm = Copy(l.ssm_norm);
-    d.ssm_out = Copy(l.ssm_out);
+    d.ssm_out = Projection(l.ssm_out);
     if (!l.linear && stackable({&l.attn_q, &l.attn_k, &l.attn_v})) {
       d.attn_qkv = Stack({&l.attn_q, &l.attn_k, &l.attn_v});
     } else {
-      d.attn_q = Copy(l.attn_q);
-      d.attn_k = Copy(l.attn_k);
-      d.attn_v = Copy(l.attn_v);
+      d.attn_q = Projection(l.attn_q);
+      d.attn_k = Projection(l.attn_k);
+      d.attn_v = Projection(l.attn_v);
     }
-    d.attn_out = Copy(l.attn_out);
+    d.attn_out = Projection(l.attn_out);
     d.attn_q_norm = Copy(l.attn_q_norm);
     d.attn_k_norm = Copy(l.attn_k_norm);
-    d.indexer_q = Copy(l.indexer_q);
-    d.indexer_k = Copy(l.indexer_k);
+    d.indexer_q = Projection(l.indexer_q);
+    d.indexer_k = Projection(l.indexer_k);
     d.indexer_q_norm = Copy(l.indexer_q_norm);
     d.indexer_k_norm = Copy(l.indexer_k_norm);
     d.ple_key = Copy(l.ple_key);
@@ -555,16 +684,21 @@ struct Uploader {
     d.ple_norm_conv = Copy(l.ple_norm_conv);
     d.ple_conv1d = CopyF32(l.ple_conv1d);
     d.router = Stack({&l.router, &l.shexp_gate_inp});
-    d.ffn_gate_exps = Copy(l.ffn_gate_exps);
-    d.ffn_up_exps = Copy(l.ffn_up_exps);
-    d.ffn_down_exps = Copy(l.ffn_down_exps);
-    d.shexp_gate = Copy(l.shexp_gate);
-    d.shexp_up = Copy(l.shexp_up);
-    d.shexp_down = Copy(l.shexp_down);
+    d.ffn_gate_exps = Projection(l.ffn_gate_exps);
+    d.ffn_up_exps = Projection(l.ffn_up_exps);
+    d.ffn_down_exps = Projection(l.ffn_down_exps);
+    constexpr flash_next::UploadHint kShared{.beside_routed_experts = true};
+    d.shexp_gate = Projection(l.shexp_gate, kShared);
+    d.shexp_up = Projection(l.shexp_up, kShared);
+    d.shexp_down = Projection(l.shexp_down, kShared);
     d.nextn_enorm = Copy(l.nextn_enorm);
     d.nextn_hnorm = Copy(l.nextn_hnorm);
     SplitMtpProjection(l.nextn_eh_proj, d.nextn_fc_embedding,
                        d.nextn_fc_hidden);
+    if (!l.nextn_fc_embedding.empty()) {
+      d.nextn_fc_embedding = Projection(l.nextn_fc_embedding);
+      d.nextn_fc_hidden = Projection(l.nextn_fc_hidden);
+    }
     d.nextn_head = Mixer(l.nextn_head);
     return d;
   }
@@ -575,9 +709,10 @@ struct Uploader {
     // A tied head projects the embedding table, so it keeps the decode
     // rows and Q8_0 copy of any projection; an untied table is only
     // gathered from.
-    const bool tied = w.output.data == w.token_embd.data;
+    const bool tied =
+        w.output.format_state == nullptr && w.output.data == w.token_embd.data;
     u.token_embd = Copy(w.token_embd, !tied);
-    u.output = tied ? u.token_embd : Copy(w.output);
+    u.output = tied ? u.token_embd : Projection(w.output);
     u.hc_head = Mixer(w.hc_head);
     u.layers.reserve(w.layers.size());
     for (const auto& l : w.layers) {
@@ -610,19 +745,21 @@ bool DeviceModel::SetDraftVocab(std::uint32_t prefix_rows,
       *error_msg = message;
     return false;
   };
-  if (output_.empty() || output_.rows == 0 || output_bytes_ % output_.rows != 0)
+  const DeviceTensor& head = draft_source();
+  if (head.empty() || head.rows == 0 || head.format_state != nullptr ||
+      (draft_source_.empty() && output_bytes_ % head.rows != 0))
     return fail("draft vocabulary needs a row-addressable output head");
-  if (prefix_rows == 0 || prefix_rows >= output_.rows)
+  if (prefix_rows == 0 || prefix_rows >= head.rows)
     return fail("draft vocabulary prefix must leave rows out");
   for (const auto id : specials) {
     if (id < static_cast<std::int32_t>(prefix_rows) ||
-        static_cast<std::uint32_t>(id) >= output_.rows)
+        static_cast<std::uint32_t>(id) >= head.rows)
       return fail("draft special tokens must lie above the prefix");
   }
   // The prefix is the head's own leading rows: no copy. It keeps the Q6_K
   // rows: an IQ4_NL prefix lowered acceptance enough to lose on sampled
   // code and at 16K context.
-  draft_output_ = output_;
+  draft_output_ = head;
   draft_output_.rows = prefix_rows;
   draft_specials_ = std::move(specials);
   return true;
@@ -656,6 +793,24 @@ bool DeviceModel::PrepareDraftHead(std::string* error_msg) {
   return true;
 }
 
+bool DeviceModel::UseDraftSource(const DeviceTensor& head,
+                                 std::string* error_msg) {
+  TensorRef ref;
+  ref.type = head.type;
+  ref.cols = head.cols;
+  const std::size_t row_bytes = ref.RowBytes();
+  if (head.empty() || head.format_state != nullptr || row_bytes == 0 ||
+      head.rows != output_.rows || head.cols != output_.cols ||
+      head.experts != 1) {
+    if (error_msg != nullptr)
+      *error_msg = "draft source must be a GGUF matrix of the head's shape";
+    return false;
+  }
+  draft_source_ = head;
+  draft_source_bytes_ = row_bytes * head.rows;
+  return true;
+}
+
 void WidenBF16(const std::uint16_t* src, float* dst,
                std::size_t count) noexcept {
   for (std::size_t i = 0; i < count; ++i) {
@@ -665,33 +820,23 @@ void WidenBF16(const std::uint16_t* src, float* dst,
 }
 
 std::unique_ptr<DeviceModel> DeviceModel::Upload(
+    const ModelWeights& w, const MtpWeights* mtp,
+    flash_next::WeightSource& source, std::string* error_msg) {
+  const auto trunk = source.Regions(false);
+  std::vector<core::GgufMappedRegion> shards(trunk.begin(), trunk.end());
+  const auto shard_count = static_cast<std::uint32_t>(shards.size());
+  if (mtp != nullptr) {
+    const auto extra = source.Regions(true);
+    shards.insert(shards.end(), extra.begin(), extra.end());
+  }
+  return UploadShards(w, mtp, std::move(shards), shard_count, &source,
+                      error_msg);
+}
+
+std::unique_ptr<DeviceModel> DeviceModel::Upload(
     const ModelWeights& w, const core::GgufReader& reader,
     const MtpWeights* mtp, const core::GgufReader* mtp_reader,
     std::string* error_msg) {
-  // The binder also accepts formats only the CPU reference reads. Reject the
-  // routed experts and heads the HIP kernels cannot project before
-  // allocating device weights.
-  const auto reject = [&](const TensorRef& t) {
-    if (error_msg != nullptr)
-      *error_msg = "unsupported HIP tensor format " +
-                   std::string(core::ToString(t.type)) + ": " +
-                   std::string(t.name);
-    return false;
-  };
-  const auto expert_supported = [&](const TensorRef& t) {
-    return ExpertFormat(t.type) || reject(t);
-  };
-  const auto layer_supported = [&](const LayerWeights& l) {
-    return expert_supported(l.ffn_gate_exps) &&
-           expert_supported(l.ffn_up_exps) && expert_supported(l.ffn_down_exps);
-  };
-  if (!(ProjectionFormat(w.output.type) || reject(w.output)) ||
-      !std::all_of(w.layers.begin(), w.layers.end(), layer_supported) ||
-      (mtp != nullptr && !layer_supported(mtp->block))) {
-    return nullptr;
-  }
-  std::unique_ptr<DeviceModel> m(new DeviceModel());
-  m->config_ = w.config;
   const auto regions = reader.GetMappedRegions();
   std::vector<core::GgufMappedRegion> shards(regions.begin(), regions.end());
   const auto shard_count = static_cast<std::uint32_t>(shards.size());
@@ -704,6 +849,41 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     const auto extra = mtp_reader->GetMappedRegions();
     shards.insert(shards.end(), extra.begin(), extra.end());
   }
+  return UploadShards(w, mtp, std::move(shards), shard_count, nullptr,
+                      error_msg);
+}
+
+std::unique_ptr<DeviceModel> DeviceModel::UploadShards(
+    const ModelWeights& w, const MtpWeights* mtp,
+    std::vector<core::GgufMappedRegion> shards, std::uint32_t shard_count,
+    flash_next::WeightSource* source, std::string* error_msg) {
+  // The binder also accepts formats only the CPU reference reads. Reject the
+  // routed experts and heads the HIP kernels cannot project before
+  // allocating device weights.
+  const auto reject = [&](const TensorRef& t) {
+    if (error_msg != nullptr)
+      *error_msg = "unsupported HIP tensor format " +
+                   std::string(core::ToString(t.type)) + ": " +
+                   std::string(t.name);
+    return false;
+  };
+  // A weight source's encoded tensors (format_state) run through the
+  // stages, not these kernels.
+  const auto expert_supported = [&](const TensorRef& t) {
+    return t.format_state != nullptr || ExpertFormat(t.type) || reject(t);
+  };
+  const auto layer_supported = [&](const LayerWeights& l) {
+    return expert_supported(l.ffn_gate_exps) &&
+           expert_supported(l.ffn_up_exps) && expert_supported(l.ffn_down_exps);
+  };
+  if (!(w.output.format_state != nullptr || ProjectionFormat(w.output.type) ||
+        reject(w.output)) ||
+      !std::all_of(w.layers.begin(), w.layers.end(), layer_supported) ||
+      (mtp != nullptr && !layer_supported(mtp->block))) {
+    return nullptr;
+  }
+  std::unique_ptr<DeviceModel> m(new DeviceModel());
+  m->config_ = w.config;
   auto stager = hip::WeightUpload::Create(shards, error_msg);
   if (!stager) {
     return nullptr;
@@ -719,7 +899,10 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     std::size_t max_q8_cols = 32;
     Uploader measure{*stager, nullptr,       conversions, allocations,
                      bytes,   max_half_cols, max_q8_cols, error_msg};
+    measure.source = source;
     (void)measure.Model(w, mtp, shard_count);
+    if (source != nullptr)
+      source->UploadDone(true);
     if (!measure.ok) {
       return nullptr;
     }
@@ -729,8 +912,19 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   std::vector<Conversion> conversions;
   Uploader up{*stager,   &weights,          conversions,     m->allocations_,
               m->bytes_, m->max_half_cols_, m->max_q8_cols_, error_msg};
+  up.measured = measured;
+  up.source = source;
   Uploaded uploaded = up.Model(w, mtp, shard_count);
-  if (!up.ok || !stager->Finish(error_msg)) {
+  // The source hears of the walk's end only once its queued region reads
+  // have landed, so it may free what they read into.
+  bool finished = false;
+  if (up.ok)
+    finished = stager->Finish(error_msg);
+  else if (source != nullptr)
+    (void)stager->Finish(nullptr);
+  if (source != nullptr)
+    source->UploadDone(false);
+  if (!up.ok || !finished) {
     return nullptr;
   }
   assert(up.requested == measured);

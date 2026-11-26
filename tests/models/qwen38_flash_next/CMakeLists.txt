@@ -109,6 +109,19 @@ if (ENGINE_ENABLE_HIP)
     SKIP_RETURN_CODE 77
     RUN_SERIAL TRUE
     TIMEOUT 1800)
+  # Stages and a weight source that tag projections with a format_state,
+  # against the default model (stage_seam_test.cpp).
+  add_executable(qwen38_flash_next_stage_seam_test EXCLUDE_FROM_ALL
+    stage_seam_test.cpp)
+  target_link_libraries(qwen38_flash_next_stage_seam_test PRIVATE
+    qwen38_flash_next_test_hip)
+  add_test(NAME qwen38_flash_next.stage_seam
+    COMMAND qwen38_flash_next_stage_seam_test)
+  set_tests_properties(qwen38_flash_next.stage_seam PROPERTIES
+    LABELS "qwen38_flash_next;hip;gpu;gfx1151;external-model"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    TIMEOUT 1800)
   add_executable(qwen38_flash_next_continuation_probe EXCLUDE_FROM_ALL
     continuation_probe.cpp)
   target_link_libraries(qwen38_flash_next_continuation_probe PRIVATE
@@ -117,7 +130,8 @@ if (ENGINE_ENABLE_HIP)
     DEPENDS qwen38_flash_next_session_test qwen38_flash_next_snapshot_test
       qwen38_flash_next_continuation_adapter_test
       qwen38_flash_next_state_churn_test
-      qwen38_flash_next_layered_prefill_test)
+      qwen38_flash_next_layered_prefill_test
+      qwen38_flash_next_stage_seam_test)
 
   add_executable(qwen38_flash_next_dense_gemm_bench EXCLUDE_FROM_ALL
     dense_gemm_bench.cpp)

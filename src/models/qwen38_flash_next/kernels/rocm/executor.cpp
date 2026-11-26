@@ -15,6 +15,7 @@
 #include <gufo/ext/experimental/managed_alloc.hpp>
 #include <gufo/ext/experimental/snapshot_transfer.hpp>
 #include <gufo/ext/experimental/state_memory.hpp>
+#include <gufo/ext/families/qwen/draft_vocab/draft_vocab.hpp>
 #include <gufo/ext/platform/pages.hpp>
 #include <limits>
 #include <memory>
@@ -26,7 +27,6 @@
 #include <vector>
 
 #include "qfn_mmq.h"
-#include "src/families/qwen/draft_vocab/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
@@ -1249,6 +1249,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       return nullptr;
     }
     e->tiles_host_ = static_cast<std::int32_t*>(tiles);
+    e->tiles_host_capacity_ = 3 * RoutedTileCapacity(slots, c);
     e->control_host_ = static_cast<Session::Control*>(control);
     e->tokens_host_ = static_cast<std::int32_t*>(tokens);
     e->logits_host_ = static_cast<float*>(logits);
@@ -1329,9 +1330,97 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
         }))
       return nullptr;
   }
+  // Stages attach once the executor's scratch exists, before the first
+  // pass (CalibrateDecodeOverlap runs MoE layers).
+  {
+    namespace fn = ext::qwen::flash_next;
+    static fn::Stages gguf_stages;
+    e->stages_ = options.stages != nullptr ? options.stages : &gguf_stages;
+    e->stage_impl_.executor = e.get();
+    const auto& layers = model.layers();
+    e->stage_layers_.reserve(layers.size());
+    for (std::size_t il = 0; il < layers.size(); ++il)
+      e->stage_layers_.push_back(
+          fn::LayerAccess::Make(&layers[il], static_cast<std::uint32_t>(il)));
+    const fn::Limits limits{
+        e->options_.max_batch,
+        e->narrow_batch_,
+        e->options_.max_context,
+        e->stage_layers_,
+        ToTensor(model.output()),
+        model.has_mtp() ? fn::LayerAccess::Make(&model.mtp(), fn::Layer::kMtp)
+                        : fn::Layer{}};
+    const std::size_t bytes = e->stages_->ScratchBytes(limits);
+    if (bytes != 0) {
+      if (!Check(hipMalloc(&e->stage_scratch_, bytes), "stage scratch",
+                 error_msg))
+        return nullptr;
+      e->allocations_.push_back(e->stage_scratch_);
+    }
+    if (!e->stages_->Attach({e->stage_scratch_, bytes, e->stream_, limits},
+                            error_msg))
+      return nullptr;
+    e->prompt_layer_hook_ = (e->stages_->Hooks() & fn::kPromptLayers) != 0;
+    if (e->prompt_layer_hook_)
+      e->prompt_layers_ = layers;
+  }
   if (!e->CalibrateDecodeOverlap(error_msg))
     return nullptr;
   return e;
+}
+
+ext::qwen::flash_next::Layer Executor::LayerHandle(
+    const DeviceLayer& l) const noexcept {
+  namespace fn = ext::qwen::flash_next;
+  const auto& layers = model_->layers();
+  if (&l >= layers.data() && &l < layers.data() + layers.size())
+    return fn::LayerAccess::Make(
+        &l, static_cast<std::uint32_t>(&l - layers.data()));
+  if (!prompt_layers_.empty() && &l >= prompt_layers_.data() &&
+      &l < prompt_layers_.data() + prompt_layers_.size())
+    return fn::LayerAccess::Make(
+        &l, static_cast<std::uint32_t>(&l - prompt_layers_.data()));
+  return fn::LayerAccess::Make(&l, fn::Layer::kMtp);
+}
+
+ext::qwen::flash_next::StageContext Executor::StageCtx(
+    const DeviceLayer* l, std::uint32_t n_tokens,
+    std::string* error_msg) const noexcept {
+  namespace fn = ext::qwen::flash_next;
+  return {
+      stream_,         prefill_phase ? fn::Phase::kPrompt : fn::Phase::kDecode,
+      n_tokens,        l != nullptr ? LayerHandle(*l) : fn::Layer{},
+      stage_defaults_, stage_scratch_,
+      error_msg};
+}
+
+bool Executor::StageLinear(const DeviceTensor& w,
+                           const ext::qwen::flash_next::LinearInput& in,
+                           float* out, std::uint32_t n_tokens,
+                           std::string* error_msg) const {
+  return stages_->Linear(StageCtx(nullptr, n_tokens, error_msg), ToTensor(w),
+                         in, out);
+}
+
+bool Executor::StageGroup(
+    std::span<const ext::qwen::flash_next::LinearJob> jobs,
+    const ext::qwen::flash_next::LinearInput& in, std::uint32_t n_tokens,
+    std::string* error_msg) const {
+  return stages_->LinearGroup(StageCtx(nullptr, n_tokens, error_msg), jobs, in);
+}
+
+bool Executor::PromptLayer(std::uint32_t il, std::uint32_t n_tokens,
+                           const DeviceLayer** layer,
+                           std::string* error_msg) const {
+  namespace fn = ext::qwen::flash_next;
+  fn::LayerEdit edit = fn::LayerAccess::MakeEdit(&prompt_layers_[il], il);
+  fn::StageContext ctx = StageCtx(&prompt_layers_[il], n_tokens, error_msg);
+  bool use = false;
+  if (!stages_->PromptLayer(ctx, edit, &use))
+    return false;
+  if (use)
+    *layer = &prompt_layers_[il];
+  return true;
 }
 
 bool Executor::CarveRowScratch(
@@ -1644,7 +1733,7 @@ bool Executor::AppendDraftRows(Session& session, std::uint32_t first,
     AssignError(error_msg, "invalid draft table append");
     return false;
   }
-  const auto& output = model_->output();
+  const auto& output = model_->draft_source();
   const std::size_t row_bytes = model_->output_row_bytes();
   for (std::size_t i = 0; i < ids.size(); ++i) {
     if (ids[i] < 0 || static_cast<std::uint32_t>(ids[i]) >= output.rows) {
@@ -1683,7 +1772,7 @@ bool Executor::ClearDraftRows(Session& session, std::uint32_t first,
 }
 
 DeviceTensor Executor::DraftTable(const Session& session) const noexcept {
-  DeviceTensor table = model_->output();
+  DeviceTensor table = model_->draft_source();
   table.data = session.mtp_.draft_rows;
   table.decode = nullptr;  // the session's rows are Q8_0 copies
   table.rows = speculative::kDraftVocabExtraRows;
@@ -2266,6 +2355,9 @@ bool Executor::DenseF16Route(const DeviceTensor& w,
 
 bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
                      std::uint32_t n_tokens, std::string* error_msg) const {
+  if (w.format_state != nullptr) [[unlikely]] {
+    return StageLinear(w, {x, n_tokens, 1, nullptr}, out, n_tokens, error_msg);
+  }
   // K-quant projections decode from their compact rows, reading Q8_1 rows
   // a producer already wrote when there are any.
   if (w.decode != nullptr && !MatrixRows(n_tokens)) {
@@ -2373,6 +2465,12 @@ void Executor::RoutedHints(const DeviceTensor& w,
       RoutedTileCols(n_tokens, config().num_experts_used, w.experts));
 }
 
+bool Executor::WaitCounts(std::uint32_t n_tokens,
+                          std::string* error_msg) const {
+  return !ExpertMatrixRows(n_tokens) ||
+         Check(hipEventSynchronize(counts_ready_), "expert counts", error_msg);
+}
+
 bool Executor::RouteHints(std::uint32_t n_tokens,
                           std::string* error_msg) const {
   // Every column tile past an expert's bucket still costs a dispatch and a
@@ -2423,8 +2521,24 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   std::uint32_t n_tiles = 0;
   routed_tile_rows_ = RoutedTileRows(
       static_cast<std::size_t>(n_tokens) * c.num_experts_used, c);
+  std::uint64_t routed = 0;
   for (std::uint32_t e = 0; e < c.num_experts; ++e) {
     max_rows = std::max(max_rows, counts_host_[e]);
+    routed += counts_host_[e];
+  }
+  // Top-k over softmax probabilities picks an expert for every slot unless
+  // a token's router logits are not finite: then it picks none, and the
+  // expert GEMMs would run without that token (or, for a whole pass, with
+  // no tiles at all). Name the cause rather than a GEMM failure. A last-row
+  // catch-up reads the counts of the whole batch it follows.
+  const std::uint64_t slots =
+      static_cast<std::uint64_t>(n_tokens) * c.num_experts_used;
+  if (counts_tokens_ == n_tokens && routed != slots) {
+    AssignError(error_msg, "router selected no expert for " +
+                               std::to_string(slots - routed) + " of " +
+                               std::to_string(slots) +
+                               " token slots: non-finite router logits");
+    return false;
   }
   routed_max_rows_ = std::max<std::uint32_t>(1, max_rows);
   const auto append = [&](std::uint32_t tile_rows) {
@@ -2456,6 +2570,9 @@ bool Executor::Experts(const DeviceTensor& w, const float* x,
                        const std::int32_t* ids, float* out,
                        std::uint32_t n_rows, std::uint32_t n_used,
                        std::uint32_t n_tokens, std::string* error_msg) const {
+  if (w.format_state != nullptr) [[unlikely]] {
+    return StageLinear(w, {x, n_rows, n_used, ids}, out, n_tokens, error_msg);
+  }
   const int M = static_cast<int>(w.rows);
   const int K = static_cast<int>(w.cols);
   const int E = static_cast<int>(w.experts);
@@ -2489,6 +2606,15 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
                             const float* x, const std::int32_t* ids, float* out,
                             std::uint32_t n_tokens, std::uint32_t n_used,
                             std::string* error_msg) const {
+  if (a.format_state != nullptr || b.format_state != nullptr) [[unlikely]] {
+    const ext::qwen::flash_next::LinearJob jobs[] = {{ToTensor(a), out},
+                                                     {ToTensor(b), s_.up_e}};
+    if (!StageGroup(jobs, {x, n_tokens, n_used, ids}, n_tokens, error_msg))
+      return false;
+    Swiglu(out, s_.up_e, static_cast<std::size_t>(n_tokens) * n_used * a.rows,
+           stream_);
+    return true;
+  }
   const bool same_shape = a.type == b.type && a.rows == b.rows &&
                           a.cols == b.cols && a.experts == b.experts;
   if (!MatrixRows(n_tokens) && n_used <= 32 && same_shape &&
@@ -3075,6 +3201,19 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                                std::string* error_msg, bool projections_ready,
                                bool project_output,
                                GdnCheckpoint checkpoint) const {
+  const ext::qwen::flash_next::LinearAttentionArgs args{
+      s, n_tokens, speculative, projections_ready, project_output, checkpoint};
+  return stages_->LinearAttention(StageCtx(&l, n_tokens, error_msg), args, x,
+                                  out);
+}
+
+bool Executor::DefaultLinearAttention(const DeviceLayer& l,
+                                      Session::LinearState& s, const float* x,
+                                      float* out, std::uint32_t n_tokens,
+                                      bool speculative, std::string* error_msg,
+                                      bool projections_ready,
+                                      bool project_output,
+                                      GdnCheckpoint checkpoint) const {
   const Config& c = config();
   const std::uint32_t channels = c.SsmConvChannels();
   const float* qkv = s_.qkv;
@@ -3134,11 +3273,19 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
     z = s_.qkvz + channels;
     qkv_stride = z_stride = l.ssm_in.rows;
   } else if (!projections_ready) {
-    Q8Input xq;
-    if (!Quantize(x, n_tokens, c.hidden_size, &xq, error_msg) ||
-        !Dense(l.ssm_qkv, xq, s_.qkv, error_msg) ||
-        !Dense(l.ssm_gate, xq, s_.z, error_msg)) {
-      return false;
+    if (l.ssm_qkv.format_state != nullptr || l.ssm_gate.format_state != nullptr)
+        [[unlikely]] {
+      const ext::qwen::flash_next::LinearJob jobs[] = {
+          {ToTensor(l.ssm_qkv), s_.qkv}, {ToTensor(l.ssm_gate), s_.z}};
+      if (!StageGroup(jobs, {x, n_tokens, 1, nullptr}, n_tokens, error_msg))
+        return false;
+    } else {
+      Q8Input xq;
+      if (!Quantize(x, n_tokens, c.hidden_size, &xq, error_msg) ||
+          !Dense(l.ssm_qkv, xq, s_.qkv, error_msg) ||
+          !Dense(l.ssm_gate, xq, s_.z, error_msg)) {
+        return false;
+      }
     }
   }
   if (!projections_ready &&
@@ -3217,6 +3364,28 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                          std::string* error_msg, bool last_only,
                          bool projections_ready, bool project_output,
                          PassCheckpoints checkpoints) const {
+  const ext::qwen::flash_next::AttentionArgs args{s,
+                                                  n_tokens,
+                                                  pos,
+                                                  first_block,
+                                                  start_pos,
+                                                  pool_grid,
+                                                  max_context,
+                                                  sparse,
+                                                  last_only,
+                                                  projections_ready,
+                                                  project_output,
+                                                  checkpoints};
+  return stages_->Attention(StageCtx(&l, n_tokens, error_msg), args, x, out);
+}
+
+bool Executor::DefaultAttention(
+    const DeviceLayer& l, Session::AttentionState& s, const float* x,
+    float* out, std::uint32_t n_tokens, const std::uint32_t* pos,
+    const std::uint32_t* first_block, std::uint32_t start_pos,
+    std::uint32_t pool_grid, std::uint32_t max_context, bool sparse,
+    std::string* error_msg, bool last_only, bool projections_ready,
+    bool project_output, PassCheckpoints checkpoints) const {
   const Config& c = config();
   const std::uint32_t kv_row = c.AttentionKvDim();
   const std::uint32_t index_capacity =
@@ -3256,6 +3425,18 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                     n_tokens, c.num_heads, c.head_dim, kv_row, stream_);
       }
     }
+  } else if (!projections_ready && (l.attn_q.format_state != nullptr ||
+                                    l.attn_k.format_state != nullptr ||
+                                    l.attn_v.format_state != nullptr))
+      [[unlikely]] {
+    const ext::qwen::flash_next::LinearJob jobs[] = {
+        {ToTensor(l.attn_q), s_.qg},
+        {ToTensor(l.attn_k), s_.k},
+        {ToTensor(l.attn_v), s_.v}};
+    if (!StageGroup(jobs, {x, n_tokens, 1, nullptr}, n_tokens, error_msg))
+      return false;
+    UnpackQGate(s_.qg, 2 * c.AttentionQDim(), s_.q, s_.attn_gate, nullptr,
+                nullptr, n_tokens, c.num_heads, c.head_dim, 0, stream_);
   } else {
     Q8Input xq;
     if (!projections_ready &&
@@ -3471,6 +3652,7 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   if (ExpertMatrixRows(n_tokens)) {
     ExpertCounts(s_.ids, s_.expert_counts, n_tokens, c.num_experts, used,
                  stream_);
+    counts_tokens_ = n_tokens;
     if (!Check(hipMemcpyAsync(counts_host_, s_.expert_counts,
                               c.num_experts * sizeof(std::uint32_t),
                               hipMemcpyDeviceToHost, stream_),
@@ -3480,10 +3662,70 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
       return false;
     }
   }
+  // DefaultMoeFfn skips the shared expert this row already queued on the
+  // forked stream.
+  shexp_forked_ = fork;
+  // Only the Q8_0 shared expert of a wide batch overlaps (see DefaultMoeFfn).
+  const bool overlap = !fork && kPrefillSideStream &&
+                       ExpertMatrixRows(n_tokens) && !last_only &&
+                       l.shexp_gate.type == GgmlType::kQ8_0 &&
+                       l.shexp_up.type == GgmlType::kQ8_0 &&
+                       l.shexp_down.type == GgmlType::kQ8_0;
+  const ext::qwen::flash_next::MoeRouting routing{
+      s_.ids,
+      s_.weights,
+      s_.router,
+      c.num_experts + 1,
+      c.num_experts,
+      used,
+      counts_host_,
+      tiles_host_,
+      tiles_host_capacity_,
+      last_only,
+      overlap,
+      {s_.gate_e, s_.up_e, s_.down_e, s_.shexp_up, s_.shexp_gate, s_.shexp_out,
+       s_.expert_counts, s_.routed_bounds, s_.routed_cursors, s_.rows_token,
+       s_.rows_slot, s_.routed_tiles}};
+  // An override that forked the shared expert and failed still leaves the
+  // main stream joined (the default joins before it returns).
+  struct JoinGuard {
+    const Executor* executor;
+    ~JoinGuard() { (void)executor->JoinSide(nullptr); }
+  } join_guard{this};
+  return stages_->MoeFfn(StageCtx(&l, n_tokens, error_msg), routing, x, out);
+}
+
+bool Executor::SharedExpertRows(const DeviceLayer& l, const float* x,
+                                std::uint32_t n_tokens,
+                                std::string* error_msg) const {
+  shexp_half_ready_ = false;
+  if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
+                  &l.shexp_down, error_msg)) {
+    return false;
+  }
+  if (shexp_half_ready_) {
+    shexp_half_ready_ = false;
+    if (!DenseF16Gemm(l.shexp_down.data, s_.shexp_half, s_.shexp_out, n_tokens,
+                      l.shexp_down.rows, l.shexp_down.cols, stream_)) {
+      AssignError(error_msg, "shared expert F16 GEMM failed");
+      return false;
+    }
+    return true;
+  }
+  return Dense(l.shexp_down, s_.shexp_up, s_.shexp_out, n_tokens, error_msg);
+}
+
+bool Executor::DefaultMoeFfn(const DeviceLayer& l,
+                             const ext::qwen::flash_next::MoeRouting& routing,
+                             const float* x, float* out, std::uint32_t n_tokens,
+                             std::string* error_msg) const {
+  const Config& c = config();
+  const bool last_only = routing.last_only;
   // The shared expert (gated by the last router row) does not depend on
   // routing. Queue its GEMMs after the count download, then prepare the
   // routed dispatch on the CPU without waiting for these GEMMs to finish.
-  if (fork) {
+  if (shexp_forked_) {
+    shexp_forked_ = false;
     shexp_half_ready_ = false;
     return MoeExperts(l, x, out, n_tokens, error_msg, true);
   }
@@ -3493,11 +3735,8 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   // main-stream work may use s_.x_q8t before JoinSide.
   // Only the Q8_0 shared expert overlaps: its kernels take stream_, while
   // the BF16, F16 and F32 routes go through BLAS handles bound to the main
-  // stream.
-  const bool overlap = kPrefillSideStream && ExpertMatrixRows(n_tokens) &&
-                       !last_only && l.shexp_gate.type == GgmlType::kQ8_0 &&
-                       l.shexp_up.type == GgmlType::kQ8_0 &&
-                       l.shexp_down.type == GgmlType::kQ8_0;
+  // stream. Moe decides it (routing.overlap).
+  const bool overlap = routing.overlap;
   const hipStream_t main = stream_;
   if (overlap) {
     if (!Check(hipEventRecord(side_start_, main), "side stream fork",
@@ -3553,25 +3792,7 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   } shared_scope{this, main, overlap};
   if (overlap)
     stream_ = side_stream_;
-  const auto shared_expert = [&] {
-    shexp_half_ready_ = false;
-    if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
-                    &l.shexp_down, error_msg)) {
-      return false;
-    }
-    if (shexp_half_ready_) {
-      shexp_half_ready_ = false;
-      if (!DenseF16Gemm(l.shexp_down.data, s_.shexp_half, s_.shexp_out,
-                        n_tokens, l.shexp_down.rows, l.shexp_down.cols,
-                        stream_)) {
-        AssignError(error_msg, "shared expert F16 GEMM failed");
-        return false;
-      }
-      return true;
-    }
-    return Dense(l.shexp_down, s_.shexp_up, s_.shexp_out, n_tokens, error_msg);
-  };
-  const bool shared_ok = shared_expert();
+  const bool shared_ok = SharedExpertRows(l, x, n_tokens, error_msg);
   if (!Check(shared_scope.Finish(), "side stream join", error_msg))
     return false;
   if (!shared_ok) {
@@ -3636,6 +3857,11 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
   const std::uint32_t used = c.num_experts_used;
   const std::uint32_t slots = n_tokens * used;
   if (!RouteHints(n_tokens, error_msg)) {
+    const auto index = LayerHandle(l).index();
+    if (error_msg)
+      *error_msg += index == ext::qwen::flash_next::Layer::kMtp
+                        ? " (MTP layer)"
+                        : " (layer " + std::to_string(index) + ")";
     return false;
   }
   // Tiled batches take the WMMA route: assignments compacted by expert
@@ -3725,7 +3951,20 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
   // The epilogue reads the shared expert's output.
   if (!JoinSide(error_msg))
     return false;
-  if (wmma_experts) {
+  // A forked single row's shared expert joins before the row epilogue.
+  if (join_shexp && !wmma_experts && !MatrixRows(n_tokens) &&
+      !Check(hipStreamWaitEvent(stream_, shexp_join_, 0),
+             "shared expert join wait", error_msg))
+    return false;
+  MoeEpilogueRows(out, n_tokens, wmma_experts);
+  return true;
+}
+
+void Executor::MoeEpilogueRows(float* out, std::uint32_t n_tokens,
+                               bool half_down) const {
+  const Config& c = config();
+  const std::uint32_t used = c.num_experts_used;
+  if (half_down) {
     // The combine that follows folds this epilogue into its own pass when
     // it takes the F16 route (Combine); otherwise it runs here.
     moe_pending_ = out == s_.block_out;
@@ -3740,13 +3979,9 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
                     s_.router + c.num_experts, c.num_experts + 1, out, n_tokens,
                     used, c.hidden_size, stream_);
   } else {
-    if (join_shexp && !Check(hipStreamWaitEvent(stream_, shexp_join_, 0),
-                             "shared expert join wait", error_msg))
-      return false;
     MoeEpilogue(s_.down_e, s_.weights, s_.shexp_out, s_.router + c.num_experts,
                 c.num_experts + 1, out, n_tokens, used, c.hidden_size, stream_);
   }
-  return true;
 }
 
 bool Executor::KeepHiddenRow(Session& session, std::uint32_t row,
@@ -3786,6 +4021,14 @@ bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
 bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
                        bool candidates, const Session* draft,
                        std::string* error_msg) const {
+  const ext::qwen::flash_next::MtpHeadArgs args{head, res, token, candidates,
+                                                draft};
+  return stages_->MtpHead(StageCtx(nullptr, 1, error_msg), args);
+}
+
+bool Executor::DefaultMtpHead(const DeviceMixer& head, const float* res,
+                              bool token, bool candidates, const Session* draft,
+                              std::string* error_msg) const {
   const std::uint32_t prefix = model_->draft_output().rows;
   const std::uint32_t rows = draft != nullptr
                                  ? prefix + speculative::kDraftVocabExtraRows
@@ -4404,7 +4647,11 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
   for (std::uint32_t il = first_layer; il < end_layer; ++il) {
     if (!session.CheckCancellation(error_msg))
       return false;
-    const DeviceLayer& l = layers[il];
+    const DeviceLayer* view = &layers[il];
+    if (prompt_layer_hook_ && prefill_phase &&
+        !PromptLayer(il, n, &view, error_msg))
+      return false;
+    const DeviceLayer& l = *view;
     if (c.IsPleLayer(il) && !Ple(l, session, n, s_.res, speculative, error_msg,
                                  embeddings_ready, checkpoints)) {
       return false;
@@ -4460,7 +4707,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                              ? (n - needed) / 128 * 128
                              : 0U;
     const auto finish = [&](std::uint32_t rows) {
-      defer_residual_ = WmmaExperts(l, rows);
+      defer_residual_ =
+          stages_->MoeDefersEpilogue(StageCtx(&l, rows, error_msg));
       // The wide FFN reads the mix only through its F16 rows (router, routed
       // experts) and tiled Q8 rows (shared expert).
       const bool no_f32 = prefill_phase && defer_residual_ &&

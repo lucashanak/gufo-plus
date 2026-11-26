@@ -1771,7 +1771,11 @@ Each request to `/v1/chat/completions`, `/v1/completions`, `/v1/responses`,
   miss detail the completion log also reports, `generated_tokens`, `finish`,
   `error` when generation failed, the `prompt` decoded from its tokens with
   special tokens spelled out, and the raw `output` before reasoning and
-  tool-call parsing.
+  tool-call parsing. The parser's inputs follow: the model's `tool_dialect`,
+  its `reasoning` markup (`open` and `close`), the chat's
+  `initial_output_state` and `pieces`, the end offset in bytes of each piece
+  the parser read. `tools/generation_parse/corpus.py` turns a trace into
+  cases for `generation_parse_test`, without the prompts.
 - `response`: `status`, `outcome`, whether the reply was a `stream`, and the
   `body` the client received. For a stream this is the event stream as
   written, `: ping` keepalives included, so a difference between streaming and
@@ -1817,7 +1821,12 @@ Loading logs report elapsed time, model, context and session capacity,
 speculative mode and memory. `rss_mib` is process resident memory;
 `host_available_mib` is available system memory. At load completion,
 `gpu_device_used_mib` is device-wide HIP usage. These overlap on unified memory
-and must not be added together.
+and must not be added together. A failed load adds `gpu_device_free_mib` and
+`gpu_device_total_mib`, read after the partial upload is freed, and on Linux
+`gtt_used_mib` and `gtt_total_mib`. On Linux the free value counts GPU memory
+held by other processes, which `host_available_mib` can miss: a small free value
+with plenty of host memory available means another GPU process holds the
+memory. On Windows it counts only this process's allocations.
 With disk caching enabled, `phase=artifact_identity` identifies full-file
 SHA-256 work. Digests are cached against the open file's identity, size and
 modification/change timestamps; unchanged artifacts avoid another scan.
@@ -1839,6 +1848,8 @@ lazily in the worker. Control characters are escaped in log lines.
   including that `--log-level` and `-v` change the emitted log rather than only
   parsing.
 - `openai_chat_test`: chat parsing, streaming, images, tools and sampling controls.
+- `chat_request_test`: the Rust request decoder for Chat Completions, Responses
+  and Messages against frozen copies of the C++ decoders it replaced.
 - Per-model serving tests: greedy/sampled decoding, batching, cache reuse and
   cancellation. Use the affected model's benchmark README for commands and limits.
 

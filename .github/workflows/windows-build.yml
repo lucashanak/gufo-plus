@@ -191,14 +191,30 @@ jobs:
           # GITHUB_ENV applies from the next step on.
           ccache --dir "$env:RUNNER_TEMP\ccache" --zero-stats
 
+      # A pull request saves its compiler cache only when the build added at
+      # least 32 MiB to it; otherwise it keeps no duplicate of main's cache.
+      - name: Snapshot restored compiler cache
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: python tools/ci/cache_growth.py snapshot "$env:RUNNER_TEMP\ccache" "$env:RUNNER_TEMP\cache-growth.json"
+
       - name: Restore vcpkg binary cache
+        id: vcpkg-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}\vcpkg-archives
-          key: gufo-vcpkg-v4-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: gufo-vcpkg-v4-${{ runner.os }}-${{ env.SDK_TARBALL }}-${{ hashFiles('vcpkg.json', 'cmake/toolchains/windows-therock.cmake') }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            gufo-vcpkg-v4-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}-
+            gufo-vcpkg-v4-${{ runner.os }}-${{ env.SDK_TARBALL }}-${{ hashFiles('vcpkg.json', 'cmake/toolchains/windows-therock.cmake') }}-
             gufo-vcpkg-v4-${{ runner.os }}-
+
+      # Port ABIs also depend on the chain-loaded TheRock toolchain, so the key
+      # covers it. A pull request also saves when it built any new archive,
+      # in case an ABI input the key misses changed.
+      - name: Snapshot restored vcpkg binary cache
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: python tools/ci/cache_growth.py snapshot "$env:RUNNER_TEMP\vcpkg-archives" "$env:RUNNER_TEMP\vcpkg-growth.json"
 
       # A full clone: the manifest baseline resolves through vcpkg's history.
       # vcvars points VCPKG_ROOT at the VS-bundled copy, which is not one.
@@ -435,8 +451,29 @@ jobs:
           path: external-extension
           persist-credentials: false
 
+      # Building the Loom runtime from hrx-system takes most of the build step,
+      # and HRX's configure downloads pinned sources, one of them from a host
+      # without a mirror. A cached library takes the loom-text-embed
+      # pkg-config path in src/models/loom/runtime.cmake instead.
+      - name: Restore Loom runtime
+        id: loom-runtime
+        if: hashFiles('src/models/loom/runtime.cmake') != ''
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: C:/gufo-loom-runtime
+          key: gufo-loom-runtime-windows-v1-${{ env.SDK_SHA256 }}-${{ hashFiles('src/models/loom/runtime.cmake', 'src/models/loom/embed/**') }}
+
+      - name: Use cached Loom runtime
+        if: steps.loom-runtime.outputs.cache-hit == 'true'
+        run: |
+          "PKG_CONFIG_PATH=C:/gufo-loom-runtime/lib/pkgconfig" >> $env:GITHUB_ENV
+          "GUFO_LOOM_RUNTIME_CACHED=1" >> $env:GITHUB_ENV
+
+      # Step limits stay below the job's 120 minutes so the cache saves at the
+      # end still run after a slow or cold build.
       - name: Configure Windows build
         id: configure
+        timeout-minutes: 40
         env:
           EXTERNAL_EXTENSION_REPO: ${{ inputs.extension-repo }}
         run: |
@@ -466,11 +503,15 @@ jobs:
             "-DGUFO_IRON_PYTHON=$env:IRON_ROOT/Scripts/python.exe" -DGUFO_NPU_DESIGNS_REQUIRED=ON `
             "-DGUFO_NPU_CACHE_HOME=$env:RUNNER_TEMP/npu-cache" @identity
           if ($LASTEXITCODE -ne 0) { throw 'configure failed' }
+          if ($env:GUFO_LOOM_RUNTIME_CACHED -and -not (Select-String -Quiet -SimpleMatch 'GUFO_LOOM_PC_FOUND:INTERNAL=1' build/windows-release/CMakeCache.txt)) {
+            throw 'configure did not take the cached Loom runtime'
+          }
           "$PWD\build\windows-release\vcpkg_installed\x64-windows-release\bin" >> $env:GITHUB_PATH
           "$PWD\build\windows-release" >> $env:GITHUB_PATH
 
       - name: Build application and test binaries
         id: build
+        timeout-minutes: 45
         run: |
           $targets = @('gufo', 'gufo-server', 'component_text_cache_test', 'qwen38_flash_next_ngram_test', 'gpu_queues_test', 'bandwidth_test', 'allocation_benchmark_test')
           # Release tags from before the in-tree NPU designs have no such target.
@@ -482,7 +523,42 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'build failed' }
           ccache --show-stats
 
+      # Lay out the library as the Nix package does (.devops/nix/hrx/loom-runtime.nix).
+      - name: Stage Loom runtime
+        id: loom-runtime-stage
+        if: steps.loom-runtime.outcome == 'success' && steps.loom-runtime.outputs.cache-hit != 'true'
+        run: |
+          $built = 'build/windows-release/loom'
+          if (-not (Test-Path "$built/b/loom_text_embed.dll")) {
+            "Release without the Loom runtime build; nothing to cache."
+            exit 0
+          }
+          $version = (Select-String -Path src/models/loom/runtime.cmake -Pattern '^set\(GUFO_LOOM_HRX_VERSION (\S+)\)').Matches[0].Groups[1].Value
+          if (-not $version) { throw 'cannot read GUFO_LOOM_HRX_VERSION' }
+          $root = 'C:/gufo-loom-runtime'
+          New-Item -ItemType Directory -Force -Path "$root/lib/pkgconfig", "$root/share/licenses/loom-runtime" | Out-Null
+          Copy-Item "$built/b/loom_text_embed.dll" "$root/lib"
+          Copy-Item "$built/s/LICENSE" "$root/share/licenses/loom-runtime/LICENSE"
+          @(
+            "prefix=$root"
+            'libdir=${prefix}/lib'
+            ''
+            'Name: loom-text-embed'
+            'Description: Loom text model layer for Gufo, built from hrx-system'
+            "Version: $version"
+            'Libs: -L${libdir} -lloom_text_embed'
+          ) | Set-Content "$root/lib/pkgconfig/loom-text-embed.pc" -Encoding ascii
+          "staged=true" >> $env:GITHUB_OUTPUT
+
+      - name: Save Loom runtime
+        if: steps.loom-runtime-stage.outputs.staged == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: C:/gufo-loom-runtime
+          key: ${{ steps.loom-runtime.outputs.cache-primary-key }}
+
       - name: Run CPU and application checks
+        timeout-minutes: 20
         run: |
           $gufo = 'build\windows-release\gufo.exe'
           if (-not (Test-Path $gufo)) { throw "$gufo was not built" }
@@ -713,27 +789,55 @@ jobs:
           path: ${{ runner.temp }}\therock-archive
           key: gufo-therock-v2-${{ env.SDK_TARBALL }}
 
+      # An empty result, such as from a failed measurement, saves.
+      - name: Measure compiler cache growth
+        id: ccache-growth
+        if: always() && github.event_name == 'pull_request' && (steps.openmp.outcome == 'success' || steps.configure.outcome == 'success')
+        continue-on-error: true
+        run: python tools/ci/cache_growth.py check "$env:RUNNER_TEMP\ccache" "$env:RUNNER_TEMP\cache-growth.json" >> $env:GITHUB_OUTPUT
+
       # Save both OpenMP and Gufo objects, even if a later stage fails. A fresh
       # key preserves this run's new entries alongside the restored set.
       - name: Save compiler cache
-        if: always() && (steps.openmp.outcome == 'success' || steps.configure.outcome == 'success')
+        if: >-
+          always() && (steps.openmp.outcome == 'success' || steps.configure.outcome == 'success') &&
+          steps.ccache-growth.outputs.save != 'false'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}\ccache
           key: gufo-windows-ccache-v1-${{ env.SDK_TARBALL }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       # Saved even when the build fails or times out, so a rerun keeps every
-      # design that finished; IRON drops failed compilations itself.
+      # design that finished; IRON drops failed compilations itself. A pull
+      # request saves the compiled designs above instead, so its rerun skips
+      # the compilation and needs none of these.
       - name: Save NPU design cache
-        if: always() && steps.iron-python.outcome == 'success'
+        if: always() && steps.iron-python.outcome == 'success' && github.event_name != 'pull_request'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}\npu-cache
           key: gufo-npu-windows-v1-${{ steps.iron.outputs.key }}-${{ github.run_id }}-${{ github.run_attempt }}
 
+      # Any new archive is a port build a rerun would repeat, so the threshold
+      # is 1 MiB. An empty result, such as from a failed measurement, saves.
+      - name: Measure vcpkg binary cache growth
+        id: vcpkg-growth
+        if: always() && github.event_name == 'pull_request' && steps.configure.outcome != 'skipped'
+        continue-on-error: true
+        run: python tools/ci/cache_growth.py check "$env:RUNNER_TEMP\vcpkg-archives" "$env:RUNNER_TEMP\vcpkg-growth.json" --min-mib 1 >> $env:GITHUB_OUTPUT
+
+      # A pull request saves when it built new archives. Without a measurement
+      # it saves only when nothing for its manifest and toolchain was restored,
+      # such as after it changed vcpkg.json or TheRock.
       - name: Save vcpkg binary cache
-        if: always() && steps.configure.outcome != 'skipped'
+        if: >-
+          always() && steps.configure.outcome != 'skipped' &&
+          (github.event_name != 'pull_request' ||
+          steps.vcpkg-growth.outputs.save == 'true' ||
+          steps.vcpkg-growth.outputs.save != 'false' &&
+          !startsWith(steps.vcpkg-cache.outputs.cache-matched-key,
+          format('gufo-vcpkg-v4-{0}-{1}-{2}-', runner.os, env.SDK_TARBALL, hashFiles('vcpkg.json', 'cmake/toolchains/windows-therock.cmake'))))
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}\vcpkg-archives
-          key: gufo-vcpkg-v4-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: gufo-vcpkg-v4-${{ runner.os }}-${{ env.SDK_TARBALL }}-${{ hashFiles('vcpkg.json', 'cmake/toolchains/windows-therock.cmake') }}-${{ github.run_id }}-${{ github.run_attempt }}

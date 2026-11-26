@@ -3,11 +3,11 @@
 #include <bit>
 #include <cstring>
 #include <gufo/ext/experimental/managed_alloc.hpp>
+#include <gufo/ext/families/qwen/draft_vocab/draft_vocab.hpp>
 #include <stdexcept>
 #include <tuple>
 
 #include "qfn_mmq.h"
-#include "src/families/qwen/draft_vocab/draft_vocab.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
@@ -963,7 +963,7 @@ bool Executor::QuantizeBatch(const float* x, std::uint32_t rows,
 
 bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
                           std::uint32_t rows, std::string* error) const {
-  if (rows <= kDecodeRows)
+  if (rows <= kDecodeRows || w.format_state != nullptr)
     return Dense(w, x, out, rows, error);
   if (w.decode != nullptr) {
     // A K-quant projection's isolated decode reads its compact rows; the

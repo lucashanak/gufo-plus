@@ -46,24 +46,9 @@ bool ParseOpenAiResponseMessage(const json::Value& item,
 std::optional<ReasoningEffort> ParseReasoningEffortName(std::string_view value);
 
 /// Messages tools and tool_choice, mapped onto the Chat tool declarations so
-/// framing, schema constraints and replayed tool turns match Chat. The
-/// tool_addition / tool_removal blocks of system turns are applied in order.
+/// framing, schema constraints and replayed tool turns match Chat.
 std::optional<HttpResponse> ParseAnthropicToolControls(const json::Value& body,
                                                        ChatRequest* chat);
-/// Whether a Messages content block is a tool_addition or tool_removal.
-bool IsAnthropicToolChange(const json::Value& block);
-/// One Messages image block (base64 or HTTPS URL source), appended to the
-/// message at the current end of its text.
-bool ParseAnthropicImage(const json::Value& block,
-                         tokenization::ChatMessage* message,
-                         core::ImageReadBudget& budget, std::string* error);
-/// One Messages turn with tool_use or tool_result blocks. Each tool_result
-/// becomes a tool message, with its images; text and images in the same user
-/// turn follow as a user message.
-bool ParseAnthropicToolMessage(const json::Value& item,
-                               std::vector<tokenization::ChatMessage>* messages,
-                               core::ImageReadBudget& budget,
-                               std::string* error);
 /// Responses text output uses the same reasoning/UTF-8 filter and scheduler
 /// as Chat Completions, including streaming cancellation and cache retention.
 /// `model` is the served name to report; empty reports the primary name.
