@@ -130,7 +130,9 @@ __launch_bounds__(192) __global__
 // the per-row kernels bit for bit. The block walks the union of its rows'
 // partitions, loads the next tile into registers while the current one is
 // consumed, and scores two tokens before their in-order softmax steps.
-template<unsigned Rows, unsigned Lanes, unsigned Tile>
+// 8-bit rows dequantize while fetching, so the tile holds the f16(scale *
+// code) values the per-row Kv8 kernel stages and the arithmetic is unchanged.
+template<unsigned Rows, unsigned Lanes, unsigned Tile, bool Kv8>
 __launch_bounds__(Rows * 6 * Lanes) __global__
     void QwenVerifySharedRowsAttentionPartialsKernel(
         const float* __restrict__ q, const __half* __restrict__ k_cache,
@@ -165,7 +167,7 @@ __launch_bounds__(Rows * 6 * Lanes) __global__
 
   const std::size_t kv_width =
       static_cast<std::size_t>(num_kv_heads) * head_dim;
-  const std::size_t cache_head_offset =
+  [[maybe_unused]] const std::size_t cache_head_offset =
       (static_cast<std::size_t>(layer_idx) * max_context * kv_width) +
       (static_cast<std::size_t>(kv_head) * head_dim);
   const float scale = rsqrtf(static_cast<float>(head_dim));
@@ -194,10 +196,25 @@ __launch_bounds__(Rows * 6 * Lanes) __global__
   const auto fetch = [&](std::size_t begin) {
     if (stages) {
       const std::size_t token = min(begin + stage_token, union_end - 1);
-      const std::size_t offset =
-          cache_head_offset + (token * kv_width) + stage_element;
-      next_key = *reinterpret_cast<const uint4*>(k_cache + offset);
-      next_value = *reinterpret_cast<const uint4*>(v_cache + offset);
+      if constexpr (Kv8) {
+        const std::size_t cache_row =
+            static_cast<std::size_t>(layer_idx) * max_context + token;
+        const std::size_t row_offset = cache_row * kv8::RowBytes(kv_width);
+        const auto in_row =
+            static_cast<std::uint32_t>(kv_head * head_dim + stage_element);
+        const auto width = static_cast<std::uint32_t>(kv_width);
+        next_key = kv8::LoadHalf8(
+            reinterpret_cast<const std::uint8_t*>(k_cache) + row_offset, width,
+            in_row);
+        next_value = kv8::LoadHalf8(
+            reinterpret_cast<const std::uint8_t*>(v_cache) + row_offset, width,
+            in_row);
+      } else {
+        const std::size_t offset =
+            cache_head_offset + (token * kv_width) + stage_element;
+        next_key = *reinterpret_cast<const uint4*>(k_cache + offset);
+        next_value = *reinterpret_cast<const uint4*>(v_cache + offset);
+      }
     }
   };
 
@@ -237,14 +254,14 @@ __launch_bounds__(Rows * 6 * Lanes) __global__
               num_heads, head, split, lane);
 }
 
-template<unsigned Rows, unsigned Lanes, unsigned Tile>
+template<unsigned Rows, unsigned Lanes, unsigned Tile, bool Kv8>
 void LaunchVerifySharedRows(const float* q, const __half* k_cache,
                             const __half* v_cache, float* scratch,
                             std::uint32_t layer_idx, std::uint32_t start_pos,
                             std::uint32_t max_context, std::uint32_t num_heads,
                             std::uint32_t num_kv_heads, std::uint32_t splits,
                             hipStream_t stream) {
-  QwenVerifySharedRowsAttentionPartialsKernel<Rows, Lanes, Tile>
+  QwenVerifySharedRowsAttentionPartialsKernel<Rows, Lanes, Tile, Kv8>
       <<<dim3(num_kv_heads, splits), Rows * 6 * Lanes, 0, stream>>>(
           q, k_cache, v_cache, scratch, layer_idx, start_pos, max_context,
           num_heads, num_kv_heads, splits);
@@ -261,38 +278,45 @@ void LaunchVerifySplitKAttentionHalfPartialsWave64(
   assert(num_kv_heads % 2 == 0 && "wave64 verification pairs KV heads");
   assert(num_heads == 6 * num_kv_heads && "twelve query heads per block");
   assert(rows > 1 && "single rows keep the 32-lane kernel");
+  // Shared-row geometries measured on gfx1151 (four KV heads, 0.8K to 48K
+  // context): 16-lane heads up to five rows, 8-lane heads from six, and as
+  // many tile tokens as one uint4 per thread stages. 8-bit rows reuse them.
+  const auto shared_rows = [&]<bool Kv8>() {
+    const auto launch = [&](auto kernel) {
+      kernel(q, k_cache, v_cache, scratch, layer_idx, start_pos, max_context,
+             num_heads, num_kv_heads, splits, stream);
+      return true;
+    };
+    switch (rows) {
+      case 2:
+        return launch(LaunchVerifySharedRows<2, 16, 4, Kv8>);
+      case 3:
+        return launch(LaunchVerifySharedRows<3, 16, 8, Kv8>);
+      case 4:
+        return launch(LaunchVerifySharedRows<4, 16, 8, Kv8>);
+      case 5:
+        return launch(LaunchVerifySharedRows<5, 16, 8, Kv8>);
+      case 6:
+        return launch(LaunchVerifySharedRows<6, 8, 8, Kv8>);
+      case 7:
+        return launch(LaunchVerifySharedRows<7, 8, 8, Kv8>);
+      case 8:
+        return launch(LaunchVerifySharedRows<8, 8, 8, Kv8>);
+      default:
+        return false;
+    }
+  };
   if (kv8) {
+    if (shared_rows.template operator()<true>())
+      return;
     QwenVerifySplitKAttentionHalfPartialsWave64Kernel<true>
         <<<dim3(num_kv_heads / 2, rows, splits), 192, 0, stream>>>(
             q, k_cache, v_cache, scratch, layer_idx, start_pos, max_context,
             num_heads, num_kv_heads, splits);
     return;
   }
-  // Shared-row geometries measured on gfx1151 (four KV heads, 0.8K to 48K
-  // context): 16-lane heads up to five rows, 8-lane heads from six, and as
-  // many tile tokens as one uint4 per thread stages.
-  const auto launch = [&](auto kernel) {
-    kernel(q, k_cache, v_cache, scratch, layer_idx, start_pos, max_context,
-           num_heads, num_kv_heads, splits, stream);
-  };
-  switch (rows) {
-    case 2:
-      return launch(LaunchVerifySharedRows<2, 16, 4>);
-    case 3:
-      return launch(LaunchVerifySharedRows<3, 16, 8>);
-    case 4:
-      return launch(LaunchVerifySharedRows<4, 16, 8>);
-    case 5:
-      return launch(LaunchVerifySharedRows<5, 16, 8>);
-    case 6:
-      return launch(LaunchVerifySharedRows<6, 8, 8>);
-    case 7:
-      return launch(LaunchVerifySharedRows<7, 8, 8>);
-    case 8:
-      return launch(LaunchVerifySharedRows<8, 8, 8>);
-    default:
-      break;
-  }
+  if (shared_rows.template operator()<false>())
+    return;
   QwenVerifySplitKAttentionHalfPartialsWave64Kernel<false><<<
       dim3(num_kv_heads / 2, rows, splits), 192, 0, stream>>>(
       q, k_cache, v_cache, scratch, layer_idx, start_pos, max_context,
