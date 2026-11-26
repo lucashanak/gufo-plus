@@ -258,7 +258,7 @@ public:
                });
       };
       if (!object_root(object_root, *root, false, 0))
-        Invalid("the root must have type object, or be an anyOf of objects");
+        Invalid("the root must have type object");
       grammar_->root_ = Seq({ws_, Visit(schema_, 0), ws_});
       grammar_->prompt_ =
           "Respond with a single JSON object matching this JSON Schema:\n" +
