@@ -36,6 +36,17 @@ For a DFlash2 draft GGUF pass `--min-layers 1`: the draft has only five
 layers, so some projections occur once. Its shapes go into `LaunchQ4K`, the
 draft block of `verify_gemm_27b.hip`.
 
+A target GGUF also lists its output head (`output.weight`, Q6_K 248320 x 5120
+on UD-Q4_K_XL), which every verification pass multiplies at 2-8 rows, and
+the two head shapes of a DFlash2 draft block, which multiplies the target's
+head at 1-7 rows: the leading 98,304 rows in place (`kDraftVocabPrefix`) and
+the 1,024-row per-request table copied from it (`kDraftVocabExtraRows`).
+Each counts as one layer and is swept whatever `--min-layers` says, at its
+own row counts within `--batches`; one-row drafts keep the generic dispatch
+(`TryLaunchVerifyGemm27` takes 2-8 rows). A draft GGUF lists no head. The
+whole head is 1.04 GB, so its sweep needs about 2.1 GB of device memory for
+two copies and rereads the tensor from the file for every row count.
+
 The binary also runs on its own:
 `qwen27b_verify_sweep <gguf> <offset> <type> <m> <k> <batch> [rounds]`, with
 the absolute file offset of the tensor and the GGUF type id (12 Q4_K, 13 Q5_K,

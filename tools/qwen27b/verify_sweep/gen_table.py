@@ -44,6 +44,11 @@ ROLES = {(1024, 5120): "attn_k/attn_v", (1280, 5120): "draft conv",
          (17408, 5120): "ffn_gate/ffn_up",
          (34816, 5120): "joined ffn_gate+ffn_up",
          (5120, 6144): "ssm_out/attn_output"}
+# Output head shapes by type, since a head shape may match a layer shape of
+# another format (Q4_K attn_k/attn_v is also 1024 x 5120).
+HEAD_ROLES = {(248320, 5120): "output head",
+              (98304, 5120): "draft prefix head",
+              (1024, 5120): "draft table head"}
 BASE = re.compile(r"^base type=(\d+) m=(\d+) k=(\d+) batch=(\d+) ")
 CANDIDATE = re.compile(r"^cand (.+) ([\d.]+) us \d+ GB/s [+-][\d.]+%$")
 
@@ -51,8 +56,10 @@ CANDIDATE = re.compile(r"^cand (.+) ([\d.]+) us \d+ GB/s [+-][\d.]+%$")
 def layers(model: Path, min_layers: int):
     """Return {(type, m, k): (layer count, tensor role)} as sweep.py sweeps them."""
     found = {}
-    for kind, m, k, _offset, count, name in projections(model):
-        if count >= min_layers:
+    for kind, m, k, _offset, count, name, heads in projections(model):
+        if heads is not None:
+            found[(kind, m, k)] = (count, HEAD_ROLES.get((m, k), name))
+        elif count >= min_layers:
             role = name if name.startswith("packed") else name.split(".")[2]
             found[(kind, m, k)] = (count, role)
     return found
@@ -110,7 +117,9 @@ def emit(listed):
         for m, k in shapes:
             rows = sorted(b for (t, mm, kk, b) in listed
                           if (t, mm, kk) == (kind, m, k))
-            role = ROLES.get((m, k), listed[(kind, m, k, rows[0])][2])
+            role = listed[(kind, m, k, rows[0])][2]
+            if role not in HEAD_ROLES.values():
+                role = ROLES.get((m, k), role)
             lines += [f"  if (Is(m, k, {m}, {k})) {{  // {role}",
                       "    switch (batch) {"]
             for batch in rows:

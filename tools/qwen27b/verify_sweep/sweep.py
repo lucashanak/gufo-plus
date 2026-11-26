@@ -3,7 +3,8 @@
 
     python3 tools/qwen27b/verify_sweep/sweep.py --binary <qwen27b_verify_sweep> <model.gguf>
 
-Lists every distinct (type, m, k) projection of the transformer layers, runs
+Lists every distinct (type, m, k) projection of the transformer layers and,
+in a target GGUF, the output head shapes (see HEADS), runs
 qwen27b_verify_sweep on one example tensor of each at every requested row
 count, and prints the fastest exact candidate per projection and row count.
 Gains of at least --min-gain percent are also printed in the Launch<> syntax
@@ -24,6 +25,22 @@ import sys
 # GGUF type id -> bytes per 256 weights; the formats the sweep binary measures.
 BLOCK_BYTES = {12: 144, 13: 176, 14: 210, 23: 136}
 TYPE_NAMES = {12: "Q4_K", 13: "Q5_K", 14: "Q6_K", 23: "IQ4_XS"}
+# Output head shapes, as (row count or None for the whole vocabulary, name,
+# row counts the head runs at). The DFlash2 draft has no head of its own: it
+# multiplies the target's output.weight (QwenDFlashGpuModel::Create), so these
+# come from the target GGUF only. Verification runs the whole head at 2-8
+# rows, and a draft block at 1-7: over the whole head, over the leading
+# kDraftVocabPrefix rows in place (draft_vocab.hpp), and over the request's
+# kDraftVocabExtraRows-row table copied from the head. TryLaunchVerifyGemm27
+# and the sweep binary take 2-8 rows, so one-row drafts keep the generic
+# dispatch and are not swept.
+DRAFT_VOCAB_PREFIX = 98304
+DRAFT_VOCAB_EXTRA_ROWS = 1024
+HEADS = ((None, "output.weight", (2, 3, 4, 5, 6, 7, 8)),
+         (DRAFT_VOCAB_PREFIX, "output.weight draft prefix",
+          (2, 3, 4, 5, 6, 7)),
+         (DRAFT_VOCAB_EXTRA_ROWS, "output.weight draft table",
+          (2, 3, 4, 5, 6, 7)))
 CANDIDATE = re.compile(r"^cand (.+) [\d.]+ us (\d+) GB/s ([+-][\d.]+)%$")
 BASE = re.compile(r"^base .* [\d.]+ us (\d+) GB/s$")
 
@@ -53,6 +70,12 @@ def read_value(f, kind):
 
 def tensors(path):
     """Return [(name, type, ne, absolute offset)] without reading weights."""
+    return read_gguf(path)[1]
+
+
+def read_gguf(path):
+    """Return (general.architecture, tensors()) without reading weights."""
+    architecture = ""
     with open(path, "rb") as f:
         if f.read(4) != b"GGUF":
             sys.exit(f"{path}: not a GGUF file")
@@ -64,6 +87,8 @@ def tensors(path):
             value = read_value(f, read(f, "I"))
             if key == "general.alignment":
                 alignment = value
+            elif key == "general.architecture":
+                architecture = value
         infos = []
         for _ in range(n_tensors):
             name = read_string(f)
@@ -71,13 +96,22 @@ def tensors(path):
             kind = read(f, "I")
             infos.append((name, kind, ne, read(f, "Q")))
         start = (f.tell() + alignment - 1) // alignment * alignment
-    return [(name, kind, ne, start + offset) for name, kind, ne, offset in infos]
+    return architecture, [(name, kind, ne, start + offset)
+                          for name, kind, ne, offset in infos]
 
 
 def projections(path):
-    """Return [(type, m, k, offset, layer_count, example_name)]."""
+    """Return [(type, m, k, offset, layer_count, example_name, batches)].
+
+    `batches` is None for layer projections (sweep the requested row counts)
+    and the row counts an output head runs at for the HEADS entries, which
+    count as one layer each and are swept whatever --min-layers says."""
+    architecture, infos = read_gguf(path)
     layers = collections.defaultdict(dict)
-    for name, kind, ne, offset in tensors(path):
+    head = None
+    for name, kind, ne, offset in infos:
+        if name == "output.weight" and len(ne) == 2 and kind in BLOCK_BYTES:
+            head = (kind, ne[1], ne[0], offset)
         parts = name.split(".")
         if parts[0] != "blk" or len(ne) != 2 or kind not in BLOCK_BYTES:
             continue
@@ -97,7 +131,18 @@ def projections(path):
         if packed:
             key = (gate[0], 2 * gate[1], gate[2])
             found.setdefault(key, [gate[3], 0, "packed ffn_gate+ffn_up"])[1] += 1
-    return [(kind, m, k, offset, count, name)
+    heads = {}
+    if head is not None and architecture != "dflash":
+        kind, vocab, k, offset = head
+        for rows, name, batches in HEADS:
+            m = vocab if rows is None else rows
+            if m > vocab:
+                continue
+            # A head's leading rows are a prefix of the row-major matrix.
+            if (kind, m, k) not in found:
+                heads[(kind, m, k)] = batches
+            found.setdefault((kind, m, k), [offset, 0, name])[1] += 1
+    return [(kind, m, k, offset, count, name, heads.get((kind, m, k)))
             for (kind, m, k), (offset, count, name) in found.items()]
 
 
@@ -119,10 +164,12 @@ def main() -> int:
 
     log = []
     rows = []
-    for kind, m, k, offset, count, name in projections(args.model):
-        if count < args.min_layers:
+    for kind, m, k, offset, count, name, only in projections(args.model):
+        if only is None and count < args.min_layers:
             continue
         for batch in batches:
+            if only is not None and batch not in only:
+                continue
             lines = subprocess.run(
                 [str(args.binary), str(args.model), str(offset), str(kind),
                  str(m), str(k), str(batch), str(args.rounds)],
