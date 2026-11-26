@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <numeric>
@@ -14,6 +15,7 @@
 
 #include "src/models/qwen36_35b_a3b/kernels/rocm/kernels.hpp"
 #include "src/models/qwen36_35b_a3b/kernels/rocm/mmq/q36_mmq.h"
+#include "tests/models/qwen36_35b_a3b/quant_fixtures.hpp"
 
 namespace {
 
@@ -286,6 +288,330 @@ void CheckRouter(int tokens, int experts, int used, int pattern) {
   (void)hipFree(d_ids);
 }
 
+namespace fx = gufo::models::qwen36_35b_a3b::test;
+
+template<typename T>
+T* DeviceCopy(const std::vector<T>& host) {
+  T* device = nullptr;
+  CheckHip(hipMalloc(&device, host.size() * sizeof(T)), "hipMalloc");
+  CheckHip(hipMemcpy(device, host.data(), host.size() * sizeof(T),
+                     hipMemcpyHostToDevice),
+           "upload");
+  return device;
+}
+
+std::vector<std::uint8_t> Bytes(const void* device, std::size_t bytes) {
+  std::vector<std::uint8_t> host(bytes);
+  CheckHip(hipMemcpy(host.data(), device, bytes, hipMemcpyDeviceToHost),
+           "download");
+  return host;
+}
+
+// The decode MoE prologue (top-k, routed Q8_1 input and shared gate/up in
+// one launch) must write exactly what RouterTopK, the tier's
+// quantize_q8_1 and DenseQ6KVec write: ids, weights, Q8_1 bytes and SwiGLU
+// rows, byte for byte, at widths 1-8. The model's routing: 256 experts,
+// top-8; hidden 2048, shared expert 512.
+void CheckPrologue(int pattern) {
+  namespace q = gufo::models::qwen36_35b_a3b::rocm;
+  constexpr int kRows = 8, kRouted = 256, kTop = 8, kStride = kRouted + 1;
+  constexpr int kHidden = 2048, kShared = 512;
+  constexpr float kInf = std::numeric_limits<float>::infinity();
+  constexpr float kNan = std::numeric_limits<float>::quiet_NaN();
+  std::uint32_t random = 0x9E3779B9U + static_cast<std::uint32_t>(pattern);
+  std::vector<float> logits(static_cast<std::size_t>(kRows) * kStride);
+  for (int t = 0; t < kRows; ++t) {
+    for (int e = 0; e < kStride; ++e) {
+      const auto bits = NextRandom(&random);
+      float v =
+          static_cast<float>(static_cast<int>(bits % 16384) - 8192) / 1024.0F;
+      if (pattern == 1) {
+        v = static_cast<float>(bits % 8);  // many exact ties
+      } else if (pattern == 2) {
+        v = 0.0F;
+      } else if (pattern == 3 && e % 3 == 0) {
+        v = -kInf;
+      } else if (pattern == 4) {
+        v = static_cast<float>(bits % 8) * 1e-41F;  // subnormal logits
+      } else if (pattern == 5) {
+        v *= 1e30F;
+      } else if (pattern == 6 && e == 7 * t + 3) {
+        v = t % 3 == 0 ? kNan : t % 3 == 1 ? kInf : -kInf;
+      }
+      logits[static_cast<std::size_t>(t) * kStride + e] = v;
+    }
+  }
+  // Hidden rows: ordinary, zero, small, subnormal, huge, zero blocks,
+  // nonfinite elements, and exact rounding ties (amax 127 gives d = 1).
+  std::vector<float> x(static_cast<std::size_t>(kRows) * kHidden);
+  for (int t = 0; t < kRows; ++t) {
+    for (int i = 0; i < kHidden; ++i) {
+      float v = fx::Uniform(&random, 2.0F);
+      switch ((t + pattern) % kRows) {
+        case 1:
+          v = 0.0F;
+          break;
+        case 2:
+          v /= 128.0F;
+          break;
+        case 3:
+          v *= 1e-39F;
+          break;
+        case 4:
+          v *= 1e30F;
+          break;
+        case 5:
+          v = (i / 32) % 2 ? 0.0F : 2.0F * v;
+          break;
+        case 6:
+          if (i == 100)
+            v = kInf;
+          if (i == 1000)
+            v = kNan;
+          if (i == 1500)
+            v = -kInf;
+          break;
+        case 7: {
+          constexpr float kTies[] = {127.0F, 2.5F, -3.5F, 0.5F, -0.5F, 63.5F};
+          v = kTies[(i * 7 + t) % 6];
+          break;
+        }
+        default:
+          break;
+      }
+      x[static_cast<std::size_t>(t) * kHidden + i] = v;
+    }
+  }
+  auto gate = fx::MakeQ6K(1, kShared, kHidden, 0x6A7E0001U);
+  auto up = fx::MakeQ6K(1, kShared, kHidden, 0x6A7E0002U);
+  auto* d_gate = DeviceCopy(gate.packed);
+  auto* d_up = DeviceCopy(up.packed);
+  if (!q::RepackQ6KRows(d_gate, kShared, kHidden) ||
+      !q::RepackQ6KRows(d_up, kShared, kHidden))
+    throw std::runtime_error("Q6_K repack rejected the shared expert");
+  auto* d_logits = DeviceCopy(logits);
+  auto* d_x = DeviceCopy(x);
+  constexpr std::size_t kGuard = 256;
+  const std::size_t id_bytes = kRows * kTop * sizeof(std::int32_t) + kGuard;
+  const std::size_t q8_bytes = q36_mmq_q8_1_bytes(kRows, kHidden) + kGuard;
+  const std::size_t y_bytes = kRows * kShared * sizeof(float) + kGuard;
+  void* ref[4] = {};
+  void* got[4] = {};
+  const std::size_t sizes[4] = {id_bytes, id_bytes, q8_bytes, y_bytes};
+  for (int i = 0; i < 4; ++i) {
+    CheckHip(hipMalloc(&ref[i], sizes[i]), "reference output");
+    CheckHip(hipMalloc(&got[i], sizes[i]), "prologue output");
+  }
+  const auto run = [&](int n, int first) {
+    for (int i = 0; i < 4; ++i) {
+      CheckHip(hipMemset(ref[i], 0xA5, sizes[i]), "guard");
+      CheckHip(hipMemset(got[i], 0xA5, sizes[i]), "guard");
+    }
+    const float* lg = d_logits + static_cast<std::size_t>(first) * kStride;
+    const float* xr = d_x + static_cast<std::size_t>(first) * kHidden;
+    q::RouterTopK(lg, kStride, static_cast<std::int32_t*>(ref[0]),
+                  static_cast<float*>(ref[1]), n, kRouted, kTop, nullptr);
+    if (q36_mmq_quantize_q8_1(xr, ref[2], n, kHidden, nullptr) != 0 ||
+        !q::DenseQ6KVec(d_gate, xr, static_cast<float*>(ref[3]), n, kShared,
+                        kHidden, nullptr, d_up) ||
+        !q::MoeSharedPrologue(lg, kStride, static_cast<std::int32_t*>(got[0]),
+                              static_cast<float*>(got[1]), kRouted, kTop, xr,
+                              got[2], d_gate, d_up, static_cast<float*>(got[3]),
+                              n, kShared, kHidden, nullptr))
+      throw std::runtime_error("prologue reference launch failed");
+    CheckHip(hipDeviceSynchronize(), "prologue");
+    const char* names[4] = {"ids", "weights", "Q8_1 bytes", "shared SwiGLU"};
+    const std::size_t used_bytes[4] = {
+        static_cast<std::size_t>(n) * kTop * sizeof(std::int32_t),
+        static_cast<std::size_t>(n) * kTop * sizeof(float),
+        q36_mmq_q8_1_bytes(n, kHidden),
+        static_cast<std::size_t>(n) * kShared * sizeof(float)};
+    for (int i = 0; i < 4; ++i) {
+      const auto a = Bytes(ref[i], sizes[i]);
+      const auto b = Bytes(got[i], sizes[i]);
+      const auto diff = std::mismatch(a.begin(), a.end(), b.begin());
+      if (diff.first != a.end()) {
+        throw std::runtime_error(
+            std::string("prologue ") + names[i] + " differ at byte " +
+            std::to_string(diff.first - a.begin()) + ", pattern " +
+            std::to_string(pattern) + ", rows " + std::to_string(first) + ".." +
+            std::to_string(first + n - 1));
+      }
+      for (std::size_t j = used_bytes[i]; j < sizes[i]; ++j)
+        if (b[j] != 0xA5)
+          throw std::runtime_error(std::string("prologue ") + names[i] +
+                                   " overwrote its guard");
+    }
+  };
+  for (int first = 0; first < kRows; ++first)
+    run(1, first);
+  for (int n = 2; n <= kRows; ++n) {
+    run(n, 0);
+    run(n, kRows - n);
+  }
+  for (int i = 0; i < 4; ++i) {
+    CheckHip(hipFree(ref[i]), "free");
+    CheckHip(hipFree(got[i]), "free");
+  }
+  for (void* p : {static_cast<void*>(d_gate), static_cast<void*>(d_up),
+                  static_cast<void*>(d_logits), static_cast<void*>(d_x)})
+    CheckHip(hipFree(p), "free");
+}
+
+/// Host copies of group_moe_slots / group_moe_rows: only the entries the
+/// routed kernels read are defined.
+bool SlotGroupsMatch(const std::vector<std::int32_t>& ids,
+                     const std::vector<std::int32_t>& g, int tokens, int used) {
+  for (int anchor = 0; anchor < tokens * used; ++anchor) {
+    const std::int32_t* group = g.data() + anchor * (tokens + 1);
+    const int expert = ids[anchor];
+    if (expert < 0) {
+      if (group[0] != -2)
+        return false;
+      continue;
+    }
+    if (std::find(ids.begin(), ids.begin() + anchor, expert) !=
+        ids.begin() + anchor) {
+      if (group[0] != -1)
+        return false;
+      continue;
+    }
+    if (group[0] != expert)
+      return false;
+    for (int t = 0; t < tokens; ++t) {
+      std::uint32_t slots = 0;
+      for (int j = 0; j < used; ++j)
+        if (ids[t * used + j] == expert)
+          slots |= std::uint32_t{1} << j;
+      if (group[t + 1] != static_cast<std::int32_t>(slots))
+        return false;
+    }
+  }
+  return true;
+}
+
+bool RowGroupsMatch(const std::vector<std::int32_t>& ids,
+                    const std::vector<std::int32_t>& g, int n_rows) {
+  for (int row = 0; row < n_rows; ++row) {
+    const std::int32_t* group = g.data() + 3 * row;
+    const int expert = ids[row];
+    if (expert < 0) {
+      if (group[0] != -2)
+        return false;
+      continue;
+    }
+    if (std::find(ids.begin(), ids.begin() + row, expert) !=
+        ids.begin() + row) {
+      if (group[0] != -1)
+        return false;
+      continue;
+    }
+    std::uint64_t mask = 0;
+    for (int i = row; i < n_rows; ++i)
+      if (ids[i] == expert)
+        mask |= std::uint64_t{1} << i;
+    const auto lo = static_cast<std::int32_t>(static_cast<std::uint32_t>(mask));
+    const auto hi =
+        static_cast<std::int32_t>(static_cast<std::uint32_t>(mask >> 32));
+    if (group[0] != expert || group[1] != lo || group[2] != hi)
+      return false;
+  }
+  return true;
+}
+
+// The grouping block of the shared down launch against the tier's grouping
+// rules: router-like rows, shared experts, disjoint experts, duplicate
+// slots and inactive (-1) slots; untouched memory past the tables.
+void CheckGroupTables() {
+  namespace q = gufo::models::qwen36_35b_a3b::rocm;
+  constexpr int kTop = 8, kDownRows = 8, kDownCols = 512;
+  auto w = fx::MakeQ6K(1, kDownRows, kDownCols, 0x6D0A0001U);
+  auto* d_w = DeviceCopy(w.packed);
+  if (!q::RepackQ6KRows(d_w, kDownRows, kDownCols))
+    throw std::runtime_error("Q6_K repack rejected the down rows");
+  std::vector<float> x(8 * kDownCols);
+  std::uint32_t seed = 0x6D0A0002U;
+  for (float& v : x)
+    v = fx::Uniform(&seed, 1.0F);
+  auto* d_x = DeviceCopy(x);
+  float *d_y = nullptr, *d_ref = nullptr;
+  CheckHip(hipMalloc(&d_y, 8 * kDownRows * sizeof(float)), "down output");
+  CheckHip(hipMalloc(&d_ref, 8 * kDownRows * sizeof(float)), "down output");
+  const std::size_t slot_count = 8 * kTop * 9, row_count = 64 * 3;
+  std::int32_t *d_slots = nullptr, *d_rows = nullptr;
+  CheckHip(hipMalloc(&d_slots, (slot_count + 64) * 4), "slot groups");
+  CheckHip(hipMalloc(&d_rows, (row_count + 64) * 4), "row groups");
+  constexpr std::int32_t kPoison = 0x7B7B7B7B;
+  for (int pattern = 0; pattern < 4; ++pattern) {
+    for (int n = 1; n <= 8; ++n) {
+      std::vector<std::int32_t> ids(static_cast<std::size_t>(n) * kTop);
+      std::uint32_t r = 0xC0DE0000U + pattern * 16 + n;
+      for (int t = 0; t < n; ++t) {
+        for (int j = 0; j < kTop; ++j) {
+          int e = 0;
+          if (pattern == 0)
+            e = (t + 3 * j) % 16;  // router-like
+          else if (pattern == 1)
+            e = (5 * j) % 8;  // all shared
+          else if (pattern == 2)
+            e = 8 * t + j;  // disjoint
+          else
+            e = NextRandom(&r) % 9 == 0 ? -1 : int(NextRandom(&r) % 6);
+          ids[t * kTop + j] = e;
+        }
+      }
+      auto* d_ids = DeviceCopy(ids);
+      CheckHip(hipMemset(d_slots, 0x7B, (slot_count + 64) * 4), "poison");
+      CheckHip(hipMemset(d_rows, 0x7B, (row_count + 64) * 4), "poison");
+      if (!q::MoeSharedDownGroups(d_w, d_x, d_y, n, kDownRows, kDownCols, d_ids,
+                                  kTop, n > 1 ? d_slots : nullptr, d_rows,
+                                  nullptr) ||
+          !q::DenseQ6KVec(d_w, d_x, d_ref, n, kDownRows, kDownCols, nullptr))
+        throw std::runtime_error("grouping launch rejected the shape");
+      CheckHip(hipDeviceSynchronize(), "grouping");
+      std::vector<std::int32_t> slots(slot_count + 64), rows(row_count + 64);
+      CheckHip(hipMemcpy(slots.data(), d_slots, slots.size() * 4,
+                         hipMemcpyDeviceToHost),
+               "slot groups download");
+      CheckHip(hipMemcpy(rows.data(), d_rows, rows.size() * 4,
+                         hipMemcpyDeviceToHost),
+               "row groups download");
+      const std::size_t slot_used =
+          n > 1 ? static_cast<std::size_t>(n) * kTop * (n + 1) : 0;
+      const std::size_t row_used = static_cast<std::size_t>(n) * kTop * 3;
+      bool ok = (n == 1 || SlotGroupsMatch(ids, slots, n, kTop)) &&
+                RowGroupsMatch(ids, rows, n * kTop);
+      for (std::size_t i = slot_used; i < slots.size(); ++i)
+        ok = ok && slots[i] == kPoison;
+      for (std::size_t i = row_used; i < rows.size(); ++i)
+        ok = ok && rows[i] == kPoison;
+      if (!ok)
+        throw std::runtime_error("grouping tables differ, pattern " +
+                                 std::to_string(pattern) + ", " +
+                                 std::to_string(n) + " rows");
+      if (Bytes(d_y, n * kDownRows * sizeof(float)) !=
+          Bytes(d_ref, n * kDownRows * sizeof(float)))
+        throw std::runtime_error("grouping launch changed the down rows");
+      CheckHip(hipFree(d_ids), "free");
+    }
+  }
+  // Shapes the single grouping block cannot cover are rejected unlaunched:
+  // a slot table for one token, more than 64 down rows, nine tokens.
+  auto* d_zero = DeviceCopy(std::vector<std::int32_t>(128, 0));
+  if (q::MoeSharedDownGroups(d_w, d_x, d_y, 1, kDownRows, kDownCols, d_zero,
+                             kTop, d_slots, nullptr, nullptr) ||
+      q::MoeSharedDownGroups(d_w, d_x, d_y, 8, kDownRows, kDownCols, d_zero, 9,
+                             nullptr, d_rows, nullptr) ||
+      q::MoeSharedDownGroups(d_w, d_x, d_y, 9, kDownRows, kDownCols, d_zero,
+                             kTop, nullptr, nullptr, nullptr))
+    throw std::runtime_error("grouping launch accepted an unsupported shape");
+  CheckHip(hipFree(d_zero), "free");
+  for (void* p : {static_cast<void*>(d_w), static_cast<void*>(d_x),
+                  static_cast<void*>(d_y), static_cast<void*>(d_ref),
+                  static_cast<void*>(d_slots), static_cast<void*>(d_rows)})
+    CheckHip(hipFree(p), "free");
+}
+
 }  // namespace
 
 int main() {
@@ -300,6 +626,12 @@ int main() {
     CheckRouter(17, 1024, 32, 1);
     CheckRouter(17, 1024, 1, 3);
     std::cout << "Router softmax, ties, guards and replay: passed\n";
+    for (int pattern = 0; pattern < 7; ++pattern)
+      CheckPrologue(pattern);
+    std::cout << "MoE prologue ids, weights, Q8_1 bytes and shared rows "
+                 "identical at widths 1-8: passed\n";
+    CheckGroupTables();
+    std::cout << "MoE grouping tables: passed\n";
     bool ok = true;
     for (int n_tokens : {37, 512, 2048}) {
       const auto ids = MakeIds(n_tokens, 0x1234ABCDU + n_tokens);

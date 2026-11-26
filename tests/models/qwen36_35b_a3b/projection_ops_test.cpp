@@ -857,6 +857,109 @@ void CheckDenseKQuantVec(q::WeightType type, std::uint32_t rows,
     CheckHip(hipFree(p), "K-quant free");
 }
 
+// The decode MoE launches that carry extra block roles (top-k, Q8_1 input,
+// grouping tables) must compute the shared expert exactly as DenseQ6KVec:
+// same bits at every width 1-8, nothing written past the real rows.
+void CheckSharedExpertLaunches(std::uint32_t rows, std::uint32_t cols,
+                               bool gated) {
+  constexpr std::uint32_t kMaxTokens = 8;
+  constexpr std::uint32_t kExperts = 256, kUsed = 8, kStride = kExperts + 1;
+  const Experts w = MakeQ6K(1, rows, cols, gated ? 0x5E6A0001U : 0x5E6D0001U);
+  const Experts up = gated ? MakeQ6K(1, rows, cols, 0x5E6A0002U) : Experts{};
+  std::vector<float> x(std::size_t(kMaxTokens) * cols);
+  std::uint32_t seed = 0x5EED7U;
+  // Ordinary rows and rows of small activations, which keep products
+  // near F16's subnormal range.
+  for (std::size_t i = 0; i < x.size(); ++i)
+    x[i] = Uniform(&seed, (i / cols) % 2 ? 1.0F / 128.0F : 1.5F);
+  std::vector<float> logits(std::size_t(kMaxTokens) * kStride);
+  for (float& v : logits)
+    v = Uniform(&seed, 4.0F);
+  std::vector<std::int32_t> ids(std::size_t(kMaxTokens) * kUsed);
+  for (std::size_t i = 0; i < ids.size(); ++i)
+    ids[i] = static_cast<std::int32_t>((i * 5 + i / kUsed) % kExperts);
+  void *dw = nullptr, *du = nullptr, *dq8 = nullptr;
+  float *dx = nullptr, *dref = nullptr, *dnew = nullptr, *dlogits = nullptr,
+        *dweights = nullptr;
+  std::int32_t *dids = nullptr, *dslots = nullptr, *drows = nullptr;
+  const std::size_t out_count = std::size_t(kMaxTokens) * rows + 64;
+  CheckHip(hipMalloc(&dw, w.packed.size()), "shared weights");
+  CheckHip(
+      hipMemcpy(dw, w.packed.data(), w.packed.size(), hipMemcpyHostToDevice),
+      "shared weights upload");
+  if (gated) {
+    CheckHip(hipMalloc(&du, up.packed.size()), "shared up weights");
+    CheckHip(hipMemcpy(du, up.packed.data(), up.packed.size(),
+                       hipMemcpyHostToDevice),
+             "shared up upload");
+  }
+  if (!q::RepackQ6KRows(dw, rows, cols) ||
+      (gated && !q::RepackQ6KRows(du, rows, cols)))
+    throw std::runtime_error("Q6_K repack rejected the shape");
+  CheckHip(hipMalloc(&dx, x.size() * sizeof(float)), "shared input");
+  CheckHip(
+      hipMemcpy(dx, x.data(), x.size() * sizeof(float), hipMemcpyHostToDevice),
+      "shared input upload");
+  CheckHip(hipMalloc(&dlogits, logits.size() * sizeof(float)), "logits");
+  CheckHip(hipMemcpy(dlogits, logits.data(), logits.size() * sizeof(float),
+                     hipMemcpyHostToDevice),
+           "logits upload");
+  CheckHip(hipMalloc(&dids, ids.size() * sizeof(std::int32_t)), "ids");
+  CheckHip(hipMemcpy(dids, ids.data(), ids.size() * sizeof(std::int32_t),
+                     hipMemcpyHostToDevice),
+           "ids upload");
+  CheckHip(hipMalloc(&dweights, ids.size() * sizeof(float)), "weights");
+  CheckHip(hipMalloc(&dq8, q36_mmq_q8_1_bytes(kMaxTokens, cols)), "Q8_1 rows");
+  CheckHip(hipMalloc(&dslots, std::size_t(kMaxTokens) * kUsed *
+                                  (kMaxTokens + 1) * sizeof(std::int32_t)),
+           "slot groups");
+  CheckHip(hipMalloc(&drows, 64 * 3 * sizeof(std::int32_t)), "row groups");
+  CheckHip(hipMalloc(&dref, out_count * sizeof(float)), "reference output");
+  CheckHip(hipMalloc(&dnew, out_count * sizeof(float)), "fused output");
+  std::vector<float> ref(out_count), got(out_count);
+  for (std::uint32_t n = 1; n <= kMaxTokens; ++n) {
+    for (int tables = 0; tables < (gated ? 1 : 2); ++tables) {
+      CheckHip(hipMemset(dref, 0xA5, out_count * sizeof(float)), "guard");
+      CheckHip(hipMemset(dnew, 0xA5, out_count * sizeof(float)), "guard");
+      if (!q::DenseQ6KVec(dw, dx, dref, n, rows, cols, nullptr, du))
+        throw std::runtime_error("DenseQ6KVec rejected the shape");
+      const bool launched =
+          gated
+              ? q::MoeSharedPrologue(dlogits, kStride, dids, dweights, kExperts,
+                                     kUsed, dx, dq8, dw, du, dnew, n, rows,
+                                     cols, nullptr)
+              : q::MoeSharedDownGroups(dw, dx, dnew, n, rows, cols, dids, kUsed,
+                                       tables && n > 1 ? dslots : nullptr,
+                                       tables ? drows : nullptr, nullptr);
+      if (!launched)
+        throw std::runtime_error("shared-expert launch rejected the shape");
+      CheckHip(hipDeviceSynchronize(), "shared-expert launches");
+      CheckHip(hipMemcpy(ref.data(), dref, out_count * sizeof(float),
+                         hipMemcpyDeviceToHost),
+               "reference download");
+      CheckHip(hipMemcpy(got.data(), dnew, out_count * sizeof(float),
+                         hipMemcpyDeviceToHost),
+               "fused download");
+      if (std::memcmp(ref.data(), got.data(), out_count * sizeof(float)) != 0)
+        throw std::runtime_error(
+            std::string("shared-expert ") + (gated ? "gate/up" : "down") +
+            " launch differs from DenseQ6KVec at width " + std::to_string(n) +
+            " m=" + std::to_string(rows) + " k=" + std::to_string(cols));
+      for (std::size_t i = std::size_t(n) * rows; i < out_count; ++i)
+        if (std::bit_cast<std::uint32_t>(got[i]) != 0xA5A5A5A5U)
+          throw std::runtime_error("shared-expert launch overwrote its guard");
+    }
+  }
+  std::cout << "shared-expert " << (gated ? "gate/up prologue" : "down+groups")
+            << " m=" << rows << " k=" << cols
+            << ": DenseQ6KVec bits at widths 1-8\n";
+  for (void* p : {dw, du, dq8, static_cast<void*>(dx), static_cast<void*>(dref),
+                  static_cast<void*>(dnew), static_cast<void*>(dlogits),
+                  static_cast<void*>(dweights), static_cast<void*>(dids),
+                  static_cast<void*>(dslots), static_cast<void*>(drows)})
+    CheckHip(hipFree(p), "shared-expert free");
+}
+
 }  // namespace
 
 int main() {
@@ -879,6 +982,14 @@ int main() {
     CheckDenseKQuantVec(q::WeightType::kQ6_K, 2049, 512);
     CheckDenseKQuantVec(q::WeightType::kQ5_K, 4096, 2048);
     CheckDenseKQuantVec(q::WeightType::kQ4_K, 2048, 4096);
+    // The shared expert inside the decode MoE prologue launches: the
+    // model's 512 x 2048 gate/up and 2048 x 512 down (two rows per wave from
+    // two tokens), plus ragged and one-row-per-wave shapes.
+    CheckSharedExpertLaunches(512, 2048, true);
+    CheckSharedExpertLaunches(100, 2048, true);
+    CheckSharedExpertLaunches(2048, 512, false);
+    CheckSharedExpertLaunches(2049, 512, false);
+    CheckSharedExpertLaunches(100, 512, false);
     // Q8_0 decode rows (the MTP block) and their grouping.
     CheckDecodeGrouping(64, 2048);
     CheckDecodeGrouping(512, 2048);

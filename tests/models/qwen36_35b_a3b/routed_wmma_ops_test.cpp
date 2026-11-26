@@ -498,6 +498,139 @@ void CheckVectorGrouping(bool down = false) {
   CheckHip(hipFree(di), "grouping IDs free");
 }
 
+// The decode MoE prologue path: q36_mmq_moe_gated_vec_preq over Q8_1 rows
+// quantized ahead (q36_mmq_quantize_q8_1, whose bytes the prologue copies)
+// with the slot table of MoeSharedDownGroups, and q36_mmq_moe_vec_groups
+// with its row table, must equal the self-contained entries bit for bit:
+// 1-8 tokens, top-8 of 64 experts, every gated and grouped-down format.
+void CheckPreparedVector() {
+  constexpr int experts = 64, used = 8, ff = 256, hidden = 512;
+  constexpr std::size_t guard = 16;
+  constexpr float poison = -1234567.0F;
+  std::vector<float> x(8 * hidden);
+  std::uint32_t seed = 41;
+  for (std::size_t i = 0; i < x.size(); ++i)
+    x[i] = Uniform(&seed, (i / hidden) % 2 ? 1.0F / 128.0F : 2.0F);
+  auto* dx = Upload(x);
+  // The grouping block rides on a shared down launch: any small Q6_K matrix.
+  const auto shared = MakeQ6K(1, 8, 512, 5);
+  auto* dshared = Upload(shared.packed);
+  if (!q::RepackQ6KRows(dshared, 8, 512))
+    throw std::runtime_error("Q6_K repack rejected the shared rows");
+  std::vector<float> shared_x(8 * 512, 0.25F);
+  auto* dshared_x = Upload(shared_x);
+  auto* dshared_y = Upload(std::vector<float>(8 * 8));
+  auto* dq8 = Upload(std::vector<std::uint8_t>(q36_mmq_q8_1_bytes(8, hidden)));
+  auto* dslots = Upload(std::vector<std::int32_t>(8 * used * 9));
+  auto* drows = Upload(std::vector<std::int32_t>(64 * 3));
+  const std::vector<float> dirty(8 * used * hidden + 2 * guard, poison);
+  auto* ref = Upload(dirty);
+  auto* got = Upload(dirty);
+  auto* ref_down = Upload(dirty);
+  auto* got_down = Upload(dirty);
+  const auto same = [&](const float* a, const float* b, const char* what, int n,
+                        int pattern, int f) {
+    const auto ha = Download(a, dirty.size());
+    const auto hb = Download(b, dirty.size());
+    if (std::memcmp(ha.data(), hb.data(), ha.size() * sizeof(float)) != 0)
+      throw std::runtime_error(std::string("prepared ") + what +
+                               " differs: format " + std::to_string(f) +
+                               ", pattern " + std::to_string(pattern) +
+                               ", tokens " + std::to_string(n));
+  };
+  const std::array<q::WeightType, 3> gated_formats = {
+      q::WeightType::kQ4_K, q::WeightType::kQ5_K, q::WeightType::kQ8_0};
+  const std::array<q::WeightType, 3> down_formats = {
+      q::WeightType::kQ4_K, q::WeightType::kQ5_K, q::WeightType::kQ6_K};
+  const auto make = [](q::WeightType type, int m, int k, std::uint32_t s) {
+    return type == q::WeightType::kQ4_K   ? MakeQ4K(experts, m, k, s)
+           : type == q::WeightType::kQ5_K ? MakeQ5K(experts, m, k, s)
+           : type == q::WeightType::kQ6_K ? MakeQ6K(experts, m, k, s)
+                                          : MakeQ8_0(experts, m, k, s);
+  };
+  for (std::size_t f = 0; f < gated_formats.size(); ++f) {
+    auto* gate = Upload(make(gated_formats[f], ff, hidden, 101 + f).packed);
+    auto* up = Upload(make(gated_formats[f], ff, hidden, 201 + f).packed);
+    auto* down = Upload(make(down_formats[f], hidden, ff, 301 + f).packed);
+    // Router-like distinct experts, one set shared by every token, disjoint
+    // sets, and duplicate or inactive slots.
+    for (int pattern = 0; pattern < 4; ++pattern) {
+      for (int n = 1; n <= 8; ++n) {
+        std::vector<std::int32_t> ids(n * used);
+        std::uint32_t r = 0xFACE0000U + pattern * 16 + n;
+        for (int t = 0; t < n; ++t)
+          for (int j = 0; j < used; ++j)
+            ids[t * used + j] = pattern == 0   ? (5 * t + 7 * j) % experts
+                                : pattern == 1 ? (3 * j + 1) % experts
+                                : pattern == 2 ? 8 * t + j
+                                : NextRandom(&r) % 7 == 0
+                                    ? -1
+                                    : static_cast<int>(NextRandom(&r) % 5);
+        auto* di = Upload(ids);
+        for (auto* p : {ref, got, ref_down, got_down})
+          CheckHip(hipMemcpy(p, dirty.data(), dirty.size() * sizeof(float),
+                             hipMemcpyHostToDevice),
+                   "poison output");
+        const int type = static_cast<int>(gated_formats[f]);
+        const int dtype = static_cast<int>(down_formats[f]);
+        if (q36_mmq_moe_gated_vec(type, gate, up, dx, di, ref + guard, ff,
+                                  hidden, n, experts, used, nullptr) ||
+            q36_mmq_moe_vec(dtype, down, ref + guard, di, ref_down + guard,
+                            hidden, ff, n * used, experts, 1, nullptr) ||
+            q36_mmq_quantize_q8_1(dx, dq8, n, hidden, nullptr) ||
+            !q::MoeSharedDownGroups(dshared, dshared_x, dshared_y, n, 8, 512,
+                                    di, used, n > 1 ? dslots : nullptr, drows,
+                                    nullptr) ||
+            q36_mmq_moe_gated_vec_preq(
+                type, gate, up, dq8, n > 1 ? dslots : nullptr, di, got + guard,
+                ff, hidden, n, experts, used, nullptr) ||
+            q36_mmq_moe_vec_groups(dtype, down, got + guard, di, drows,
+                                   got_down + guard, hidden, ff, n * used,
+                                   experts, 1, nullptr))
+          throw std::runtime_error("prepared vector launch failed");
+        CheckHip(hipDeviceSynchronize(), "prepared vector");
+        same(ref, got, "gated vector", n, pattern, static_cast<int>(f));
+        same(ref_down, got_down, "grouped down", n, pattern,
+             static_cast<int>(f));
+        CheckHip(hipFree(di), "IDs free");
+      }
+    }
+    for (void* p : {static_cast<void*>(gate), static_cast<void*>(up),
+                    static_cast<void*>(down)})
+      CheckHip(hipFree(p), "prepared weight free");
+  }
+  // The prepared entries need their tables: one token takes no slot table,
+  // more tokens need one, and the row entry always needs its rows.
+  auto* di = Upload(std::vector<std::int32_t>(16 * used, 0));
+  auto* gate = Upload(make(q::WeightType::kQ4_K, ff, hidden, 7).packed);
+  if (q36_mmq_moe_gated_vec_preq(static_cast<int>(q::WeightType::kQ4_K), gate,
+                                 gate, dq8, dslots, di, got + guard, ff, hidden,
+                                 1, experts, used, nullptr) == 0 ||
+      q36_mmq_moe_gated_vec_preq(static_cast<int>(q::WeightType::kQ4_K), gate,
+                                 gate, dq8, nullptr, di, got + guard, ff,
+                                 hidden, 2, experts, used, nullptr) == 0 ||
+      q36_mmq_moe_gated_vec_preq(static_cast<int>(q::WeightType::kQ4_K), gate,
+                                 gate, dq8, dslots, di, got + guard, ff, hidden,
+                                 9, experts, used, nullptr) == 0 ||
+      q36_mmq_moe_vec_groups(static_cast<int>(q::WeightType::kQ4_K), gate, dx,
+                             di, nullptr, got + guard, ff, hidden, 8, experts,
+                             1, nullptr) == 0 ||
+      q36_mmq_moe_vec_groups(static_cast<int>(q::WeightType::kQ8_0), gate, dx,
+                             di, drows, got + guard, ff, hidden, 8, experts, 1,
+                             nullptr) == 0)
+    throw std::runtime_error("prepared vector accepted a missing table");
+  for (void* p : {static_cast<void*>(di), static_cast<void*>(gate),
+                  static_cast<void*>(dx), static_cast<void*>(dshared),
+                  static_cast<void*>(dshared_x), static_cast<void*>(dshared_y),
+                  static_cast<void*>(dq8), static_cast<void*>(dslots),
+                  static_cast<void*>(drows), static_cast<void*>(ref),
+                  static_cast<void*>(got), static_cast<void*>(ref_down),
+                  static_cast<void*>(got_down)})
+    CheckHip(hipFree(p), "prepared vector free");
+  std::cout << "prepared routed vectors (Q8_1 input, grouping tables): "
+               "identical at 1-8 tokens\n";
+}
+
 void CheckPairedMmq() {
   constexpr int experts = 8, rows = 64, cols = 512, tokens = 65, used = 3;
   const auto a = MakeQ4K(experts, rows, cols, 11);
@@ -544,6 +677,7 @@ int main() {
   try {
     CheckVectorGrouping();
     CheckVectorGrouping(true);
+    CheckPreparedVector();
     CheckPairedMmq();
     bool ok = true;
     // Gate/up view: 256 experts, top-8, 512 x 2048 Q4_K (Q5_K in the MTP
