@@ -82,6 +82,16 @@ public:
     bool reasoning{false};
     std::size_t max_output_tokens{4096};
     std::optional<std::uint64_t> seed;
+    /// One of voices() for spoken replies; empty: the conversation's own.
+    std::string voice;
+    /// Respond only, when supports_response_options(): instructions for this
+    /// reply, given after the conversation as a system message.
+    std::string response_instructions;
+    /// False: the reply must not call tools, though the context lists them.
+    bool call_tools{true};
+    /// Respond only, when supports_response_options(): the reply leaves the
+    /// context when it ends (an out-of-band reply), with its instructions.
+    bool out_of_band{false};
   };
   struct ToolCall {
     std::string name;
@@ -122,6 +132,20 @@ public:
   /// Keeps only the first samples (24 kHz) of the last reply's speech in the
   /// context, as far as the user heard it; the turn stays closed.
   virtual bool TruncateReply(std::size_t samples, std::string* error) = 0;
+  /// Names a client may select as Settings::voice. Empty: replies speak only
+  /// the conversation's own voice, which has no name.
+  virtual std::vector<std::string> voices() const { return {}; }
+  /// Removes the latest user turn (audio or text) from the context. Gufo calls
+  /// it only when that turn is closed and nothing followed it. Conversations
+  /// that cannot remove turns keep the default, which fails.
+  /// Whether Respond honours Settings::response_instructions and
+  /// out_of_band, and Configure and Respond honour call_tools. Without them a
+  /// client asking for these gets an error.
+  virtual bool supports_response_options() const { return false; }
+  virtual bool DeleteUserTurn(std::string* error) {
+    *error = "this conversation cannot delete items";
+    return false;
+  }
 };
 
 /// Abstract capability runner for speech recognition models.

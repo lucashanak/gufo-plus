@@ -28,6 +28,7 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
+#include "src/core/prompt_too_long.hpp"
 #include "src/mem/ledger.hpp"
 #include "src/sched/policy.hpp"
 
@@ -296,7 +297,7 @@ void PublishTerminal(const std::shared_ptr<ScheduledRequest>& request,
         request->sessions->requests[std::exchange(request->session, kNoSession)]
             .reset();
       }
-      detail::RequestsProcessing().fetch_sub(1, std::memory_order_relaxed);
+      Metrics().requests_processing.Add(-1);
     }
     request->phase.store(TextRequestPhase::kTerminal,
                          std::memory_order_release);
@@ -783,10 +784,8 @@ struct TextGenerationScheduler::Impl {
 
   /// Keeps the process-wide deferred gauge in step. Requires queue_mutex.
   void SetQueuedCountLocked(std::size_t count) {
-    detail::RequestsDeferred().fetch_add(
-        static_cast<std::int64_t>(count) -
-            static_cast<std::int64_t>(queued_count),
-        std::memory_order_relaxed);
+    Metrics().requests_deferred.Add(static_cast<std::int64_t>(count) -
+                                    static_cast<std::int64_t>(queued_count));
     queued_count = count;
   }
 
@@ -821,7 +820,7 @@ struct TextGenerationScheduler::Impl {
       }
     }
     request->counted_processing = true;
-    detail::RequestsProcessing().fetch_add(1, std::memory_order_relaxed);
+    Metrics().requests_processing.Add(1);
     SetQueuedCountLocked(queued_count - 1);
     if (!client.requests.empty()) {
       queued_clients.push_back(std::move(client));
@@ -957,7 +956,7 @@ struct TextGenerationScheduler::Impl {
   void MarkDeviceLost(std::string_view reason) noexcept {
     if (device_lost.exchange(true, std::memory_order_acq_rel))
       return;
-    detail::DeviceLostTotal().fetch_add(1, std::memory_order_relaxed);
+    Metrics().device_lost.Add(1);
     try {
       Logger::Error("scheduler", "event=device_lost remedy=restart reason=" +
                                      std::string(reason));
@@ -1069,8 +1068,41 @@ struct TextGenerationScheduler::Impl {
     }
   }
 
+  /// Generation ended before a token showed what the runner's held-back text
+  /// is (TextModelRunner::HeldText): it is the reply's last text, after the
+  /// last token's piece.
+  void PublishHeldText(const std::shared_ptr<ScheduledRequest>& request,
+                       TextGenerationBackend::FinishReason& finish_reason) {
+    auto held = request->runner_request.HeldText();
+    if (held.empty())
+      return;
+    if (held.size() >
+        request->max_output_bytes - request->generated_output_bytes)
+      throw TextGenerationError(TextGenerationErrorCode::kOutputLimit,
+                                "text generation output byte limit exceeded");
+    request->generated_output_bytes += held.size();
+    if (incremental_text_is_exact && !request->result.piece_ends.empty())
+      request->result.piece_ends.back() += held.size();
+    auto piece = request->stop_filter.enabled()
+                     ? request->stop_filter.Push(held)
+                     : std::move(held);
+    if (incremental_text_is_exact)
+      request->result.text += piece;
+    if (!piece.empty() && !PublishPiece(request, std::move(piece)))
+      throw TextGenerationError(
+          TextGenerationErrorCode::kOutputBackpressure,
+          "text generation buffered output limit exceeded");
+    if (request->stop_filter.stopped()) {
+      request->result.stop_sequence = request->stop_filter.matched_sequence();
+      finish_reason = TextGenerationBackend::FinishReason::kStopSequence;
+    }
+  }
+
   void CompleteSuccess(const std::shared_ptr<ScheduledRequest>& request,
                        TextGenerationBackend::FinishReason finish_reason) {
+    if (finish_reason == TextGenerationBackend::FinishReason::kStop ||
+        finish_reason == TextGenerationBackend::FinishReason::kLength)
+      PublishHeldText(request, finish_reason);
     if (request->stop_filter.enabled()) {
       auto tail = request->stop_filter.Finish();
       request->result.text += tail;
@@ -1625,6 +1657,7 @@ struct TextGenerationScheduler::Impl {
         request->result.queue_ms = std::chrono::duration<double, std::milli>(
                                        Clock::now() - request->request_start)
                                        .count();
+        Metrics().queue_seconds.Observe(request->result.queue_ms / 1e3);
         request->result.resident_requests_at_admission =
             prefilling.size() + decoding.size() + capturing.size() + 1;
         PublishAdmission(request);
@@ -1700,8 +1733,7 @@ struct TextGenerationScheduler::Impl {
       publication_prefill.ObserveContext(step.consumed_tokens, depth, step_ms);
       request->live_prefill_tokens.store(request->result.prefill_tokens,
                                          std::memory_order_relaxed);
-      detail::TotalPromptTokens().fetch_add(step.consumed_tokens,
-                                            std::memory_order_relaxed);
+      Metrics().prompt_tokens.Add(step.consumed_tokens);
       ++request->result.prefill_chunks;
       request->result.max_prefill_chunk_tokens = std::max(
           request->result.max_prefill_chunk_tokens, step.consumed_tokens);
@@ -1811,6 +1843,7 @@ struct TextGenerationScheduler::Impl {
       request->result.ttft_ms = std::chrono::duration<double, std::milli>(
                                     now - request->request_start)
                                     .count();
+      Metrics().first_token_seconds.Observe(request->result.ttft_ms / 1e3);
     } else {
       const auto inter_token = now - *request->previous_token;
       request->inter_token_total += inter_token;
@@ -1837,7 +1870,7 @@ struct TextGenerationScheduler::Impl {
     }
     request->live_generated_tokens.store(request->result.tokens.size(),
                                          std::memory_order_relaxed);
-    detail::TotalGenTokens().fetch_add(1, std::memory_order_relaxed);
+    Metrics().gen_tokens.Add(1);
     const auto piece = request->stop_filter.enabled()
                            ? request->stop_filter.Push(selection.piece)
                            : selection.piece;
@@ -1874,9 +1907,33 @@ struct TextGenerationScheduler::Impl {
     }
   }
 
+  /// Advances a token that PrepareDecode published and then deferred.
+  /// Returns whether the request can keep decoding.
+  [[nodiscard]] bool AdvancePending(
+      const std::shared_ptr<ScheduledRequest>& request) {
+    try {
+      const auto decode_start = PrepareDecode(request);
+      if (!decode_start.has_value())
+        return false;
+      request->runner_request.Advance();
+      FinishAdvanced(request, *decode_start);
+    } catch (...) {
+      const auto failure = std::current_exception();
+      if (!CompleteIfStopped(request))
+        CompleteFailure(request, failure);
+      return false;
+    }
+    return !IsTerminal(request);
+  }
+
   void StepDecode(const std::shared_ptr<ScheduledRequest>& request) {
     consecutive_active_prefill_chunks = 0;
     if (multi_token_decode) {
+      // A batched plain advance can defer a published token for snapshot
+      // capture. The multi-token step rejects a pending token, so advance it
+      // first, as the plain path below does through PrepareDecode.
+      if (request->advance_pending && !AdvancePending(request))
+        return;
       StepMultiTokenDecode(request);
       return;
     }
@@ -2959,10 +3016,13 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   }
   const auto context = impl_->runner_pool->runner().Descriptor().max_context;
   if (prompt.size() >= context) {
-    throw std::length_error("prompt has " + std::to_string(prompt.size()) +
-                            " tokens but the context is " +
-                            std::to_string(context) +
-                            "; increase --context or shorten the conversation");
+    // Generation needs one free position, so the longest accepted prompt is
+    // one token shorter than the context.
+    throw core::PromptTooLong(
+        prompt.size(), context == 0 ? 0 : context - 1,
+        "prompt has " + std::to_string(prompt.size()) +
+            " tokens but the context is " + std::to_string(context) +
+            "; increase --context or shorten the conversation");
   }
   const std::size_t available = context - prompt.size();
   const std::size_t prompt_tokens = prompt.size();
@@ -3004,8 +3064,13 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   request->cache_prefix_tokens = metadata.cache_prefix_tokens;
   // A client replays the previous answer as text, and the next prompt's
   // tokenization of it need not match the sampled tokens (#1154). Comparing
-  // that text needs exact per-token decoding.
-  if (metadata.cache_prompt && request->prompt_context == nullptr &&
+  // that text needs exact per-token decoding, and a prompt context must
+  // allow the rewrite.
+  const auto* prompt_context = request->prompt_context.get();
+  if (metadata.cache_prompt &&
+      (prompt_context == nullptr ||
+       (prompt_context->TokenizationIndependent() &&
+        prompt_context->cache_identity.empty())) &&
       impl_->incremental_text_is_exact)
     request->align_frontier = metadata.chat_template;
   request->stop_at_eos = metadata.stop_at_eos;

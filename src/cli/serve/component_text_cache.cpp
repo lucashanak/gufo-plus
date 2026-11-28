@@ -6,6 +6,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -13,6 +14,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -78,24 +80,27 @@ std::size_t PayloadBytes(const cache::DiskManifest& manifest) {
   }
   return bytes;
 }
-// Disk eviction during admission decides which conversations survive a
-// restart; name every retired entry so retention losses can be traced.
-bool LogDiskEviction(const cache::DiskEviction& eviction) {
+// Disk eviction for admission or for the metadata allowance decides which
+// conversations survive a restart; name every retired entry so retention
+// losses can be traced.
+bool LogDiskEviction(const cache::DiskEviction& eviction,
+                     std::string_view reason) {
   if (!eviction)
     return false;
   const auto& manifest = eviction.description->Manifest();
-  Logger::Info(
-      "cache",
-      "schema=component-cache-v1 event=disk_entry_evicted reason=admission "
-      "tokens=" +
-          std::to_string(manifest.tokens.size()) + " checkpoint_id=" +
-          std::to_string(manifest.checkpoint.value) + " purpose=" +
-          std::to_string(static_cast<unsigned>(manifest.purpose)) +
-          " superseded=" + std::to_string(eviction.superseded) +
-          " reused=" + std::to_string(eviction.reused) +
-          " payload_bytes=" + std::to_string(PayloadBytes(manifest)));
+  Logger::Info("cache",
+               "schema=component-cache-v1 event=disk_entry_evicted reason=" +
+                   std::string(reason) + " tokens=" +
+                   std::to_string(manifest.tokens.size()) + " checkpoint_id=" +
+                   std::to_string(manifest.checkpoint.value) + " purpose=" +
+                   std::to_string(static_cast<unsigned>(manifest.purpose)) +
+                   " superseded=" + std::to_string(eviction.superseded) +
+                   " reused=" + std::to_string(eviction.reused) +
+                   " payload_bytes=" + std::to_string(PayloadBytes(manifest)));
   return true;
 }
+thread_local const ComponentTextCache::DiskMetadataTesting*
+    disk_metadata_testing{};
 class FrontierHeadroomRefused final : public std::runtime_error {
 public:
   FrontierHeadroomRefused() : std::runtime_error("frontier capture headroom") {}
@@ -232,6 +237,23 @@ std::string HostReserveMessage(std::size_t sessions, std::size_t requested,
          ". Use fewer --sessions, a smaller --context, or --cache-ram-bytes "
          "off to serve without RAM checkpoints";
 }
+// A failed restore falls back to a shallower candidate or a cold prefill;
+// say why, or the miss is unexplained (#1432).
+void LogRestoreFailure(std::size_t tokens, std::exception_ptr error) noexcept {
+  try {
+    std::string reason = "unknown";
+    try {
+      std::rethrow_exception(error);
+    } catch (const std::exception& e) {
+      reason = e.what();
+    } catch (...) {
+    }
+    Logger::Info("cache",
+                 "schema=component-cache-v1 event=restore_failed tokens=" +
+                     std::to_string(tokens) + " reason=" + reason);
+  } catch (...) {
+  }
+}
 }  // namespace
 struct ComponentTextCache::Impl {
   struct Entry {
@@ -364,6 +386,8 @@ struct ComponentTextCache::Impl {
   std::shared_ptr<const cache::Checkpoint> demotion;
   cache::CheckpointId demotion_id{};
   std::size_t disk_capacity{}, disk_step{};
+  // RAM that disk checkpoint metadata may hold (cache::DiskMetadataAllowance).
+  std::size_t disk_metadata_allowance{SIZE_MAX};
   // The cache's own RAM budget. The ledger limit adds what the slots pinned.
   // Zero when the RAM cache is off.
   std::size_t budget{};
@@ -374,6 +398,10 @@ struct ComponentTextCache::Impl {
   std::size_t lender_grant{};
   // Checkpoints evicted so sessions could borrow their pages back.
   std::atomic<std::size_t> state_sheds{};
+  // Candidates of in-flight RAM restores, under `mutex`. Their restores pin
+  // the pages, so evicting them frees nothing, and the restored session needs
+  // their records (#1432). Sheds leave them alone.
+  std::vector<cache::CheckpointId> restoring;
   // A host-pressure episode was logged; cleared when the shortfall ends.
   bool host_pressure_reported{};
   cache::ResourceCharge metadata;
@@ -652,8 +680,35 @@ struct ComponentTextCache::Impl {
     budget = ram_enabled ? ram : 0;
     FitExpertCache(experts, ram);
     if (options) {
+      const auto* testing = disk_metadata_testing;
+      disk_metadata_allowance = testing ? testing->allowance_bytes
+                                        : cache::DiskMetadataAllowance(budget);
       catalog = std::make_unique<cache::DiskCatalog>(ledger, *disk, index,
-                                                     options->capacity_bytes);
+                                                     options->capacity_bytes,
+                                                     disk_metadata_allowance);
+      if (testing && testing->recovered)
+        testing->recovered(*disk);
+      // Recovered checkpoints over the allowance retire before indexing, so
+      // their index records are never charged; orphan reclamation has not
+      // started yet, so no wait is needed.
+      if (const auto evicted = catalog->FitMetadata([](const auto& eviction) {
+            (void)LogDiskEviction(eviction, "metadata");
+          })) {
+        Logger::Info(
+            "cache",
+            "schema=component-cache-v1 event=disk_evicted "
+            "reason=metadata entries=" +
+                std::to_string(evicted) +
+                " metadata_bytes=" + std::to_string(catalog->MetadataBytes()) +
+                " allowance_bytes=" + std::to_string(disk_metadata_allowance));
+      }
+      if (catalog->MetadataBytes() > disk_metadata_allowance)
+        Logger::Warn(
+            "cache",
+            "schema=component-cache-v1 "
+            "event=disk_over_metadata_allowance metadata_bytes=" +
+                std::to_string(catalog->MetadataBytes()) +
+                " allowance_bytes=" + std::to_string(disk_metadata_allowance));
       for (const auto& durable : disk->Entries()) {
         cache::ExecutionHistory::ObserveDurableId(
             durable.Manifest().checkpoint);
@@ -723,7 +778,10 @@ struct ComponentTextCache::Impl {
                       std::to_string(id.value));
               return;
             }
-            catalog->Track(id);
+            // Over the metadata allowance, older checkpoints retire first.
+            catalog->Track(id, [](const auto& eviction) {
+              (void)LogDiskEviction(eviction, "metadata");
+            });
             if (const auto description = catalog->Find(id)) {
               if (completed)
                 for (auto& entry : entries)
@@ -790,7 +848,7 @@ struct ComponentTextCache::Impl {
                                         error.what());
             }
             const std::lock_guard lock(mutex);
-            return LogDiskEviction(catalog->EvictOne());
+            return LogDiskEviction(catalog->EvictOne(), "admission");
           });
     }
     if (queue && ram_enabled)
@@ -810,6 +868,11 @@ struct ComponentTextCache::Impl {
             " automatic_bytes=" + std::to_string(automatic_bytes) +
             " max_bytes=" + std::to_string(max_bytes) +
             " disk_capacity_bytes=" + std::to_string(disk_capacity) +
+            // Zero: no allowance (no disk cache, or the RAM cache is off).
+            " disk_metadata_allowance_bytes=" +
+            std::to_string(disk_metadata_allowance == SIZE_MAX
+                               ? 0
+                               : disk_metadata_allowance) +
             " slot_pinned_bytes=" + std::to_string(slot_pinned_bytes) +
             " owned_manifest_bytes=" + std::to_string(owned_manifest_bytes) +
             " ram_cache=" + (ram_enabled ? "on" : "off") +
@@ -825,7 +888,9 @@ struct ComponentTextCache::Impl {
         bool reclaimed;
         {
           const std::lock_guard lock(mutex);
-          reclaimed = retention.Reclaim(cache::RetentionRequest{});
+          cache::RetentionRequest request;
+          request.protected_checkpoints = restoring;
+          reclaimed = retention.Reclaim(request);
         }
         DrainDemotion();
         if (reclaimed)
@@ -1575,6 +1640,16 @@ ComponentTextCache::ComponentTextCache(
     : impl_(std::make_unique<Impl>(std::move(runner), count, ram,
                                    std::max(ram, ceiling), disk, automatic_ram,
                                    ram_enabled, experts)) {}
+ComponentTextCache::DiskMetadataTesting::DiskMetadataTesting(
+    std::size_t allowance, std::function<void(cache::DiskStore&)> hook)
+    : allowance_bytes(allowance),
+      recovered(std::move(hook)),
+      previous_(disk_metadata_testing) {
+  disk_metadata_testing = this;
+}
+ComponentTextCache::DiskMetadataTesting::~DiskMetadataTesting() {
+  disk_metadata_testing = previous_;
+}
 ComponentTextCache::~ComponentTextCache() = default;
 std::size_t ComponentTextCache::capacity() const noexcept {
   return impl_->entries.size();
@@ -1781,6 +1856,31 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
     // boundary instead (TextRunnerCapabilities::prefill_alignment).
     const std::size_t alignment = std::max<std::size_t>(
         1, impl_->runner->Descriptor().capabilities.prefill_alignment);
+    // A restore makes session pages, which at the host's free floor sheds
+    // checkpoints. Keep this lookup's candidates out of those sheds until
+    // the loop ends: they share the restored rows and free little.
+    struct Restoring {
+      ComponentTextCache::Impl& cache;
+      std::vector<cache::CheckpointId> ids;
+      ~Restoring() {
+        if (ids.empty())
+          return;
+        const std::lock_guard lock(cache.mutex);
+        // Other sessions' restores may hold the same ids: remove one each.
+        for (const auto id : ids)
+          if (const auto at = std::ranges::find(cache.restoring, id);
+              at != cache.restoring.end())
+            cache.restoring.erase(at);
+      }
+    } restoring{*impl_, {}};
+    if (!restored) {
+      for (const auto& candidate : found.candidates)
+        if (candidate.checkpoint)
+          restoring.ids.push_back(candidate.checkpoint->Id());
+      const std::lock_guard lock(impl_->mutex);
+      impl_->restoring.insert(impl_->restoring.end(), restoring.ids.begin(),
+                              restoring.ids.end());
+    }
     for (const auto& candidate : found.candidates) {
       if (restored || (cancelled && cancelled()))
         break;
@@ -1995,7 +2095,17 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           request.source = checkpoint.Id();
           {
             const std::lock_guard lock(impl_->mutex);
-            impl_->retention.Touch(checkpoint.Id());
+            // Another session's capture may have evicted the record while the
+            // copies ran. The pins kept its rows, and the restore validated:
+            // keep it rather than prefill the whole prompt again.
+            try {
+              impl_->retention.Touch(checkpoint.Id());
+            } catch (const std::invalid_argument&) {
+              Logger::Info("cache",
+                           "schema=component-cache-v1 "
+                           "event=restore_source_evicted tokens=" +
+                               std::to_string(candidate.boundary));
+            }
           }
           restored = true;
         } else if (candidate.durable && impl_->streaming) {
@@ -2079,6 +2189,7 @@ std::unique_ptr<ComponentTextCache::Lease> ComponentTextCache::Acquire(
           entry->durable = candidate.durable;
         }
       } catch (...) {
+        LogRestoreFailure(candidate.boundary, std::current_exception());
         request.SettleCapture();
         if (!impl_->resources->adapter->Invalidate(request.slot.Execution()))
           throw;

@@ -172,6 +172,7 @@ private:
   std::shared_ptr<EmbeddingService> embeddings_;
   std::shared_ptr<DecisionService> decisions_;
   HttpServerOptions options_;
+  std::function<HttpResponse()> metrics_;
   GufoHttpServer* server_ = nullptr;
   std::atomic<bool> stopped_{false};
   std::atomic<bool> device_lost_reported_{false};
@@ -232,10 +233,8 @@ inline void RecordServerMetrics(const TextGenerationBackend::Result& result) {
           ? result.prefill_tokens
           : result.prompt_tokens -
                 std::min(result.prompt_tokens, result.cached_prompt_tokens);
-  detail::TotalPromptTokens().fetch_add(prompt_tokens,
-                                        std::memory_order_relaxed);
-  detail::TotalGenTokens().fetch_add(result.completion_tokens,
-                                     std::memory_order_relaxed);
+  Metrics().prompt_tokens.Add(prompt_tokens);
+  Metrics().gen_tokens.Add(result.completion_tokens);
   RecordRequestMetrics(result);
 }
 

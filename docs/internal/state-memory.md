@@ -124,7 +124,9 @@ the floor for a whole run, and the cache must still grow as far as without
 state pages. Only state pages are lent. When a region needs pages and
 none can be made that way, the pool thread **lends** whole free cache pages to
 it instead: it evicts checkpoints by the cache's pressure order until enough
-2 MiB pages are free, then maps them into the region (cleared first). The
+2 MiB pages are free, then maps them into the region (cleared first). It
+skips the checkpoints an in-flight RAM restore found: the restore pins their
+pages, so evicting them frees nothing and costs the restore (#1432). The
 cache keeps its own mapping of a lent page, unused, and the page returns to it
 when the region releases it. Lending is a map: it never unmaps (which waits
 for the device), unregisters (about 100 ms per 128 MiB, with a device drain)
@@ -204,7 +206,8 @@ Rules:
   there is nothing to map: it releases the pages the loads would overwrite.
 - After `PrepareWrite` or `Restore` on every region of the write or the
   restore, call `SettleRemaps` once, before the device uses those rows. It
-  costs two atomic reads when no page was remapped.
+  costs two atomic reads when no page was remapped and no copy, or alias of
+  one, is left to run or unmap.
 - All three unmap pages or wait for the device: call them on the thread that
   runs the model, between its launches. Mapping never waits.
 - A released park address keeps its mapping until `PagePark::Sweep`, which
@@ -244,8 +247,8 @@ eight threads mapped no faster than one).
 `hipMemUnmap` followed by `hipMemMap` with another page returns at once, but
 the device keeps the translation it cached for an address it has used.
 Kernels, runtime copies and copy-engine copies through that address go on
-reading and writing the **old** page, with no error, until the process's
-device work has been idle for a moment. Measured on gfx1151 in November 2026
+reading and writing the **old** page, with no error, until the device has
+been idle for a moment. Measured on gfx1151 in November 2026
 (ROCm 10.1, Linux 7.3.3, `amdgpu` with the MES scheduler; probes and logs in
 [state-memory-shared-pages](state-memory-shared-pages.md)):
 
@@ -258,18 +261,49 @@ device work has been idle for a moment. Measured on gfx1151 in November 2026
 
 A second unmap, an access change, `hipDeviceSynchronize`, a busy kernel, or
 freeing and reserving the address change nothing. An idle moment between the
-last use and the unmap works as well as one after the remap. An address the
-device never used since its last idle moment can be mapped and used at once.
+last use and the unmap works as well as one after the remap.
 
-So an address that loses a mapping is **dirty** until the device has been
-idle, and memory mapped at a dirty address needs the **remap barrier**
+The cause is the kernel driver. Where the GPU sees all of its memory, as on
+Strix Halo, `amdgpu` updates compute page tables with the CPU and, before
+Linux commit `566ed98e48be` (7.4-rc3), invalidates no TLB after an unmap. So
+the idle moment helps only while no other process uses the GPU. Freeing or
+allocating a 4 MiB block goes through the driver and flushes the process's
+translations, quiet or beside a busy process. An address that never had a
+mapping can be mapped and used at once. The measurements are in
+[Another process keeps the GPU busy](state-memory-shared-pages.md#another-process-keeps-the-gpu-busy).
+
+So an address that loses a mapping is **dirty** until its translations are
+flushed, and memory mapped at a dirty address needs the **remap barrier**
 (`mem::RemapBarrier::Settle`, `src/mem/remap_barrier.hpp`) before the device
-uses it: wait for the device's work, keep the device idle for 400 us. Every
+uses it: wait for the device's work, then flush the translations
+(`mem::FlushTranslations`, `src/core/hip/remap_barrier_device.hpp`: it frees
+the 4 MiB block it allocated last time and allocates the next). The flush
+needs no idle time before it, so the barrier keeps none; without a flush
+installed (the CPU tests) it keeps the device idle for 400 us instead. Every
 address unmapped before the barrier began is clean afterwards.
 
-- Regions, the park and the cache's lendable range stamp each address when
-  it loses a mapping (`RemapBarrier::Stamp`) and ask `RemapBarrier::Clean`
-  before mapping there again. A clean address costs nothing.
+When the flush fails three times, 1 ms apart, the barrier fails: nothing it
+covers becomes clean, and the next barrier tries again. What needed it fails
+too and leaves nothing the device could use:
+
+- `Region::Ensure` gives back the pages it mapped at dirty addresses and the
+  recycled pages it could not clear.
+- `Region::SettleRemaps` runs none of the queued copies and clears. They wait
+  for the next barrier that succeeds, since other regions' threads queue
+  some of them. A region that unmaps pages waits for a barrier that is
+  running their copies and clears, then drops what is still queued.
+- Creating a region, mapping pass scratch and growing the expert stream
+  store fail; a cache capture fails without evicting anything. At teardown
+  the expert stream store keeps its address ranges reserved.
+
+The model's write or restore then fails its request, and the scheduler drops
+that session's state.
+
+- Regions, the park and the cache's lendable range stamp each address once
+  its unmap has returned (`RemapBarrier::Stamp`; a barrier that began before
+  may have flushed before the page tables changed) and ask
+  `RemapBarrier::Clean` before mapping there again. A clean address costs
+  nothing.
 - `Region::Ensure` runs the barrier itself when it maps a dirty address (a
   session that was trimmed and grows again). The page pool's thread never
   maps a dirty address: it leaves it to the writer.
@@ -280,23 +314,27 @@ address unmapped before the barrier began is clean afterwards.
   readable as soon as it is parked.
 - Pass scratch (`ScratchArena::MapTransient`) and a region created where
   another gave its address range back run the barrier themselves. Releasing
-  the old page does not help: without the idle moment, 50 of 50 writes
+  the old page does not help: without the barrier, 50 of 50 writes
   through the address reached the page the driver had already freed.
 - Threads that submit device work on their own (transfer streams, the copy
   engine, the page pool's clears) bracket it with `RemapBarrier::Enter` and
   `Leave`. A barrier waits for open brackets and holds new ones back, for at
   most 25 ms. Device work it cannot see (another model's thread in the same
-  process) is detected only while it runs; `event=remap_barrier` at shutdown
-  counts the barriers that gave up as `unquiet`.
+  process) is detected only while it still runs at the barrier's second wait
+  for the device; `event=remap_barrier` at shutdown counts the barriers that
+  gave up as `unquiet`, and those that failed on their flush as `unflushed`.
 - The hold starts before the unmaps (`RemapBarrier::Hold`): an unmap waits
   for device work in flight, and a disk write's copies beside a request that
   replaced one page per buffer stalled that request for 290 ms.
 
-A barrier costs about 0.4 ms with every decoder paused. One runs per restore
-that maps or drops pages, per write that replaces shared pages (the first
-pass of a request that takes over a session, then once per page the session
-crosses), per wide prefill pass and per `Ensure` over dirty addresses. The
-rotation run of the evidence page ran 29 in 12 requests, 11.7 ms in all.
+As of November 2026, a barrier takes about 0.16 ms on gfx1151 with every
+decoder paused, most of it the flush
+([measured](state-memory-shared-pages.md#another-process-keeps-the-gpu-busy)).
+One runs per restore that maps or drops pages, per write that replaces shared
+pages (the first pass of a request that takes over a session, then once per
+page the session crosses), per wide prefill pass and per `Ensure` over dirty
+addresses. The rotation run of the evidence page, with the idle time alone,
+ran 29 in 12 requests, 11.7 ms in all.
 
 > **Warning:** check a remapped address with a kernel. A `hipMemcpy` read
 > can disagree with what kernels see through the same address.

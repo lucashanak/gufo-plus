@@ -31,6 +31,7 @@
 #include "src/core/platform/net.hpp"
 #include "src/core/platform/os_info.hpp"
 #include "tests/cli/http_server_test_support.hpp"
+#include "tests/cli/metrics_values.hpp"
 
 namespace {
 using gufo::server::Logger;
@@ -353,8 +354,11 @@ void TestFramingAndMetrics() {
   for (const std::string header :
        {"Content-Length: nope", "Content-Length: -1", "Content-Length: 4junk",
         "Content-Length: 18446744073709551616",
-        "Content-Length: 4\r\nContent-Length: 3", "Transfer-Encoding: chunked",
-        "broken-header", "Transfer-Encoding : chunked", "Content-Length\t: 5",
+        "Content-Length: 4\r\nContent-Length: 3", "Transfer-Encoding: gzip",
+        "Transfer-Encoding: gzip, chunked",
+        "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked",
+        "Content-Length: 5\r\nTransfer-Encoding: chunked", "broken-header",
+        "Transfer-Encoding : chunked", "Content-Length\t: 5",
         "X-Test: one\r\n folded", "Bad Name: x"}) {
     ExpectStatus(server.Send("POST /echo HTTP/1.1\r\n" + header + "\r\n\r\n"),
                  400);
@@ -407,6 +411,19 @@ void TestFramingAndMetrics() {
   assert(lowercase_head(echo).find("\r\ncontent-length: 5000\r\n") !=
          std::string::npos);
   assert(echo.substr(echo.find("\r\n\r\n") + 4) == payload);
+  // Chunked bodies, as aiohttp streams an upload from a generator (#1418),
+  // are decoded and held to the same limit as Content-Length bodies.
+  const auto chunked = server.Send(
+      "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+      "3\r\nabc\r\n4;ext=1\r\ndefg\r\n0\r\n\r\n");
+  ExpectStatus(chunked, 200);
+  assert(chunked.substr(chunked.find("\r\n\r\n") + 4) == "abcdefg");
+  const auto chunked_too_large = server.Send(
+      "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n"
+      "2001\r\n" +
+      std::string(8193, 'x') + "\r\n0\r\n\r\n");
+  ExpectStatus(chunked_too_large, 413);
+  assert(chunked_too_large.find("payload_too_large") != std::string::npos);
 
   const std::string body = R"({"prompt":"hi","n_predict":1})";
   const auto response =
@@ -465,7 +482,7 @@ void TestExpectContinue() {
 }
 
 void TestFallbackBackendMetrics() {
-  namespace metrics = gufo::server::detail;
+  namespace metrics = gufo::server::testing;
   RunningServer server;
   struct Endpoint {
     const char* path;
@@ -478,14 +495,14 @@ void TestFallbackBackendMetrics() {
            Endpoint{"/v1/responses", R"({"input":"hi"})"},
        }) {
     for (const bool stream : {false, true}) {
-      const auto prompt_before = metrics::TotalPromptTokens().load();
-      const auto generated_before = metrics::TotalGenTokens().load();
-      const auto cached_before = metrics::TotalCachedPromptTokens().load();
-      const auto rounds_before = metrics::TotalDraftRounds().load();
-      const auto drafts_before = metrics::TotalDraftTokens().load();
-      const auto accepted_before = metrics::TotalDraftAcceptedTokens().load();
-      const auto prompt_seconds_before = metrics::TotalPromptSeconds().load();
-      const auto gen_seconds_before = metrics::TotalGenSeconds().load();
+      const auto prompt_before = metrics::TotalPromptTokens();
+      const auto generated_before = metrics::TotalGenTokens();
+      const auto cached_before = metrics::TotalCachedPromptTokens();
+      const auto rounds_before = metrics::TotalDraftRounds();
+      const auto drafts_before = metrics::TotalDraftTokens();
+      const auto accepted_before = metrics::TotalDraftAcceptedTokens();
+      const auto prompt_seconds_before = metrics::TotalPromptSeconds();
+      const auto gen_seconds_before = metrics::TotalGenSeconds();
       auto body = gufo::json::parse(endpoint.body);
       body["model"] = "test";
       body["stream"] = stream;
@@ -508,10 +525,9 @@ void TestFallbackBackendMetrics() {
       assert(response.find("llamacpp:spec_decode_num_accepted_tokens_total " +
                            std::to_string(accepted_before + 4) + "\n") !=
              std::string::npos);
-      assert(metrics::TotalPromptSeconds().load() - prompt_seconds_before >
-                 0.0039 &&
-             metrics::TotalGenSeconds().load() - gen_seconds_before > 0.0019);
-      assert(metrics::MaxSequenceTokens().load() >= 11);
+      assert(metrics::TotalPromptSeconds() - prompt_seconds_before > 0.0039 &&
+             metrics::TotalGenSeconds() - gen_seconds_before > 0.0019);
+      assert(metrics::MaxSequenceTokens() >= 11);
       assert(response.find("llamacpp:tokens_predicted_total " +
                            std::to_string(generated_before + 1) + "\n") !=
              std::string::npos);
@@ -530,8 +546,8 @@ void TestFallbackBackendMetrics() {
            Case{0, 0, true, 0},
            Case{3, 0, true, 3},
        }) {
-    const auto prompt_before = metrics::TotalPromptTokens().load();
-    const auto generated_before = metrics::TotalGenTokens().load();
+    const auto prompt_before = metrics::TotalPromptTokens();
+    const auto generated_before = metrics::TotalGenTokens();
     TextGenerationBackend::Result result;
     result.prompt_tokens = 10;
     result.cached_prompt_tokens = test.cached;
@@ -539,9 +555,9 @@ void TestFallbackBackendMetrics() {
     result.completion_tokens = 2;
     result.cancelled = test.cancelled;
     gufo::server::RecordServerMetrics(result);
-    assert(metrics::TotalPromptTokens().load() ==
+    assert(metrics::TotalPromptTokens() ==
            prompt_before + test.expected_prompt);
-    assert(metrics::TotalGenTokens().load() == generated_before + 2);
+    assert(metrics::TotalGenTokens() == generated_before + 2);
   }
 }
 
@@ -1099,6 +1115,11 @@ void TestCompatibilityRequests() {
     auto body = parse(endpoint.body);
     response_body(server.Post(endpoint.path, body.dump()));
     assert(server.backend->LastCall().max_tokens == 0);
+    auto unset = body;
+    for (const auto* field : {"stream", "echo", "store", "background"})
+      unset[field] = nullptr;
+    response_body(server.Post(endpoint.path, unset.dump()));
+    assert(server.backend->LastCall().max_tokens == 0);
     server.backend->defaults.provider = gufo::sampling::PresetDefaults(
         gufo::sampling::TextModelPreset::kQwen38);
     server.backend->defaults.supplied = {};
@@ -1134,6 +1155,18 @@ void TestCompatibilityRequests() {
                                ? "context_length_exceeded"
                                : "invalid_prompt") != std::string::npos);
     }
+    // Messages names the sizes in Anthropic's wording, which Claude Code
+    // answers by compacting; the other endpoints keep the server's message.
+    server.backend->failure = 9;
+    const bool messages = std::string_view(endpoint.path) == "/v1/messages";
+    const auto too_long = server.Post(endpoint.path, body.dump());
+    ExpectStatus(too_long, 400);
+    assert(too_long.find("context_length_exceeded") != std::string::npos);
+    assert(
+        (too_long.find("prompt is too long: 300000 tokens > 262143 maximum") !=
+         std::string::npos) == messages);
+    assert((too_long.find("prompt exceeds the context") != std::string::npos) !=
+           messages);
     server.backend->failure = 0;
     assert(last.client_id == "127.0.0.1");
     assert(last.max_tokens == 1 && last.sampling.temperature == 0.6F &&

@@ -107,6 +107,13 @@ void MoeGuGrouped(hipStream_t s, int fmt, const void* w, const float* escale,
 /// yp [pair][d]: weighted outputs, inputs from MoeQuantGrouped(k = 1152).
 void MoeDownGrouped(hipStream_t s, int fmt, const void* w, const float* escale,
                     MoeGroups g, int slots, const float* wts, float* yp, int d);
+/// MoeGu then MoeDownE (same outputs) in one launch for NVFP4 experts; cnt
+/// [2][nb * 8] (zero, self-resetting). False (nothing launched) for other
+/// formats.
+bool MoeGuDown(hipStream_t s, int fmt, const void* wgu, const float* gscale,
+               const void* wd, const float* dscale, const float* x,
+               const int* ids, const float* wts, float* a, float* yp,
+               unsigned* cnt, int ff, int d, float beta, float lb, int nb);
 void MoeDownE(hipStream_t s, int fmt, const void* w, const float* escale,
               const float* a, const int* ids, const float* wts, float* yp,
               int d, int nb = 1);
@@ -128,7 +135,7 @@ struct ConvResidArgs {
   // Verification (all nb rows are consecutive positions of one session): row
   // b's history is rows b-3..b-1 of this step (the stored history before
   // row 0), the history is not written, and each row's input goes to
-  // cap[(conv_off + c) * kVerifyRows + b] (CommitVerifyConv applies it).
+  // cap[b * 6656 + conv_off + c] (CommitVerifyConv applies it).
   float* cap = nullptr;
   // With `cap`: each row's index within its session's rows (a step may verify
   // several sessions, each one's rows consecutive); null: all rows one session.
@@ -141,13 +148,27 @@ void ConvResid(hipStream_t s, const ConvResidArgs& a, int nb = 1);
 /// After a verification step: every history of the session's 48 slots
 /// becomes the last 3 inputs of (history, the first `keep` of its captured
 /// rows, which start at step row `row0`).
-/// `cap` is [48][6656][kVerifyRows].
+/// `cap` is [48][kVerifyRows][6656].
 void CommitVerifyConv(hipStream_t s, const SlotEntry* tbl, const float* cap,
                       int keep, int row0 = 0);
 /// out[r] = the first maximum of the finite values of row r of x [rows][n]
 /// (ws: rows * 64 * 2 floats).
 void RowsArgmax(hipStream_t s, const float* x, int rows, int n, float* ws,
                 int* out);
+/// GPU linear sampling (temperature + optional min_p, FP64 softmax weights)
+/// for `rows` rows of `vocab` logits. Only rows with `temp[r] > 0` are
+/// sampled; `ws` holds rows * (64 * 2 + 1) doubles.
+struct LinearSampleArgs {
+  const float* logits;  // [rows][vocab]
+  int rows;
+  int vocab;
+  const float* temp;   // [rows] (device; <= 0 skips row)
+  const float* min_p;  // [rows] (device)
+  const double* u;     // [rows] (device)
+  double* ws;          // [rows][129] (device)
+  int* out;            // [rows] (device)
+};
+void RowsLinearSample(hipStream_t s, const LinearSampleArgs& a);
 
 /// Attention-residual mix: states (<= 8 vectors of 2304) RMS-normalised,
 /// softmax of query . state / sqrt(2304), out[q] = sum_j p_j S_j / rms_j. One
@@ -170,10 +191,22 @@ struct MixJob {
   ConvResidArgs cr;
   int ostride = 0;  // token stride of `out` (0: nq * 2304); decode batches
 };
-/// Reads `bytes` from p, then `bytes2` from p2 (a cache prefetch: nothing is
+/// Reads every range of the list, in order (a cache prefetch: nothing is
 /// written).
-void Touch(hipStream_t s, const void* p, size_t bytes, int blocks,
-           const void* p2 = nullptr, size_t bytes2 = 0);
+struct TouchList {
+  static constexpr int kMax = 16;
+  const void* p[kMax];
+  size_t bytes[kMax];
+  int n = 0;
+  void Add(const void* q, size_t b) {
+    if (b > 0 && q != nullptr && n < kMax) {
+      p[n] = q;
+      bytes[n] = b;
+      ++n;
+    }
+  }
+};
+void TouchN(hipStream_t s, const TouchList& l, int blocks);
 void Mix(hipStream_t s, const MixJob& j, float eps);
 
 /// Several RMS norms of 2304 rows in one launch.
@@ -201,9 +234,8 @@ struct CtlJobs {  // loop controllers of up to 4 streams
       os[4];  // token strides of x, msg, g64, out (decode batches)
 };
 void CtlGate(hipStream_t s, const CtlJobs& j, float eps, int nb = 1);
-void CtlApply(hipStream_t s, const CtlJobs& j, int nb = 1);
-/// CtlApply, then Rms of norm job i on stream i's output (nj.n == j.n) in the
-/// same launch. cnt: [nb][4] zero, self-resetting.
+/// The Ctl apply step, then Rms of norm job i on stream i's output
+/// (nj.n == j.n) in the same launch. cnt: [nb][4] zero, self-resetting.
 void CtlApplyRms(hipStream_t s, const CtlJobs& j, const NormJobs& nj,
                  unsigned* cnt, float eps, int nb = 1);
 
@@ -291,6 +323,18 @@ struct MoeWs {  // device scratch of the expert grouping
   float* posw;
 };
 void CvtF16(hipStream_t s, const float* x, void* h, size_t n);
+/// Sets `*non_exact = 1` if any of the `n` F32 values has non-zero low 16 bits.
+void CheckBf16Exact(hipStream_t s, const float* x, size_t n,
+                    unsigned* non_exact);
+/// Exact high-16-bit truncation of `n` F32 values to BF16 (`uint16_t`).
+void F32ToBf16(hipStream_t s, const float* x, void* dst, size_t n);
+/// BF16 copy of a BF16-exact F32 [rows][64] controller gain/forget matrix in
+/// the k-interleaved layout k_ctl_apply_norm reads: [16][rows][4].
+void CtlWeightsK4(hipStream_t s, const float* x, void* dst, int rows);
+/// Copies `rows x cols` weights of ggml type `type` (0=F32, 1=F16, 30=BF16)
+/// into `padded_rows x cols` F32, zero-padding rows `[rows, padded_rows)`.
+void PadRowsToF32(hipStream_t s, const void* src, int type, int rows,
+                  int padded_rows, int cols, float* dst);
 /// out[t][r] = W[r] . x[t] (Q8_0, K 2304 or 3072, m % 64 == 0); activations f16
 /// [T][k].
 void GemmDense(hipStream_t s, const void* w, int m, int k, const void* ah,
@@ -335,36 +379,53 @@ void AttnPrefill(hipStream_t s, const PrefillAttn& a);
 /// by the t inputs.
 void MoeTail(hipStream_t s, const float* pairs, float* state, const float* w,
              float* cur, int t, int c, float scale);
+/// Captures the MoE post-convolution history after the first `t` tokens of
+/// `pairs` ([T][8][c]) without modifying `old_state`.
+void MoeTailStateCapture(hipStream_t s, const float* pairs,
+                         const float* old_state, float* dst_state, int t,
+                         int c);
 /// cur[t] += post conv of x with the history `state`, which is then advanced
 /// (hip::Conv + ConvStateUpdate + Add in one pass).
 void ConvAdd(hipStream_t s, const float* x, float* state, const float* w,
              float* cur, int t, int c, float scale);
 
-/// Prefill loop controller and router over T tokens (F32 weights, tiled SIMT).
+/// Prefill loop controller and router over T tokens (F32 or exact-BF16 weights,
+/// tiled SIMT).
 struct CtlPJob {
   const float* x;  // [T][ldx]
   int ldx;
   const float* msg;  // [T][ldm]
   int ldm;
-  const float* down;    // [64][4608]
-  const float* gain;    // [2304][64]
-  const float* forget;  // [2304][64]
-  float* g64;           // [T][64] scratch
-  float* out;           // [T][2304]
+  const void* down;    // [64][4608]  F32, or BF16 when `half`
+  const void* gain;    // [2304][64]
+  const void* forget;  // [2304][64]
+  float* g64;          // [T][64] scratch
+  float* out;          // [T][2304]
   // optional [T] inverse RMS of each msg row (from hip::Mix), else computed
   // here
   const float* minv = nullptr;
   // optional [T] inverse RMS of each x row, summed as the gate prologue sums it
   const float* xinv = nullptr;
+  int half = 0;
+  // Optional RMS norm of the controlled rows (weight `nw`), fused into the
+  // apply: writes `nout` (F32, may be null) and `nout16` (F16) instead of
+  // `out`. Same values as hip::RmsNorm of `out`. Reads `gain4`/`forget4` (the
+  // CtlWeightsK4 copies) instead of `gain`/`forget`.
+  const float* nw = nullptr;
+  const void* gain4 = nullptr;
+  const void* forget4 = nullptr;
+  float* nout = nullptr;
+  void* nout16 = nullptr;
 };
 struct CtlPJobs {
   CtlPJob j[3];
   int n;
 };
 void CtlPrefill(hipStream_t s, const CtlPJobs& jobs, int t, float eps);
-/// logits[t][r] = W[r] . x[t] for the F32 [128][2304] router.
-void RouterPrefill(hipStream_t s, const float* w, const float* x, float* logits,
-                   int t);
+/// logits[t][r] = W[r] . x[t] for the [128][2304] router (F32, or BF16 when
+/// `half`).
+void RouterPrefill(hipStream_t s, const void* w, const float* x, float* logits,
+                   int t, bool half = false);
 /// Sigmoid, biased top-8 and renormalisation of router logits [t][128] (wave
 /// per token).
 void TopkPrefill(hipStream_t s, const float* logits, const float* bias,

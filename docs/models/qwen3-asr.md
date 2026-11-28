@@ -26,8 +26,8 @@ greedy, so `temperature` must be 0.
 
 ## Audio input
 
-Gufo reads WAV, FLAC, MP3 and Ogg (Vorbis or Opus) files, up to eight
-channels and 192 kHz, and converts them to 16 kHz mono. M4A/AAC isn't
+Gufo reads WAV, FLAC, MP3, Ogg (Vorbis or Opus) and WebM (Vorbis or Opus,
+as browsers record) files, up to eight channels and 192 kHz, and converts them to 16 kHz mono. M4A/AAC isn't
 supported. A recording can be up to 30 minutes long; the CLI also caps input
 at 256 MiB, and the server applies its request size limit.
 
@@ -71,6 +71,10 @@ Two requests can prepare audio at the same time; the GPU work runs one piece at
 a time in arrival order, and cancelling a request removes its queued pieces.
 `--served-model-name` sets the model ID clients send; repeat it to accept
 aliases. Speech synthesis runs as a separate server, `gufo serve tts`.
+
+`GET /metrics` returns Prometheus `gufo_asr_*` metrics: requests by outcome,
+audio seconds transcribed, request latency, real-time factor, requests in
+flight and open live sessions. See [Metrics](../server.md#metrics).
 
 ## Performance
 

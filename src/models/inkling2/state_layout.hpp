@@ -106,9 +106,6 @@ public:
   /// pages).
   [[nodiscard]] std::vector<cache::BackingClass> BackingPlan(
       std::size_t ram_bytes) const;
-  /// Bytes one checkpoint at `position` adds to the cache (rows it keeps +
-  /// private state).
-  [[nodiscard]] std::size_t CheckpointBytes(std::size_t position) const;
   /// Device bytes of one session for `context` tokens (matches
   /// Engine::session_bytes()).
   [[nodiscard]] std::size_t SessionBytes(std::uint32_t context) const;
@@ -130,8 +127,6 @@ class SessionStateAccess {
 public:
   [[nodiscard]] static std::size_t Position(const Session&);
   [[nodiscard]] static bool Global(const Session&, std::uint32_t visit);
-  [[nodiscard]] static std::uint32_t RingRows(const Session&,
-                                              std::uint32_t visit);
   [[nodiscard]] static bool HasLogits(const Session&);
   static void LogitsOut(const Session&, std::byte* dst, std::size_t bytes);
   static void RowsOut(const Session&, std::uint32_t visit, bool value,
@@ -164,6 +159,9 @@ public:
                                                            cache::Rows first,
                                                            cache::Rows end);
   static void PrepareRestore(Session&, std::size_t rows);
+  /// Copies `n` bytes from an arbitrary device pointer (e.g. an in-pass
+  /// checkpoint buffer) to a cache host buffer via the snapshot copy path.
+  static void DeviceBytesOut(const void* src, std::size_t n, std::byte* dst);
 
 private:
   /// One K or V row stream: a target visit's slot, or (visit >= kVisits) a

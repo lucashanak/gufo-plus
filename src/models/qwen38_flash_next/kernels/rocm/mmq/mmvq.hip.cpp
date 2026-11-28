@@ -618,11 +618,12 @@ static void launch_moe_grouped(const void* gate, const void* up,
                                hipStream_t stream) {
   if (n_tokens == tokens) {
     // Q4_K splits groups across two launches from three tokens on, so most
-    // of a block row per slot would only read a group header and exit. Two
-    // block rows walk each launch's anchor list instead. Two tokens keep one
-    // block row per slot.
+    // of a block row per slot would only read a group header and exit. Block
+    // rows walk each launch's anchor list instead: forty, since each walks its
+    // groups in turn (with two, ~20 each; 8-row verification gate/up 468 ->
+    // 443 us). Two tokens keep one block row per slot.
     constexpr bool split = type == GGML_TYPE_Q4_K && tokens >= 3;
-    constexpr int kListRows = 2;
+    constexpr int kListRows = 40;
     const int anchors = tokens * experts_used;
     const int32_t* lists = split ? groups + anchors * (tokens + 1) : nullptr;
     const dim3 grid((rows + 1) / 2,
@@ -708,8 +709,9 @@ int prepare_q8_decode() {
 }
 
 // Q4_K dense projection (the MTP draft head) of 1..8 rows: each wave reads a
-// weight row once and keeps the routed-expert Q4MoeFragment dot and 32-lane
-// reduction per input, so a row's logits do not depend on the batch width.
+// weight row once and keeps the routed-expert Q4MoeFragment dot, its
+// accumulation (Accumulate) and the 32-lane reduction per input, so a row's
+// logits do not depend on the batch width.
 template<int ncols_dst>
 __launch_bounds__(32, 1) static __global__
     void mul_mat_vec_q4k_dense(const void* __restrict__ weights,
@@ -732,7 +734,7 @@ __launch_bounds__(32, 1) static __global__
     const Q4MoeFragment w(weights, row_offset + kbx, kqs);
 #pragma unroll
     for (int j = 0; j < ncols_dst; ++j)
-      sum[j] += w.Dot(input + j * stride_col_y + kby, kqs);
+      sum[j] = w.Accumulate(sum[j], input + j * stride_col_y + kby, kqs);
   }
 #pragma unroll
   for (int j = 0; j < ncols_dst; ++j) {

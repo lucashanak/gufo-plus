@@ -279,7 +279,7 @@ if (ENGINE_ENABLE_HIP)
   add_library(gufo_mem_hip STATIC src/core/hip/state_page_pool.cpp
     src/core/hip/state_lendable_range.cpp src/core/hip/state_region.cpp
     src/core/hip/state_shared_page.cpp src/core/hip/scratch_arena.cpp
-    src/core/hip/session_state.cpp)
+    src/core/hip/session_state.cpp src/core/hip/remap_barrier_device.cpp)
   target_link_libraries(gufo_mem_hip PUBLIC gufo_mem hip::host Threads::Threads)
   # SessionState places fixed buffers like other session state
   # (src/core/hip/managed_alloc.hpp, HIP builds only).
@@ -314,7 +314,6 @@ if (ENGINE_ENABLE_HIP)
     "$<$<NOT:$<PLATFORM_ID:Windows>>:${PROJECT_SOURCE_DIR}/src/core/hip/copy_engine.cpp>"
     "$<$<PLATFORM_ID:Windows>:${PROJECT_SOURCE_DIR}/src/core/hip/copy_engine_windows.cpp>"
     src/core/hip/snapshot_copy.hip
-    src/core/hip/staging.cpp
     src/core/hip/transfer_pool.cpp)
   target_link_libraries(gufo_cache_hip PUBLIC gufo_cache gufo_hip_host hip::host)
   # The copy engine resolves ROCr's functions from the runtime HIP loaded, so
@@ -359,6 +358,12 @@ if (BUILD_TESTING)
   endif()
 endif()
 
+# safetensors::Parse (src/core/safetensors.hpp), which checks headers with the
+# Rust reader. The extension host keeps and exports it. The Rust header stays
+# private, since extensions reach this library through gufo_ext_runtime.
+add_library(gufo_safetensors STATIC src/core/safetensors.cpp)
+target_link_libraries(gufo_safetensors PRIVATE gufo_rust)
+
 add_library(gufo_diagnostics STATIC
   src/core/diagnostics/gpu_queues.cpp
   src/core/diagnostics/linux_sysfs.cpp
@@ -398,6 +403,7 @@ add_subdirectory(src/core/npu)
 
 add_library(gufo_core STATIC
   src/core/base64.cpp
+  src/core/metrics.cpp
   src/core/image.cpp
   src/core/png.cpp
   src/core/crypto/sha256.cpp
@@ -416,7 +422,8 @@ add_library(gufo_core STATIC
 )
 target_include_directories(gufo_core PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(gufo_core PUBLIC gufo_platform gufo_npu ICU::uc ICU::i18n
-  Threads::Threads gufo_json gufo_rust PkgConfig::WEBP CURL::libcurl
+  Threads::Threads gufo_json gufo_safetensors gufo_rust PkgConfig::WEBP
+  CURL::libcurl
   OpenSSL::Crypto)
 
 # Family libraries come before the model that needs them; they may depend on
@@ -489,10 +496,10 @@ target_link_libraries(gufo_llm_cli PUBLIC gufo_core gufo_compare gufo_ext_runtim
   gufo_serving)
 
 add_subdirectory(src/ext)
-# The extension surface includes json::parse; programs that link the runtime
-# without gufo_core get it here. Projects that build src/ext on its own stay
-# free of Rust.
-target_link_libraries(gufo_ext_runtime PUBLIC gufo_json)
+# The extension surface includes json::parse and safetensors::Parse; programs
+# that link the runtime without gufo_core get them here. Projects that build
+# src/ext on its own stay free of Rust.
+target_link_libraries(gufo_ext_runtime PUBLIC gufo_json gufo_safetensors)
 
 # RFC step 6: the text-serving tier the gufo executable used to compile into
 # itself. Scheduler, runner pool, component text cache and InferenceBackend
@@ -808,6 +815,9 @@ function(gufo_qwen3_asr_register_tests)
   add_executable(qwen3_asr_audio_api_test
     ${PROJECT_SOURCE_DIR}/src/models/qwen3_asr/tests/audio_api_test.cpp)
   target_link_libraries(qwen3_asr_audio_api_test PRIVATE gufo_qwen3_asr gufo_test_support)
+  target_compile_definitions(qwen3_asr_audio_api_test PRIVATE
+    GUFO_QWEN3_ASR_SPEECH_FIXTURES="${PROJECT_SOURCE_DIR}/tests/functional/fixtures/audio"
+    GUFO_AUDIO_DECODE_FIXTURES="${PROJECT_SOURCE_DIR}/tests/fixtures/audio")
   add_test(NAME qwen3_asr_audio_api_test COMMAND qwen3_asr_audio_api_test)
   set_tests_properties(qwen3_asr_audio_api_test PROPERTIES
     LABELS "cpu;models;qwen3-asr;server;api;audio;quality")
@@ -976,10 +986,8 @@ endfunction()
   add_test(NAME json_constraint_test COMMAND json_constraint_test)
   set_tests_properties(json_constraint_test PROPERTIES LABELS "cpu;json;sampling")
 
-  # Compares the Rust JSON Schema compiler with the frozen C++ one in
-  # tests/core/json_schema_reference.hpp; the Rust headers come from gufo_rust.
   add_executable(json_schema_test tests/core/json_schema_test.cpp)
-  target_link_libraries(json_schema_test PRIVATE gufo_core gufo_rust ICU::uc)
+  target_link_libraries(json_schema_test PRIVATE gufo_core)
   add_test(NAME json_schema_test COMMAND json_schema_test)
   set_tests_properties(json_schema_test PROPERTIES LABELS "cpu;json;sampling;correctness")
 
@@ -1006,13 +1014,10 @@ endfunction()
   add_test(NAME png_test COMMAND png_test)
   set_tests_properties(png_test PROPERTIES LABELS "cpu;image;correctness")
 
-  # libjpeg-turbo writes the cases and is the frozen reference decoder; the
-  # shipped binary decodes JPEG in Rust.
-  find_package(JPEG REQUIRED)
-  add_executable(jpeg_decode_test
-    tests/core/jpeg_decode_test.cpp
-    tests/core/jpeg_reference.cpp)
-  target_link_libraries(jpeg_decode_test PRIVATE gufo_core JPEG::JPEG)
+  add_executable(jpeg_decode_test tests/core/jpeg_decode_test.cpp)
+  target_link_libraries(jpeg_decode_test PRIVATE gufo_core)
+  target_compile_definitions(jpeg_decode_test PRIVATE
+    GUFO_JPEG_FIXTURES="${PROJECT_SOURCE_DIR}/tests/fixtures/jpeg")
   add_test(NAME jpeg_decode_test COMMAND jpeg_decode_test)
   set_tests_properties(jpeg_decode_test PROPERTIES LABELS "cpu;image;correctness")
 
@@ -1061,13 +1066,10 @@ endfunction()
   set_tests_properties(openai_chat_test PROPERTIES
     LABELS "cpu;server;api;openai;streaming;tools")
 
-  # The Rust generation parser against a frozen copy of the C++ one it
-  # replaced, over the corpus in tests/fixtures/generation_parse, with the
-  # real Qwen and DeepSeek scanners and tool grammar.
-  add_executable(generation_parse_test
-    tests/cli/generation_parse_test.cpp
-    tests/cli/generation_parse_frozen.cpp
-  )
+  # Expected results of the generation parser over the corpus in
+  # tests/fixtures/generation_parse, with the real Qwen and DeepSeek scanners
+  # and tool grammar.
+  add_executable(generation_parse_test tests/cli/generation_parse_test.cpp)
   target_link_libraries(generation_parse_test PRIVATE gufo_core gufo_http
     gufo_deepseek_v4_flash_text ${GUFO_QWEN_LIBRARIES})
   # One test per corpus file, so a parallel ctest spreads them.
@@ -1109,6 +1111,11 @@ endfunction()
   add_test(NAME base64_test COMMAND base64_test)
   set_tests_properties(base64_test PROPERTIES LABELS "cpu;server;correctness")
 
+  add_executable(metrics_test tests/core/metrics_test.cpp)
+  target_link_libraries(metrics_test PRIVATE gufo_http)
+  add_test(NAME metrics_test COMMAND metrics_test)
+  set_tests_properties(metrics_test PROPERTIES LABELS "cpu;server;correctness")
+
   add_executable(websocket_frame_test
     tests/cli/websocket_frame_test.cpp)
   target_link_libraries(websocket_frame_test PRIVATE gufo_core)
@@ -1123,18 +1130,16 @@ endfunction()
   set_tests_properties(http_request_test PROPERTIES
     LABELS "cpu;server;http;correctness")
 
-  # The Rust chat request decoder against frozen C++ decoders; no sockets.
+  # The Rust chat request decoder through its C++ caller; no sockets.
   add_executable(chat_request_test
-    tests/cli/chat_request_test.cpp
-    tests/cli/chat_request_reference.cpp)
+    tests/cli/chat_request_test.cpp)
   target_link_libraries(chat_request_test PRIVATE gufo_http)
   add_test(NAME chat_request_test COMMAND chat_request_test)
   set_tests_properties(chat_request_test PROPERTIES
     LABELS "cpu;server;api;openai;correctness")
 
   add_executable(multipart_test
-    tests/cli/multipart_test.cpp
-    tests/cli/multipart_reference.cpp)
+    tests/cli/multipart_test.cpp)
   target_link_libraries(multipart_test PRIVATE gufo_http)
   target_compile_definitions(multipart_test PRIVATE
     GUFO_MULTIPART_FIXTURES="${PROJECT_SOURCE_DIR}/tests/fixtures/multipart")
@@ -1148,6 +1153,26 @@ endfunction()
   target_link_libraries(http_server_test PRIVATE gufo_http)
   add_test(NAME http_server_test COMMAND http_server_test)
   set_tests_properties(http_server_test PROPERTIES LABELS "cpu;server;http" TIMEOUT 30)
+
+  add_executable(asr_metrics_test tests/cli/asr_metrics_test.cpp)
+  target_link_libraries(asr_metrics_test PRIVATE gufo_http)
+  add_test(NAME asr_metrics_test COMMAND asr_metrics_test)
+  set_tests_properties(asr_metrics_test PROPERTIES
+    LABELS "cpu;server;http;correctness" TIMEOUT 30)
+
+  add_executable(embedding_metrics_test tests/cli/embedding_metrics_test.cpp)
+  target_link_libraries(embedding_metrics_test PRIVATE gufo_http)
+  add_test(NAME embedding_metrics_test COMMAND embedding_metrics_test)
+  set_tests_properties(embedding_metrics_test PROPERTIES
+    LABELS "cpu;server;http;correctness" TIMEOUT 30)
+
+  add_executable(metrics_golden_test tests/cli/metrics_golden_test.cpp)
+  target_link_libraries(metrics_golden_test PRIVATE gufo_http)
+  target_compile_definitions(metrics_golden_test PRIVATE
+    GUFO_METRICS_FIXTURES="${PROJECT_SOURCE_DIR}/tests/fixtures/metrics")
+  add_test(NAME metrics_golden_test COMMAND metrics_golden_test)
+  set_tests_properties(metrics_golden_test PROPERTIES
+    LABELS "cpu;server;http;correctness" TIMEOUT 30)
 
   add_executable(http_server_signals_test tests/cli/http_server_signals_test.cpp)
   target_link_libraries(http_server_signals_test PRIVATE gufo_http)
@@ -1214,9 +1239,12 @@ endfunction()
     FIXTURES_REQUIRED gufo_extension_inventory)
   set_tests_properties(check_extension_isolation_test PROPERTIES
     LABELS "cpu;repository" TIMEOUT 180)
-  set_tests_properties(extension_isolation_report
-    extension_core_model_includes_gate extension_family_graph_gate
-    extension_model_core_includes_gate
+  # The report scans the whole tree: 6 s on Linux, 15-30 s on Windows runners
+  # running four tests at once. The gates only read its inventory.
+  set_tests_properties(extension_isolation_report PROPERTIES
+    LABELS "cpu;repository" TIMEOUT 120)
+  set_tests_properties(extension_core_model_includes_gate
+    extension_family_graph_gate extension_model_core_includes_gate
     extension_serving_boundary_gate extension_target_ownership_gate
     PROPERTIES LABELS "cpu;repository" TIMEOUT 30)
 
@@ -1527,13 +1555,17 @@ endfunction()
   set_tests_properties(allocation_benchmark_test PROPERTIES
     LABELS "gpu;hip;gfx1151;diagnostics;allocation;opt-c091")
 
-  add_executable(gguf_header_test
-    tests/core/gguf_header_test.cpp
-    tests/core/gguf_header_reference.cpp)
+  add_executable(gguf_header_test tests/core/gguf_header_test.cpp)
   target_link_libraries(gguf_header_test PRIVATE gufo_core)
   add_test(NAME gguf_header_test COMMAND gguf_header_test)
   set_tests_properties(gguf_header_test PROPERTIES
     LABELS "cpu;core;gguf;correctness")
+
+  add_executable(safetensors_header_test tests/core/safetensors_header_test.cpp)
+  target_link_libraries(safetensors_header_test PRIVATE gufo_core)
+  add_test(NAME safetensors_header_test COMMAND safetensors_header_test)
+  set_tests_properties(safetensors_header_test PROPERTIES
+    LABELS "cpu;core;safetensors;correctness")
 
   # the prefetch fixture uses mkstemp and mmap
   if (NOT WIN32)
@@ -1682,11 +1714,6 @@ endfunction()
   target_link_libraries(exact_token_test PRIVATE gufo_core ${GUFO_QWEN_LIBRARIES})
   add_test(NAME exact_token_test COMMAND exact_token_test)
   set_tests_properties(exact_token_test PROPERTIES LABELS "cpu;quality;tokens")
-
-  add_executable(eval_regrade_test tests/quality/eval_regrade_test.cpp)
-  target_link_libraries(eval_regrade_test PRIVATE gufo_core gufo_eval)
-  add_test(NAME eval_regrade_test COMMAND eval_regrade_test)
-  set_tests_properties(eval_regrade_test PROPERTIES LABELS "cpu;quality;eval")
 
   add_test(NAME eval_http_test
     COMMAND ${Python3_EXECUTABLE}

@@ -1,6 +1,6 @@
 # Inkling 2 Mini experiments
 
-Rejected or neutral changes, measured November 22–24, 2026 on Strix Halo
+Rejected or neutral changes, measured November 22–27, 2026 on Strix Halo
 against the build they modified. Every variant is exact unless noted. Kept
 changes are in Git history; current speeds are in [benchmarks](BENCHMARKS.md).
 
@@ -17,13 +17,31 @@ changes are in Git history; current speeds are in [benchmarks](BENCHMARKS.md).
 | Prefill attention with register-prefetched K/V tiles | spills; pp32768 −5% |
 | 32-query attention blocks | pp32768 −11% |
 | 128-query blocks on window visits too | equal within noise |
+| Accumulator rescale skipped in window and near attention steps too, as in the far tiles | equal within noise |
 | Message mixes as their own side-stream launch | pp512 −1.5%; folded into the message mix from 1,024-token ubatches |
+| Router and controller gates with smaller token tiles, or blocks reordered so jobs sharing x run together (Nov 25) | equal or up to 2.5× slower: the gates are LDS-bandwidth bound, not DRAM or occupancy bound |
+| Gate GEMMs with wave-uniform scalar weights, one token per lane (Nov 25) | 2 to 10× slower |
+| Controller apply + norm below 512-token ubatches (Nov 25) | pp64 −1%: too few blocks; the separate kernels are kept there |
+| MoE items of ≤64 tokens in a lean kernel beside the full items (Nov 25) | gate/up −2.4% only: small items are bound by their expert weight reads and barely overlap |
+| MoE gate/up with activations staged in LDS, a two-deep weight prefetch, or 4 waves of 32 tokens × 128 rows (Nov 25) | full items up to +2.6%, overall 2 to 19% slower |
+| MoE gate/up with each wave dequantising its own weight tile in registers, no LDS or barriers (Nov 26) | 15 to 23 TFLOPS against 29: the wave then loads four times the activation tiles per WMMA, and the weight rows no longer arrive ahead of their use |
+| MoE gate/up waves of 64 tokens × 64 rows, or 64 tokens × 32 rows (Nov 26) | 64 × 64 fills all 256 VGPRs (full items 32.8 TFLOPS against 35.6); 64 × 32 doubles the activation loads (29.2) |
+| MoE gate/up with 32-k LDS slabs (10 KiB per block), another LDS row stride, activations loaded per 16 k, or the `iterative-ilp`, `max-ilp` and `iterative-minreg` schedulers (Nov 26) | 3 to 9% slower or equal; a 64-element row stride (no padding) is 2.4 times slower |
+| Expert items of at most 16 tokens in a kernel of their own, with or without LDS (Nov 26) | equal to 27% slower: an item's cost is its 18 LDS loads of the expert's weights, whatever its tokens |
+| Use 128-query `attn_prefill_db<8, 32>` on global visits from `pos0 == 0` when `n >= 1024` (Nov 27) | Rejected: neutral within noise (2048: 2318 vs 2319 tok/s, 16K: 2254 vs 2259 tok/s) |
+
+| Short ubatches: 32-token dense GEMM tiles up to 32 tokens, gate tiles with 64 or 128 k per barrier, or 64-thread MoE blocks for 32-token items (Nov 27) | within 1%: the dense and MoE kernels follow their weight reads, the gate tiles their LDS loads per product |
+| MoE items of 64 tokens below 512-token ubatches, or 128-token items from 64, 128 or 256 tokens (Nov 27) | 64-token items 12 to 30% slower (64 to 448 tokens); 128-token items 7 to 12% slower below 512 tokens |
+| Padding tiles of `k_gemm4` skipped by checks inside its product loop (Nov 27) | 16 tokens 82 → 88 ms, 64 tokens 126 → 138 ms: the checks break the straight-line body; a separate body for waves that hold only padding is kept (1 to 2% faster) |
+| Short ubatches at 32K: attention blocks of one or two query tiles, or one head per block (Nov 27) | 16 tokens 111 → 138 ms (one tile or one head), 118 ms (two tiles); 256 tokens 243 → 368 ms: fewer threads move each K/V tile |
+| Attention K/V rows touched 2 to 16 tiles ahead on short ubatches at 32K (Nov 27) | 16 tokens −2%, 256 tokens 243 → 270 ms |
 
 ## Decode and verification
 
 | Variant | Result |
 | --- | --- |
 | Quantising each activation once (`k_quant`) instead of per GEMV block | tg −3%: about 240 more launches per token |
+| A block's first weight rows loaded before it quantises its input, in the expert gate/up and down GEMVs (Nov 26) | tg −1.6% (22.03 against 21.68 ms per token): the decode GEMVs already read their weights at 197 to 238 GB/s, so the prologue is not their bound |
 | Two row iterations per wave, or 16 waves per block, in the expert GEMVs | equal or −2% |
 | Expert weights held in registers, or MoE inputs read from L2 | 2% slower per token |
 | Predictive expert prefetch (60% top-1 reuse between tokens) | 0.5% slower: the reads compete with latency-bound kernels |
@@ -33,6 +51,14 @@ changes are in Git history; current speeds are in [benchmarks](BENCHMARKS.md).
 | Dense int8 WMMA from 8 rows for one-input projections or the output projection | within noise |
 | Verification attention with the split reduction in its last block | +0.3 ms per step |
 | Controller gates of 2 to 8 tokens per block | verification +0.1 to +0.3 ms |
+| Eliminate `% cap` integer modulo on global visits and add far-tile fast path in `attn_decode_body`, `attn_decode_rows`, and `attn_prefill_db` (Nov 27) | Rejected: neutral within noise (±0.2% across 2K–32K prefill and decode); integer modulo is hidden behind DRAM/WMMA latency |
+| Stream K loads inside the WMMA loop and issue V loads after WMMA in `attn_decode_body` and `attn_decode_rows` to reduce VGPR pressure (Nov 27) | Rejected: neutral within noise (38.87 vs 38.91 tok/s at 32K); decode attention is DRAM-bandwidth bound, not occupancy bound |
+| Skip `attn_output` + router MALL prefetch during global attention when `bucket_ctx >= 8192` (Nov 27) | **Accepted**: decode at 32K 38.91 → 39.36 tok/s (+1.2%, −0.30 ms/tok), 16K 43.16 → 43.33 tok/s; avoids competing with KV reads and evicting prefetched weights from MALL |
+| Non-temporal (`__builtin_nontemporal_load`) K/V loads on global visits in `attn_decode_body` and `attn_decode_rows` (Nov 27) | Rejected: decode −0.6% to −1.0% across 64–32K (39.36 → 38.96 tok/s at 32K); both half-waves read the same K rows and rely on L1/L2 caching |
+| Halve global decode attention split chunk (`bucket_ctx / 64`, 64 splits at 32K) (Nov 27) | Rejected: decode at 32K 39.36 → 39.26 tok/s (−0.25%); extra split writeback and `decode_reduce` work outweigh finer load balance |
+| Shrink `k_mix` from 512 to 256 threads (8 waves, `R=9` in `conv_resid_block`) (Nov 27) | Rejected: decode at 64/2K regressed −0.76 ms/tok (50.95 → 49.05 tok/s at 64); fewer threads serialized `conv_resid_block` and the weighted sum |
+| Size `k_mix` to 576 threads (18 waves = 2304/4 exact: `R=4` in `conv_resid_block`, `R=1` in mix, branchless) (Nov 27) | **Accepted**: decode improved across all depths (64: 50.95 → 51.04, 2K: 48.17 → 48.24, 16K: 43.33 → 43.53, 32K: 39.36 → 39.49 tok/s; −0.08 to −0.11 ms/tok) |
+| Read k-interleaved `HW4` (`[16][2304][4]` BF16) controller `gain`/`forget` weights in `k_ctl_apply_rms` and prefetch `HW4` (Nov 27) | **Accepted**: coalesced loads across waves with exact arithmetic; decode 2K 48.24 → 48.35, 16K 43.53 → 43.55, 32K 39.49 → 39.55 tok/s (total +1.65% / −0.41 ms/tok at 32K vs baseline) |
 
 ## DSpark
 
@@ -47,6 +73,10 @@ changes are in Git history; current speeds are in [benchmarks](BENCHMARKS.md).
 | Back-off tolerance 0 for a lone request | greedy −4% |
 | Verification MoE grouped by expert at 4 rows | slower: L2 already dedups shared experts |
 | No drafter injection at eight sessions (not exact for later proposals) | +0.6%, within noise |
+| Acceptance calibration with its own table for a block's first proposal, and bins up to 0.99999 (Nov 27) | same speed as the bins by distance from 1 alone (greedy +0.8% both), although it predicts acceptance better (log-loss 0.421 against 0.435; ten bins 0.485) |
+| A second candidate for the same position as a verification row (Nov 27) | not built: it shares more experts than an unrelated row but still costs about 3.5 ms, and pays only when the drafter's second choice is right more than 20% of the time |
+| Dropping verification rows early from a readout of the anchor row's residual (Nov 27) | not built: the readout agrees with the final token 11% of the time after the third loop pass and 33% mid-postlude |
+| A proposal head of the first token ids, as the Qwen draft vocabulary (Nov 27) | not built: ids are not in frequency order here (the first 65,536 cover 25% of prose tokens, the 65,536 largest `markov_w1` rows 98.8%, the 32,768 largest 90.6%) |
 
 ## Host
 
@@ -72,4 +102,3 @@ Each would need its own quality qualification.
 | F16 MoE slot rows instead of F32 | about 45 ms less per pp2048 |
 | Rejection sampling of sampled proposals | more accepted drafts at T > 0; output distributed as AR's, not equal to it |
 | Expert layers 20–23 as NVFP4, expert pruning, sparse attention from 32K (mikealanni/gufo) | faster decode/prefill at KL ~1e-3 |
-| Larger prefill batches (4,096) | changes the chunking the byte comparison uses |

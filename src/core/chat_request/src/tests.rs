@@ -1,5 +1,5 @@
 //! Decoder tests through a recording host. tests/cli/chat_request_test.cpp
-//! compares every API with the frozen C++ decoders.
+//! checks every API through the C++ caller.
 
 use super::*;
 use crate::draft::{Message, Role};
@@ -272,6 +272,100 @@ fn messages_split_tool_turns() {
 }
 
 #[test]
+fn messages_apply_tool_changes_and_references() {
+    let mut host = Fake::default();
+    let tool = |name: &str| format!(r#"{{"name":"{name}","input_schema":{{"type":"object"}}}}"#);
+    let body = format!(
+        r#"{{"tools":[{},{}],"messages":[{{"role":"user","content":"find"}},
+            {{"role":"assistant","content":[{{"type":"tool_use","id":"c","name":"a","input":{{}}}}]}},
+            {{"role":"user","content":[{{"type":"tool_result","tool_use_id":"c","content":[
+              {{"type":"text","text":"found"}},{{"type":"tool_reference","tool_name":"b"}}]}}]}},
+            {{"role":"system","content":[{{"type":"tool_removal","tool":{{"type":"tool_reference","name":"a"}}}},
+              {{"type":"tool_addition","tool":{{"type":"tool_definition","definition":{}}}}}]}},
+            {{"role":"system","content":[{{"type":"text","text":"note"}},
+              {{"type":"tool_addition","tool":{{"type":"tool_reference","name":"a"}}}}]}},
+            {{"role":"user","content":"go"}}]}}"#,
+        tool("a"),
+        tool("b"),
+        tool("c")
+    );
+    let draft = run_api(Api::Messages, &body, &mut host).unwrap();
+    let names: Vec<&str> = draft.tools.added.iter().map(|t| t.name.as_str()).collect();
+    // A removed tool added back keeps its place; a defined tool follows.
+    assert_eq!(names, ["a", "b", "c"]);
+    assert_eq!(draft.messages[2].role, Role::Tool);
+    assert_eq!(draft.messages[2].content, "found\nTool loaded: b\n");
+    // The turn that held only changes adds no message; the other keeps its text.
+    let roles: Vec<Role> = draft.messages.iter().map(|m| m.role).collect();
+    assert_eq!(
+        roles,
+        [
+            Role::User,
+            Role::Assistant,
+            Role::Tool,
+            Role::System,
+            Role::User
+        ]
+    );
+    assert_eq!(draft.messages[3].content, "note");
+
+    let removed = format!(
+        r#"{{"tools":[{},{}],"messages":[{{"role":"system","content":[
+            {{"type":"tool_removal","tool":{{"type":"tool_reference","name":"b"}}}}]}},
+            {{"role":"user","content":"go"}}]}}"#,
+        tool("a"),
+        tool("b")
+    );
+    let draft = run_api(Api::Messages, &removed, &mut host).unwrap();
+    let names: Vec<&str> = draft.tools.added.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, ["a"]);
+    // Removed, then defined again: declared, with the new definition.
+    let redefined = format!(
+        r#"{{"tools":[{}],"messages":[{{"role":"system","content":[
+            {{"type":"tool_removal","tool":{{"type":"tool_reference","name":"a"}}}}]}},
+            {{"role":"system","content":[{{"type":"tool_addition","tool":{{"type":"tool_definition",
+              "definition":{{"name":"a","description":"new","input_schema":{{"type":"object"}}}}}}}}]}},
+            {{"role":"user","content":"go"}}]}}"#,
+        tool("a")
+    );
+    let draft = run_api(Api::Messages, &redefined, &mut host).unwrap();
+    assert_eq!(draft.tools.added.len(), 1);
+    assert_eq!(draft.tools.added[0].name, "a");
+    assert_eq!(draft.tools.added[0].description, "new");
+
+    for (body, message) in [
+        (
+            r#"{"messages":[{"role":"system","content":[{"type":"tool_removal","tool":{"type":"tool_reference","name":"x"}}]},{"role":"user","content":"go"}]}"#,
+            "tool change references tool 'x', which is not declared in tools",
+        ),
+        (
+            r#"{"messages":[{"role":"user","content":[{"type":"tool_addition","tool":{"type":"tool_reference","name":"x"}}]}]}"#,
+            "tool_addition and tool_removal blocks are only allowed in messages with role \"system\"",
+        ),
+        (
+            r#"{"messages":[{"role":"system","content":[{"type":"tool_removal","tool":{"type":"tool_reference","name":""}}]}]}"#,
+            "a tool change needs a tool_reference with a name, or (tool_addition only) a tool_definition",
+        ),
+        (
+            r#"{"messages":[{"role":"system","content":[{"type":"tool_removal","tool":{"type":"tool_definition","definition":{}}}]}]}"#,
+            "a tool change needs a tool_reference with a name, or (tool_addition only) a tool_definition",
+        ),
+    ] {
+        assert_eq!(
+            run_api(Api::Messages, body, &mut host).err(),
+            Some(rejected(400, "invalid_tools", message))
+        );
+    }
+    let missing = r#"{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"c","name":"a","input":{}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"c","content":[{"type":"tool_reference"}]}]}]}"#;
+    assert!(matches!(
+        run_api(Api::Messages, missing, &mut host).err(),
+        Some(Failure::Rejected(Rejection { status: 400, ref message, .. }))
+            if message == "tool_reference blocks require a tool_name"
+    ));
+}
+
+#[test]
 fn fragments_start_from_the_request() {
     let mut host = Fake::default();
     let defaults = Defaults {
@@ -392,4 +486,138 @@ fn caller_errors_are_internal() {
             GufoChatDecode::Internal
         );
     }
+}
+
+/// The text and thought parts a message emits, as (thought, end).
+fn parts_of(host: &Fake) -> Vec<(bool, i64)> {
+    host.events
+        .iter()
+        .filter(|event| event.0 == Op::Part)
+        .map(|event| (event.1 != 0, event.2))
+        .collect()
+}
+
+// A turn written as blocks (Inkling 2) replays its thoughts in place: a Chat
+// assistant message takes `thinking` parts among its text parts, after its
+// `reasoning_content`, as the reference renderer reads them.
+#[test]
+fn chat_assistant_thinking_parts_keep_their_order() {
+    let mut host = Fake::default();
+    let draft = run_api(
+        Api::Chat,
+        r#"{"model":"m","messages":[{"role":"user","content":"q"},
+            {"role":"assistant","reasoning_content":"R","content":[
+            {"type":"text","text":"ab"},{"type":"thinking","thinking":"T"},
+            {"type":"text","text":"c"}]}]}"#,
+        &mut host,
+    )
+    .unwrap();
+    let message = &draft.messages[1];
+    assert_eq!(
+        (message.thought.as_str(), message.content.as_str()),
+        ("RT", "abc")
+    );
+    draft.emit(&mut host).unwrap();
+    assert_eq!(
+        parts_of(&host),
+        [(true, 1), (false, 2), (true, 2), (false, 3)]
+    );
+
+    let mut host = Fake::default();
+    let refused = run_api(
+        Api::Chat,
+        r#"{"model":"m","messages":[{"role":"user","content":[
+            {"type":"thinking","thinking":"T"}]}]}"#,
+        &mut host,
+    );
+    assert!(
+        format!("{refused:?}").contains("thinking content parts require an assistant message"),
+        "{refused:?}"
+    );
+}
+
+// Text parts keep their boundaries; the legacy shape (a thought, then one
+// text) emits none.
+#[test]
+fn parts_emit_only_when_their_order_says_more() {
+    let mut host = Fake::default();
+    let draft = run_api(
+        Api::Chat,
+        r#"{"model":"m","messages":[
+            {"role":"user","content":[{"type":"text","text":"a"},{"type":"text","text":"bc"}]},
+            {"role":"assistant","reasoning_content":"R","content":[{"type":"text","text":"x"}]},
+            {"role":"user","content":[{"type":"text","text":"only"}]}]}"#,
+        &mut host,
+    )
+    .unwrap();
+    draft.emit(&mut host).unwrap();
+    assert_eq!(parts_of(&host), [(false, 1), (false, 3)]);
+}
+
+#[test]
+fn messages_thinking_blocks_keep_their_order() {
+    let mut host = Fake::default();
+    let draft = run_api(
+        Api::Messages,
+        r#"{"model":"m","max_tokens":8,"messages":[{"role":"user","content":"q"},
+            {"role":"assistant","content":[{"type":"text","text":"A"},
+            {"type":"thinking","thinking":"T","signature":""},{"type":"text","text":"B"}]}]}"#,
+        &mut host,
+    )
+    .unwrap();
+    draft.emit(&mut host).unwrap();
+    assert_eq!(parts_of(&host), [(false, 1), (true, 1), (false, 2)]);
+}
+
+// The Responses output of such a turn (reasoning, message, reasoning,
+// message) replays as one assistant turn with its blocks in order.
+#[test]
+fn responses_later_thoughts_join_their_turn() {
+    let mut host = Fake::default();
+    let draft = run_api(
+        Api::Responses,
+        r#"{"model":"m","input":[{"role":"user","content":"q"},
+            {"type":"reasoning","summary":[{"type":"summary_text","text":"R"}]},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"A"}]},
+            {"type":"reasoning","summary":[{"type":"summary_text","text":"T"}]},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"B"}]},
+            {"role":"user","content":"next"}]}"#,
+        &mut host,
+    )
+    .unwrap();
+    assert_eq!(draft.messages.len(), 3);
+    let turn = &draft.messages[1];
+    assert_eq!((turn.thought.as_str(), turn.content.as_str()), ("RT", "AB"));
+    draft.emit(&mut host).unwrap();
+    assert_eq!(
+        parts_of(&host),
+        [(true, 1), (false, 1), (true, 2), (false, 2)]
+    );
+
+    // An answer item that brings its own `reasoning_content` starts a turn,
+    // as before parts existed, instead of slicing its text by thought ends.
+    let mut host = Fake::default();
+    let draft = run_api(
+        Api::Responses,
+        r#"{"model":"m","input":[{"role":"user","content":"q"},
+            {"type":"reasoning","summary":[{"type":"summary_text","text":"R"}]},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"A"}]},
+            {"type":"reasoning","summary":[{"type":"summary_text","text":"T"}]},
+            {"type":"message","role":"assistant","reasoning_content":"long thought",
+             "content":[{"type":"output_text","text":"B"}]},
+            {"role":"user","content":"next"}]}"#,
+        &mut host,
+    )
+    .unwrap();
+    assert_eq!(draft.messages.len(), 4);
+    let turn = &draft.messages[1];
+    assert_eq!((turn.thought.as_str(), turn.content.as_str()), ("RT", "A"));
+    assert_eq!(
+        (
+            draft.messages[2].thought.as_str(),
+            draft.messages[2].content.as_str()
+        ),
+        ("long thought", "B")
+    );
+    draft.emit(&mut host).unwrap();
 }

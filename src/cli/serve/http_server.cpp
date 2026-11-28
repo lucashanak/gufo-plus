@@ -19,6 +19,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <ranges>
@@ -51,6 +52,7 @@
 #include "src/cli/serve/websocket.hpp"
 #include "src/core/json.hpp"
 #include "src/core/platform/shutdown_signal.hpp"
+#include "src/core/prompt_too_long.hpp"
 #include "src/core/rust/callback.hpp"
 #include "src/core/utf8.hpp"
 #include "src/families/qwen/text/chat_template.hpp"
@@ -312,9 +314,12 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
     const auto* value = body.find(field);
     if (value == nullptr)
       continue;
+    // As on Chat Completions, an explicit null leaves the flag unset, which
+    // these endpoints serve as false.
+    if (value->is_null())
+      continue;
     if (field == "stream" && allowances.stream) {
-      // As on Chat Completions, null leaves streaming off.
-      if (!value->is_null() && !value->is_bool())
+      if (!value->is_bool())
         return InvalidCompatibilityRequest("'stream' must be a boolean");
       continue;
     }
@@ -866,6 +871,14 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
   return CreateAnthropicMessage(
       req, b, decoded.chat, decoded.max_tokens.value_or(0), decoded.sampling,
       decoded.stream, decoded.model ? *decoded.model : b.model_id());
+} catch (const core::PromptTooLong& error) {
+  // Anthropic's wording, which Claude Code answers by compacting the
+  // conversation instead of failing the turn.
+  const auto message = "prompt is too long: " + std::to_string(error.tokens()) +
+                       " tokens > " + std::to_string(error.maximum()) +
+                       " maximum";
+  return Err(400, "Bad Request", message.c_str(), "invalid_request_error",
+             "context_length_exceeded");
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
              "context_length_exceeded");
@@ -1125,144 +1138,52 @@ double KvCacheUsageRatio(const TextGenerationBackend& b) {
   return static_cast<double>(used) / static_cast<double>(capacity);
 }
 
-HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
-  std::ostringstream out;
-  out << std::setprecision(std::numeric_limits<double>::max_digits10);
-  out << "# HELP gufo_device_lost_total Confirmed GPU context losses\n"
-      << "# TYPE gufo_device_lost_total counter\n"
-      << "gufo_device_lost_total "
-      << detail::DeviceLostTotal().load(std::memory_order_relaxed) << "\n";
-  out << "# HELP llamacpp:prompt_tokens_total Total prompt tokens processed, "
-         "excluding cache hits\n"
-      << "# TYPE llamacpp:prompt_tokens_total counter\n"
-      << "llamacpp:prompt_tokens_total "
-      << detail::TotalPromptTokens().load(std::memory_order_relaxed) << "\n"
-      << "# HELP llamacpp:prompt_tokens_cached_total Total prompt tokens "
-         "reused from cache\n"
-      << "# TYPE llamacpp:prompt_tokens_cached_total counter\n"
-      << "llamacpp:prompt_tokens_cached_total "
-      << detail::TotalCachedPromptTokens().load(std::memory_order_relaxed)
-      << "\n"
-      << "# HELP llamacpp:prompt_seconds_total Prompt process time\n"
-      << "# TYPE llamacpp:prompt_seconds_total counter\n"
-      << "llamacpp:prompt_seconds_total "
-      << detail::TotalPromptSeconds().load(std::memory_order_relaxed) << "\n"
-      << "# HELP llamacpp:tokens_predicted_total Total tokens generated\n"
-      << "# TYPE llamacpp:tokens_predicted_total counter\n"
-      << "llamacpp:tokens_predicted_total "
-      << detail::TotalGenTokens().load(std::memory_order_relaxed) << "\n"
-      << "# HELP llamacpp:tokens_predicted_seconds_total Predict process "
-         "time\n"
-      << "# TYPE llamacpp:tokens_predicted_seconds_total counter\n"
-      << "llamacpp:tokens_predicted_seconds_total "
-      << detail::TotalGenSeconds().load(std::memory_order_relaxed) << "\n"
-      << "# HELP llamacpp:n_tokens_max Largest observed n_tokens.\n"
-      << "# TYPE llamacpp:n_tokens_max counter\n"
-      << "llamacpp:n_tokens_max "
-      << detail::MaxSequenceTokens().load(std::memory_order_relaxed) << "\n"
-      << "# HELP llamacpp:spec_decode_num_drafts_total Total speculative "
-         "verification rounds\n"
-      << "# TYPE llamacpp:spec_decode_num_drafts_total counter\n"
-      << "llamacpp:spec_decode_num_drafts_total "
-      << detail::TotalDraftRounds().load(std::memory_order_relaxed) << "\n"
-      << "# HELP llamacpp:spec_decode_num_draft_tokens_total Total draft "
-         "tokens proposed\n"
-      << "# TYPE llamacpp:spec_decode_num_draft_tokens_total counter\n"
-      << "llamacpp:spec_decode_num_draft_tokens_total "
-      << detail::TotalDraftTokens().load(std::memory_order_relaxed) << "\n"
-      << "# HELP llamacpp:spec_decode_num_accepted_tokens_total Total draft "
-         "tokens accepted\n"
-      << "# TYPE llamacpp:spec_decode_num_accepted_tokens_total counter\n"
-      << "llamacpp:spec_decode_num_accepted_tokens_total "
-      << detail::TotalDraftAcceptedTokens().load(std::memory_order_relaxed)
-      << "\n"
-      << "# HELP gufo_spec_lookup_tokens_total Total prompt-lookup copies "
-         "proposed\n"
-      << "# TYPE gufo_spec_lookup_tokens_total counter\n"
-      << "gufo_spec_lookup_tokens_total "
-      << detail::TotalLookupTokens().load(std::memory_order_relaxed) << "\n"
-      << "# HELP gufo_spec_lookup_accepted_tokens_total Total prompt-lookup "
-         "copies accepted\n"
-      << "# TYPE gufo_spec_lookup_accepted_tokens_total counter\n"
-      << "gufo_spec_lookup_accepted_tokens_total "
-      << detail::TotalLookupAcceptedTokens().load(std::memory_order_relaxed)
-      << "\n"
-      << "# HELP llamacpp:prompt_tokens_seconds Prompt processing speed in "
-         "tokens per second\n"
-      << "# TYPE llamacpp:prompt_tokens_seconds gauge\n"
-      << "llamacpp:prompt_tokens_seconds "
-      << detail::LastPromptSpeed().load(std::memory_order_relaxed) << "\n"
-      << "# HELP llamacpp:predicted_tokens_seconds Generation speed in tokens "
-         "per second\n"
-      << "# TYPE llamacpp:predicted_tokens_seconds gauge\n"
-      << "llamacpp:predicted_tokens_seconds "
-      << detail::LastGenSpeed().load(std::memory_order_relaxed) << "\n"
-      << "# HELP llamacpp:requests_processing Number of admitted requests, "
-         "including cache preparation\n"
-      << "# TYPE llamacpp:requests_processing gauge\n"
-      << "llamacpp:requests_processing "
-      << detail::RequestsProcessing().load(std::memory_order_relaxed) << "\n"
-      << "# HELP llamacpp:requests_deferred Number of requests waiting for a "
-         "session\n"
-      << "# TYPE llamacpp:requests_deferred gauge\n"
-      << "llamacpp:requests_deferred "
-      << detail::RequestsDeferred().load(std::memory_order_relaxed) << "\n"
-      << "# HELP llamacpp:kv_cache_usage_ratio In-flight prompt and generated "
-         "tokens over sessions times context; excludes retained cache\n"
-      << "# TYPE llamacpp:kv_cache_usage_ratio gauge\n"
-      << "llamacpp:kv_cache_usage_ratio " << KvCacheUsageRatio(b) << "\n";
-  if (const auto shared = b.shared_state()) {
-    out << "# HELP gufo_shared_state_bytes Session state the configured "
-           "sessions share when they do not all fit at full context\n"
-        << "# TYPE gufo_shared_state_bytes gauge\n"
-        << "gufo_shared_state_bytes " << shared->shared_bytes << "\n"
-        << "# HELP gufo_shared_state_charged_bytes Shared session state "
-           "charged to sessions\n"
-        << "# TYPE gufo_shared_state_charged_bytes gauge\n"
-        << "gufo_shared_state_charged_bytes " << shared->charged_bytes << "\n"
-        << "# HELP gufo_shared_state_reclaimable_bytes Charged session state "
-           "held by idle sessions or mapped past a session's need\n"
-        << "# TYPE gufo_shared_state_reclaimable_bytes gauge\n"
-        << "gufo_shared_state_reclaimable_bytes " << shared->reclaimable_bytes
-        << "\n"
-        << "# HELP gufo_shared_state_max_prompt_tokens Longest prompt the "
-           "shared session state holds\n"
-        << "# TYPE gufo_shared_state_max_prompt_tokens gauge\n"
-        << "gufo_shared_state_max_prompt_tokens " << shared->max_prompt_tokens
-        << "\n"
-        << "# HELP gufo_shared_state_waits_total Requests that waited for "
-           "shared session state\n"
-        << "# TYPE gufo_shared_state_waits_total counter\n"
-        << "gufo_shared_state_waits_total " << shared->waits << "\n"
-        << "# HELP gufo_shared_state_pauses_total Decoding requests paused "
-           "until shared session state freed\n"
-        << "# TYPE gufo_shared_state_pauses_total counter\n"
-        << "gufo_shared_state_pauses_total " << shared->pauses << "\n"
-        << "# HELP gufo_shared_state_preemptions_total Requests stopped "
-           "with memory_pressure so others could continue\n"
-        << "# TYPE gufo_shared_state_preemptions_total counter\n"
-        << "gufo_shared_state_preemptions_total " << shared->preemptions
-        << "\n";
-  }
-  if (const auto budget = b.prompt_admission_budget()) {
-    out << "# HELP gufo_prompt_state_budget_bytes Host RAM prompt state may "
-           "claim before admission refuses\n"
-        << "# TYPE gufo_prompt_state_budget_bytes gauge\n"
-        << "gufo_prompt_state_budget_bytes " << budget->budget_bytes << "\n"
-        << "# HELP gufo_prompt_state_reserved_bytes Host prompt state charged "
-           "to in-flight requests\n"
-        << "# TYPE gufo_prompt_state_reserved_bytes gauge\n"
-        << "gufo_prompt_state_reserved_bytes " << budget->used_bytes << "\n"
-        << "# HELP gufo_prompt_state_available_bytes Remaining host prompt "
-           "state budget\n"
-        << "# TYPE gufo_prompt_state_available_bytes gauge\n"
-        << "gufo_prompt_state_available_bytes " << budget->available_bytes
-        << "\n";
-  }
+HttpResponse PrometheusText(std::string body) {
   return {.status = 200,
           .reason = "OK",
-          .body = out.str(),
+          .body = std::move(body),
           .headers = {{"Content-Type", "text/plain; version=0.0.4"}}};
+}
+
+HttpResponse LlamaMetrics(TextGenerationBackend& b) {
+  // The cells are process-global, so a concurrent scrape could Show or Set
+  // between this scrape's updates and its render.
+  static std::mutex scrape_mutex;
+  const std::lock_guard<std::mutex> lock(scrape_mutex);
+  TextMetrics& metrics = Metrics();
+  metrics.kv_cache_usage_ratio.Set(KvCacheUsageRatio(b));
+  const auto shared = b.shared_state();
+  metrics.shared_state.Show(shared.has_value());
+  if (shared) {
+    metrics.shared_state.bytes.Set(shared->shared_bytes);
+    metrics.shared_state.charged_bytes.Set(shared->charged_bytes);
+    metrics.shared_state.reclaimable_bytes.Set(shared->reclaimable_bytes);
+    metrics.shared_state.max_prompt_tokens.Set(shared->max_prompt_tokens);
+    metrics.shared_state.waits.Set(shared->waits);
+    metrics.shared_state.pauses.Set(shared->pauses);
+    metrics.shared_state.preemptions.Set(shared->preemptions);
+  }
+  const auto budget = b.prompt_admission_budget();
+  metrics.prompt_state.Show(budget.has_value());
+  if (budget) {
+    metrics.prompt_state.budget_bytes.Set(budget->budget_bytes);
+    metrics.prompt_state.reserved_bytes.Set(budget->used_bytes);
+    metrics.prompt_state.available_bytes.Set(budget->available_bytes);
+  }
+  return PrometheusText(metrics.registry.Render());
+}
+
+std::function<HttpResponse()> MetricsEndpoint(
+    const std::shared_ptr<TextGenerationBackend>& text,
+    const std::shared_ptr<EmbeddingService>& embeddings,
+    const std::shared_ptr<AsrService>& asr) {
+  if (text != nullptr)
+    return [text] { return LlamaMetrics(*text); };
+  if (embeddings != nullptr)
+    return [embeddings] { return PrometheusText(embeddings->RenderMetrics()); };
+  if (asr != nullptr)
+    return [asr] { return PrometheusText(asr->RenderMetrics()); };
+  return {};
 }
 
 }  // namespace
@@ -1356,7 +1277,8 @@ HttpServer::HttpServer(std::string host, int port,
       images_(std::move(images)),
       embeddings_(std::move(embeddings)),
       decisions_(std::move(decisions)),
-      options_(std::move(options)) {
+      options_(std::move(options)),
+      metrics_(MetricsEndpoint(backend_, embeddings_, asr_)) {
   if (options_.max_request_body_bytes == 0 || options_.max_connections == 0) {
     throw std::invalid_argument("HTTP server limits must be positive");
   }
@@ -1401,8 +1323,6 @@ void HttpServer::register_routes() {
   add("GET", "/props", LlamaProps);
   add("GET", "/slots", LlamaSlots);
   add("GET", "/v1/slots", LlamaSlots);
-  add("GET", "/metrics", LlamaMetrics);
-  add("GET", "/v1/metrics", LlamaMetrics);
 
   // ---- sdapi ----
   add("POST", "/sdapi/v1/txt2img", NotImplemented);
@@ -1687,6 +1607,10 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
     if (device_lost())
       return DeviceLost();
     return response;
+  }
+  if (metrics_ && req.method == "GET" &&
+      (req.path == "/metrics" || req.path == "/v1/metrics")) {
+    return metrics_();
   }
   for (const auto& entry : routes_) {
     if (entry.first.first == req.method && entry.first.second == req.path) {

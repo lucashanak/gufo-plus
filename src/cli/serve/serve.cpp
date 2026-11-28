@@ -38,6 +38,7 @@
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/cli/speculative_settings.hpp"
 #include "src/core/diagnostics/gpu_queues.h"
+#include "src/core/diagnostics/linux_sysfs.h"
 #include "src/core/platform/shutdown_signal.hpp"
 #include "src/mem/ledger.hpp"
 
@@ -53,6 +54,30 @@
 namespace gufo::cli {
 namespace {
 
+/// GPU memory at a failed load, after its partial allocations are freed.
+/// On Linux the runtime's free bytes are what the kernel still lets this
+/// process map (GTT, TTM and the system-wide GPU limit, which counts other
+/// processes); with plenty of host memory available, a small value names
+/// another GPU user. On Windows they count only this process's allocations.
+/// GTT counters come from amdgpu sysfs and are absent on Windows.
+std::string GpuMemoryStatus() {
+  std::ostringstream out;
+#if defined(ENGINE_ENABLE_HIP)
+  std::size_t free = 0, total = 0;
+  if (hipMemGetInfo(&free, &total) == hipSuccess) {
+    out << " gpu_device_free_mib=" << free / (1024 * 1024)
+        << " gpu_device_total_mib=" << total / (1024 * 1024);
+  } else {
+    (void)hipGetLastError();
+  }
+#endif
+  if (const auto gtt = diagnostics::LinuxSysfs().QueryGtt()) {
+    out << " gtt_used_mib=" << gtt->used_bytes / (1024 * 1024)
+        << " gtt_total_mib=" << gtt->total_bytes / (1024 * 1024);
+  }
+  return out.str();
+}
+
 class ModelLoadLog {
 public:
   ModelLoadLog(std::string kind, const std::filesystem::path& artifact)
@@ -64,9 +89,9 @@ public:
   ~ModelLoadLog() {
     if (!completed_) {
       try {
-        server::Logger::Error("loader", "event=load_failed kind=" + kind_ +
-                                            " " +
-                                            server::Logger::MemoryStatus());
+        server::Logger::Error(
+            "loader", "event=load_failed kind=" + kind_ + " " +
+                          server::Logger::MemoryStatus() + GpuMemoryStatus());
       } catch (...) {
       }
     }
@@ -960,24 +985,12 @@ int RunServe(std::span<const char* const> args) {
   if (const char* env_host = std::getenv("HOST");
       env_host != nullptr && *env_host != '\0') {
     host = env_host;
-  } else if (const char* env_strix_host = std::getenv("GUFO_HOST");
-             env_strix_host != nullptr && *env_strix_host != '\0') {
-    host = env_strix_host;
   }
 
   int port = 8080;
   if (const char* env_port = std::getenv("PORT");
       env_port != nullptr && *env_port != '\0') {
     const std::string_view sv(env_port);
-    int parsed_port = 0;
-    auto [ptr, ec] =
-        std::from_chars(sv.data(), sv.data() + sv.size(), parsed_port);
-    if (ec == std::errc{} && ptr == sv.data() + sv.size()) {
-      port = parsed_port;
-    }
-  } else if (const char* env_strix_port = std::getenv("GUFO_PORT");
-             env_strix_port != nullptr && *env_strix_port != '\0') {
-    const std::string_view sv(env_strix_port);
     int parsed_port = 0;
     auto [ptr, ec] =
         std::from_chars(sv.data(), sv.data() + sv.size(), parsed_port);

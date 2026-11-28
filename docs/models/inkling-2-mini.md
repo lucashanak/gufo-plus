@@ -75,6 +75,13 @@ model think first, then force the call or the JSON.
 A required call gets one thought: a model that decided against the call would
 otherwise keep reopening thoughts until the token limit.
 
+The prompt matches Thinking Machines' renderer (`tml-renderers`). The model can
+think again after part of its answer. Responses and Messages return one item or
+block per thought and answer text, in order; Chat Completions joins the
+thoughts in `reasoning_content`. Send them back in order to keep the
+conversation cached: in Chat Completions, as `{"type": "thinking", "thinking":
+"..."}` content parts between the text parts (other models read them joined).
+
 ## Tools and structured output
 
 Tool arguments are generated with their keys in sorted order, the order the
@@ -92,17 +99,17 @@ answer.
 
 ## Performance
 
-As of November 24, 2026, on Strix Halo with greedy decoding and thinking off,
+As of November 26, 2026, on Strix Halo with greedy decoding and thinking off,
 compared with llama.cpp's HIP backend on the same weights:
 
 | Workload | Gufo | llama.cpp HIP |
 | --- | --- | --- |
-| Prefill, 2,048-token prompt | 1,916 tokens/s | 347 tokens/s |
+| Prefill, 2,048-token prompt | 2,296 tokens/s | 347 tokens/s |
 | Decode, one user | 47.4 tokens/s | 22.0 tokens/s |
 | Decode, one user, 131,072 tokens of context | 24.3 tokens/s | 7.7 tokens/s |
-| Decode, one user, DSpark, prose | 59.1 tokens/s | N/A |
-| Decode, 8 users, in total | 188.4 tokens/s | 68.3 tokens/s |
-| Cold start to ready, with DSpark | 4.7 s | N/A |
+| Decode, one user, DSpark, prose | 59.4 tokens/s | N/A |
+| Decode, 8 users, in total | 189.7 tokens/s | 68.3 tokens/s |
+| Cold start to ready, with DSpark | 3.9 s | N/A |
 
 llama.cpp can't load the DSpark drafter yet. DSpark gains most on predictable
 text: a prose summary whose prompt comes back from the cache decodes at 77

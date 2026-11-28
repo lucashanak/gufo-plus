@@ -1,6 +1,6 @@
 // GPU test of the cache layer, without a server.
 //
-//   inkling2_cache_test --model GGUF --ids ids.bin [--n 5000] [--tail 48]
+//   inkling2_cache_test --model GGUF --ids ids.bin [--n N] [--tail 48]
 //
 // 1. Capture/restore: prefill N tokens in slot A, capture a checkpoint through
 // the adapter (rows,
@@ -229,9 +229,9 @@ bool Same(const std::vector<float>& a, const std::vector<float>& b) {
 
 int main(int argc, char** argv) {
   std::string model, idsf;
-  std::size_t n = 5000,
-              tail =
-                  48;  // n > ring rows (1024 + ubatch), so the SWA rings wrap
+  // Two passes and a 600-token third: more than the ring rows (1024 + ubatch),
+  // so the SWA rings wrap.
+  std::size_t n = 2 * i2::Engine::kUbatch + 600, tail = 48;
   std::size_t chunk_prompt = 1853;  // over 1K keys, under one ubatch
   bool chunks_only = false;
   std::string dspark;  // drafter GGUF: its context is checkpointed too
@@ -297,8 +297,9 @@ int main(int argc, char** argv) {
   CountingGuard guard;
   gufo::models::inkling2::Inkling2CacheAdapter adapter(
       std::shared_ptr<i2::Engine>(std::move(engine)),
-      gc::Identity{'t', 'e', 's', 't'}, false, 2048);
+      gc::Identity{'t', 'e', 's', 't'}, false, i2::Engine::kUbatch);
   auto& eng = *adapter.engine_for_test();
+  const std::size_t U = eng.ubatch();
   guard.adapter = &adapter;
 
   const std::span<const std::int32_t> prompt(ids.data(), n),
@@ -333,6 +334,9 @@ int main(int argc, char** argv) {
           65, 127, 128, 129, 255, 256, 257, 1023, 1024, 1025})
       if (k < P)
         splits.push_back({P - k, k});
+    for (const std::size_t k : {2047, 2048, 2049, 3000})
+      if (k < P)
+        splits.push_back({k, P - k});
     splits.push_back({P / 3, P / 3, P - 2 * (P / 3)});
     {
       std::vector<std::size_t> many;
@@ -392,8 +396,8 @@ int main(int argc, char** argv) {
   guard.slot = slot_a.get();
   auto& sa = adapter.GetSession(*slot_a);
   guard.capture_inside = true;
-  for (std::size_t at = 0; at < n; at += 2048) {
-    const auto len = std::min<std::size_t>(2048, n - at);
+  for (std::size_t at = 0; at < n; at += U) {
+    const auto len = std::min<std::size_t>(U, n - at);
     (void)Run(eng, sa, prompt.subspan(at, len));
   }
   guard.capture_inside = false;
@@ -416,9 +420,8 @@ int main(int argc, char** argv) {
     // noise floor: the same prompt in another slot, no cache involved
     auto slot_n = adapter.CreateSlot(guard);
     auto& sn = adapter.GetSession(*slot_n);
-    for (std::size_t at = 0; at < n; at += 2048)
-      (void)Run(eng, sn,
-                prompt.subspan(at, std::min<std::size_t>(2048, n - at)));
+    for (std::size_t at = 0; at < n; at += U)
+      (void)Run(eng, sn, prompt.subspan(at, std::min<std::size_t>(U, n - at)));
     const auto l0 = sn.logits();
     const auto m2 = Run(eng, sn, more);
     g_noise = std::max(MaxDiff(l0, logits_at_n), MaxDiff(m2, ref));
@@ -441,8 +444,8 @@ int main(int argc, char** argv) {
     // restored frontier equal those of a session that prefilled the prompt.
     auto slot_o = adapter.CreateSlot(guard);
     auto& so = adapter.GetSession(*slot_o);
-    for (std::size_t at = 0; at < n; at += 2048)
-      eng.Forward(so, prompt.subspan(at, std::min<std::size_t>(2048, n - at)));
+    for (std::size_t at = 0; at < n; at += U)
+      eng.Forward(so, prompt.subspan(at, std::min<std::size_t>(U, n - at)));
     REQUIRE(eng.DraftReady(sb), "no drafter context after a restore");
     std::int32_t pa[7] = {}, pb[7] = {};
     float ca[7] = {}, cb[7] = {};
@@ -497,8 +500,8 @@ int main(int argc, char** argv) {
     d_yielded.push_back(sd.logits());
   };
   std::vector<float> c_logits;
-  for (std::size_t at = 0; at < n; at += 2048) {
-    const auto len = std::min<std::size_t>(2048, n - at);
+  for (std::size_t at = 0; at < n; at += U) {
+    const auto len = std::min<std::size_t>(U, n - at);
     (void)Run(eng, sc, prompt.subspan(at, len), &y);
   }
   c_logits = sc.logits();
@@ -528,7 +531,7 @@ int main(int argc, char** argv) {
   // ---- 3. layered prefill whose yield runs a MULTI-token prefill on another
   // session ---- Another Forward replaces the per-ubatch dense work items and
   // the shared scratch; the yielded prefill must restore them (T differs: 70
-  // against 2048 / 904).
+  // against a full pass and the last one).
   {
     auto slot_e = adapter.CreateSlot(guard);
     auto& se = adapter.GetSession(*slot_e);
@@ -540,20 +543,24 @@ int main(int argc, char** argv) {
     std::vector<std::vector<float>> e_log;
     i2::PrefillYield y2;
     y2.groups = 6;
+    // 70 tokens per yield, taken from anywhere in the id file.
+    auto yield_ids = [&](std::size_t k) {
+      return (n + tail + 400 + k * 70) % (ids.size() - 70);
+    };
     y2.yield = [&] {
-      const std::size_t off = n + tail + 400 + yields2 * 70;
+      const std::size_t off = yield_ids(yields2);
       ++yields2;
       e_log.push_back(
           Run(eng, se, std::span<const std::int32_t>(ids.data() + off, 70)));
     };
-    for (std::size_t at = 0; at < n; at += 2048) {
-      const auto len = std::min<std::size_t>(2048, n - at);
+    for (std::size_t at = 0; at < n; at += U) {
+      const auto len = std::min<std::size_t>(U, n - at);
       (void)Run(eng, sf, prompt.subspan(at, len), &y2);
     }
     REQUIRE(Same(sf.logits(), logits_at_n),
             "layered prefill (prefill in yield) logits differ");
     for (std::size_t k = 0; k < e_log.size(); ++k) {
-      const std::size_t off = n + tail + 400 + k * 70;
+      const std::size_t off = yield_ids(k);
       const auto l =
           Run(eng, sg, std::span<const std::int32_t>(ids.data() + off, 70));
       REQUIRE(Same(l, e_log[k]), "prefill during a yield differs at yield %zu",
@@ -564,6 +571,96 @@ int main(int argc, char** argv) {
                  "identical (exact when the engine is deterministic, else "
                  "within the noise floor)\n",
                  yields2);
+  }
+
+  // ---- 4. in-pass prefill checkpoints ----
+  // Single Forward call over two ubatches and 600 tokens of a third (the pass
+  // writes more rows than the SWA ring holds, so it wraps)
+  // capturing interior and ubatch-end boundaries in place, the last one after
+  // the wrap. Restoring each checkpoint must yield bit-identical logits,
+  // continuations, and (with --dspark) draft proposals to stopping prefill at
+  // that boundary.
+  const std::size_t kInPassLen = 2 * U + 600;
+  if (n < kInPassLen) {
+    std::fprintf(stderr, "SKIP in-pass checkpoints: needs --n %zu\n",
+                 kInPassLen);
+  } else {
+    const std::span<const std::int32_t> ip_prompt(ids.data(), kInPassLen);
+    const std::size_t ip_len = ip_prompt.size();
+    const std::vector<std::size_t> bounds = {700,     1500,  U,
+                                             U + 552, 2 * U, 2 * U + 104};
+    const std::vector<i2::Block> blocks = {
+        i2::Block::kIdle, i2::Block::kAfterHeader, i2::Block::kText,
+        i2::Block::kIdle, i2::Block::kText,        i2::Block::kIdle};
+    REQUIRE(ip_len > eng.ring_rows() && bounds.back() > eng.ring_rows(),
+            "in-pass test no longer wraps the %u-row ring", eng.ring_rows());
+    for (const std::size_t b : bounds)
+      REQUIRE(eng.CanCaptureInPass(0, ip_len, b),
+              "CanCaptureInPass rejected %zu", b);
+    // A boundary whose FirstChunkRow would be evicted from the SWA ring must be
+    // rejected: from offset U + 1 a pass ends at 2 U + 1, and the window of
+    // boundary U + 2 starts U - 1024 rows in, one row more than the ring holds.
+    REQUIRE(!eng.CanCaptureInPass(U + 1, U, U + 2),
+            "CanCaptureInPass accepted evicted window boundary");
+
+    auto slot_ip = adapter.CreateSlot(guard);
+    std::vector<Checkpoint> cps(bounds.size());
+    std::vector<bool> seen(bounds.size(), false);
+    adapter.PrefillThrough(*slot_ip, ip_prompt, bounds, blocks,
+                           [&](std::size_t idx) {
+                             REQUIRE(idx < bounds.size() && !seen[idx],
+                                     "bad checkpoint index %zu", idx);
+                             const auto pos = adapter.Positions(*slot_ip);
+                             REQUIRE(pos.front().valid_rows == bounds[idx],
+                                     "checkpoint position %zu != %zu",
+                                     pos.front().valid_rows, bounds[idx]);
+                             cps[idx] = Capture(adapter, *slot_ip);
+                             seen[idx] = true;
+                           });
+    for (std::size_t i = 0; i < bounds.size(); ++i)
+      REQUIRE(seen[i], "checkpoint %zu not delivered", i);
+
+    for (std::size_t i = 0; i < bounds.size(); ++i) {
+      const std::size_t b = bounds[i];
+      auto slot_ref = adapter.CreateSlot(guard);
+      auto& sref = adapter.GetSession(*slot_ref);
+      eng.Forward(sref, ip_prompt.first(b));
+      const auto ref_logits = sref.logits();
+      const auto cont = std::span<const std::int32_t>(
+          ids.data() + b, std::min<std::size_t>(24, ids.size() - b));
+      const auto ref_cont = Run(eng, sref, cont);
+
+      auto slot_res = adapter.CreateSlot(guard);
+      Restore(adapter, *slot_res, cps[i]);
+      auto& sres = adapter.GetSession(*slot_res);
+      REQUIRE(sres.position() == b, "restored in-pass pos %zu != %zu",
+              sres.position(), b);
+      REQUIRE(static_cast<i2::Inkling2Slot&>(*slot_res).block == blocks[i],
+              "restored in-pass block mismatch at %zu", b);
+      REQUIRE(Same(sres.logits(), ref_logits),
+              "in-pass checkpoint logits differ at %zu", b);
+      if (eng.has_drafter()) {
+        auto slot_dref = adapter.CreateSlot(guard);
+        auto& sdref = adapter.GetSession(*slot_dref);
+        eng.Forward(sdref, ip_prompt.first(b));
+        REQUIRE(eng.DraftReady(sres), "no drafter context at in-pass %zu", b);
+        std::int32_t pa[7] = {}, pb[7] = {};
+        float ca[7] = {}, cb[7] = {};
+        const int na = eng.Propose(sdref, cont[0], 7, pa, ca);
+        const int nb = eng.Propose(sres, cont[0], 7, pb, cb);
+        REQUIRE(na == nb && std::memcmp(pa, pb, sizeof pa) == 0 &&
+                    std::memcmp(ca, cb, sizeof ca) == 0,
+                "in-pass drafter proposals differ at %zu (%d vs %d)", b, na,
+                nb);
+      }
+      const auto got_cont = Run(eng, sres, cont);
+      REQUIRE(Same(got_cont, ref_cont),
+              "in-pass continuation logits differ at %zu", b);
+    }
+    std::fprintf(stderr,
+                 "PASS in-pass checkpoints: %zu boundaries (interior + "
+                 "ubatch-end, SWA wrap%s) identical\n",
+                 bounds.size(), eng.has_drafter() ? " + DSpark" : "");
   }
   (void)V;
   std::fprintf(stderr, "worst compared max |dlogit| %.3e (noise %.3e)\n",

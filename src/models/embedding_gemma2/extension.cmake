@@ -17,6 +17,7 @@ gufo_extension_target(
   LINK_LIBRARIES
     gufo_ext_runtime
     gufo_platform
+    gufo_rust
     Threads::Threads
 )
 
@@ -83,6 +84,7 @@ gufo_extension_target(
     hip::host
     roc::hipblas
     roc::hipblaslt
+    roc::rocblas
 )
 
 if(TARGET gufo_embedding_gemma2_hip)

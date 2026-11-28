@@ -637,6 +637,24 @@ def _round_from_samples(
     )
 
 
+def _run_workers(
+    execute: Callable[[int], RequestObservation],
+    concurrency: int,
+    start_gate: threading.Barrier,
+) -> tuple[RequestObservation, ...]:
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=concurrency
+    ) as executor:
+        try:
+            futures = [executor.submit(execute, index) for index in range(concurrency)]
+            start_gate.wait()
+        except BaseException:
+            # Release any workers already waiting before the executor joins them.
+            start_gate.abort()
+            raise
+        return tuple(future.result() for future in futures)
+
+
 def _run_round(
     *,
     base_url: str,
@@ -674,12 +692,7 @@ def _run_round(
             cache_prompt=cache_prompt,
         )
 
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=concurrency
-    ) as executor:
-        futures = [executor.submit(execute, index) for index in range(concurrency)]
-        start_gate.wait()
-        samples = tuple(future.result() for future in futures)
+    samples = _run_workers(execute, concurrency, start_gate)
     return _round_from_samples(concurrency, repetition, samples)
 
 
@@ -726,12 +739,7 @@ def _run_corpus_round(
             extra_body={"id_slot": index} if pin_slots else None,
         )
 
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=concurrency
-    ) as executor:
-        futures = [executor.submit(execute, index) for index in range(concurrency)]
-        start_gate.wait()
-        samples = tuple(future.result() for future in futures)
+    samples = _run_workers(execute, concurrency, start_gate)
     return _round_from_samples(concurrency, repetition, samples)
 
 
@@ -1525,12 +1533,15 @@ def print_human(report: dict[str, Any]) -> None:
             for category, summary in categories.items():
                 acceptance = summary["acceptance"]
                 rendered = "-" if acceptance is None else f"{acceptance * 100:.1f}%"
+                drafted_per_output = summary["draftedPerOutputToken"]
+                drafted_rate = (
+                    "-" if drafted_per_output is None else f"{drafted_per_output:.2f}"
+                )
                 print(
                     f"   {category}: {rendered} "
                     f"({summary['acceptedTokens']}/"
                     f"{summary['draftedTokens']}), "
-                    f"draft/output="
-                    f"{summary['draftedPerOutputToken']:.2f}, "
+                    f"draft/output={drafted_rate}, "
                     f"decode p50={_median(summary['decode_tokens_per_second'])}"
                 )
     reference = report.get("reference")

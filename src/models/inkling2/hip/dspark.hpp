@@ -68,6 +68,7 @@ struct AttnArgs {
   int first;       // first injected context position
   float* ws;       // split workspace
   _Float16* out16;
+  int nsplits = 32;
 };
 inline constexpr int kAttnSplits = 32;
 void Attn(hipStream_t s, const AttnArgs& a);
@@ -82,7 +83,7 @@ void Swiglu(hipStream_t s, const float* g, const float* u, _Float16* out16,
 
 /// One Markov RNN step of the chain (row `i` of the block):
 /// joint = W_j [state, w1[prev], h_i, f] + b; state = cand + sig(gate) (state -
-/// cand) with cand = tanh; lat = tanh, at joint + 3 * 256 (LrLogits).
+/// cand) with cand = tanh; lat = tanh, at joint + 3 * 256 (LrLogits8).
 struct MarkovArgs {
   const uint16_t* w1;  // BF16 [201024][256]
   const uint16_t* wj;  // BF16 [768][5120]
@@ -98,17 +99,29 @@ void MarkovStep(hipStream_t s, const MarkovArgs& a);
 
 /// The proposal logits of one Markov step without a head pass: W_U (h_i + W_o
 /// lat + b_o) = base + (W_U W_o) lat + W_U b_o, with base = W_U h_i (Gemv8 of
-/// the block, once per draft) and pt = (W_U W_o)^T [256][n] F16, cb = W_U b_o
-/// precomputed. logits[r] for r < n (n even).
-void LrLogits(hipStream_t s, const _Float16* pt, const float* cb,
-              const float* base, const float* lat, float* logits, int n);
-
-/// LrLogits from an int8 table pt [256][n] with one scale per row (n % 4 ==
-/// 0), as QuantPt makes from the F32 table.
+/// the block, once per draft), pt = (W_U W_o)^T [256][n] as an int8 table with
+/// one scale per row (n % 4 == 0, as QuantPt makes from the F32 table) and
+/// cb = W_U b_o precomputed.
 void LrLogits8(hipStream_t s, const int8_t* pt, const float* ps,
                const float* cb, const float* base, const float* lat,
                float* logits, int n);
+/// Batched LrLogits8 for `count` (1..8) sessions sharing one read of `pt`,
+/// `ps` and `cb`.
+struct LrBatch {
+  const float* base[8];
+  const float* lat[8];
+  float* out[8];
+  int count;
+};
+void LrLogits8Batch(hipStream_t s, const int8_t* pt, const float* ps,
+                    const float* cb, const LrBatch& batch, int n);
 void QuantPt(hipStream_t s, const float* src, int n, int8_t* q, float* scale);
+/// Row-wise squared L2 norms of BF16 [rows][256] into `out` [rows].
+void RowNormSqBf16(hipStream_t s, const uint16_t* src, int rows, float* out);
+/// Quantizes and transposes row-major BF16 [n][256] into int8 [256][n] + [n]
+/// scales.
+void QuantPtBf16(hipStream_t s, const uint16_t* src, int n, int8_t* q,
+                 float* scale);
 
 /// tokens[row] = map[argmax(logits[0, n))] (first maximum; map null: the
 /// index itself), also *prev; conf[row] = the softmax probability of that
@@ -116,13 +129,14 @@ void QuantPt(hipStream_t s, const float* src, int n, int8_t* q, float* scale);
 void Argmax(hipStream_t s, const float* logits, int n, const int* map,
             float* ws, int* tokens, int row, int* prev, float* conf);
 
-/// y[r][m] = W[m] . x[r] for the 8 block rows: W Q8_0 [M][K], x F16 [8][K]
-/// (K a multiple of 2304 or 3072, M of 32).
+/// y[r][m] = W[m] . x[r] for `nrows` (1..64) rows: W Q8_0 [M][K], x F16
+/// [nrows][K] (K a multiple of 32, M of 16). `qa` ([ntiles][K/32][2][16] v4i)
+/// and `qs` ([ntiles][K/32][16] float) are device quantization scratch.
 void Gemv8(hipStream_t s, const void* w, int m, int k, const _Float16* x,
-           float* y, int sessions = 1);
+           float* y, int nrows, void* qa, float* qs);
 /// Gemv8 of n (<= 3) matrices of the same input in one launch.
 void Gemv8N(hipStream_t s, int n, const void* const* w, const int* m, int k,
-            const _Float16* x, float* const* y, int sessions = 1);
+            const _Float16* x, float* const* y, int nrows, void* qa, float* qs);
 
 /// Coupled sampling of one proposal: p over the n proposal-head rows (in
 /// token order) = softmax(softcap(logits) / temperature), rows below the

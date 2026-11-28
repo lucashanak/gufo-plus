@@ -47,8 +47,8 @@ Each holds bit for bit and is checked by a test:
 
 | Guarantee | Check |
 | --- | --- |
-| A prompt split into any chunks, or a restored prefix plus a tail, equals one prefill | `inkling2_cache_test`: 22 chunkings (1- to 1,025-token tails, thirds, 37-token chunks) and restores at 1,853 and 5,000 tokens, logits and 4 decode steps |
-| A restore continues as the uninterrupted session, also into a used slot | `inkling2_cache_test`, 48 tokens after 5,000 |
+| A prompt split into any chunks, or a restored prefix plus a tail, equals one prefill | `inkling2_cache_test`: 22 chunkings of 1,853 tokens and 26 of 5,000 (1- to 1,025-token tails, splits at 2,047 to 3,000, thirds, 37-token chunks) and restores, logits and 4 decode steps; `inkling2_oracle` dumps of 9,300 tokens equal for 2,048-, 3,000-, 4,096- and 8,192-token passes |
+| A restore continues as the uninterrupted session, also into a used slot | `inkling2_cache_test`, 48 tokens after 8,792 |
 | Layered prefill, with decodes or prefills in its yields, equals an unsplit run | `inkling2_cache_test`, `inkling2_spec_test` (7 sessions decoding in an 8th's yields) |
 | Batched decode of 2–8 sessions equals each session alone | `inkling2_spec_test`, `inkling2_bench --verify` |
 | DSpark verification rows (2–64) equal one-token decodes; greedy and seeded sampled DSpark output equals AR | `inkling2_spec_test --dspark`, `inkling2_bench --spec`; HTTP hashes |
@@ -86,7 +86,7 @@ still think briefly; llama.cpp gets `--reasoning off`.
 
 | | Gufo | llama.cpp |
 | --- | --- | --- |
-| Build | `build/release/gufo` at `82645e0a` (SHA-256 `7affdcf4…`) | `4c92c5bfb` (master with #32694, #32704, #32799, #32833), ROCm 10.1 build, SHA-256 `be1e917f…` |
+| Build | `result/bin/gufo` (`nix build`) at `1d61903a` (`.gufo-wrapped` SHA-256 `49f10edb…`), November 26, 2026 | `4c92c5bfb` (master with #32694, #32704, #32799, #32833), ROCm 10.1 build, SHA-256 `be1e917f…`, November 24, 2026 |
 | Server | `serve llm --think off --max-pending-per-client 8`, DSpark `--speculative dspark --dspark-model` | `-ngl 999 -fa on --cache-reuse 0 --cache-ram 0 --jinja --reasoning off` |
 
 Model files: `Inkling-2-Mini-UD-Q4_K_XL.gguf` (SHA-256 `e6427665…`) and
@@ -103,7 +103,7 @@ llama.cpp #32218, is not merged). Its DSpark and loading cells are N/A
 
 ```sh
 FILES="--gguf Inkling-2-Mini-UD-Q4_K_XL.gguf --dspark dspark-Inkling-2-Mini-Q8_0.gguf"
-python3 tools/bench/model-bench.py --model inkling-2-mini --gufo build/release/gufo $FILES \
+python3 tools/bench/model-bench.py --model inkling-2-mini --gufo result/bin/gufo $FILES \
   run --target gufo --fresh --drop-caches "<POSIX_FADV_DONTNEED on both files>"
 python3 tools/bench/model-bench.py --model inkling-2-mini $FILES run --target reference \
   --reference-binary llama.cpp/build-rocm/bin/llama-server --table single-ar,multi-ar,memory --fresh

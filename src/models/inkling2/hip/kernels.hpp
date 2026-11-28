@@ -30,7 +30,6 @@ enum GgmlTypeId : int {
 /// Bytes of one row of `k` elements of `type`; 0 when the type is not supported
 /// or k does not fill whole blocks.
 std::size_t RowBytes(int type, std::size_t k);
-bool TypeSupported(int type);
 
 /// out[t*ldo + r] = sum_k W[r][k] * x[t*ldx + k] for r < n, t < t_count.
 /// `w` is n rows of RowBytes(type, k) bytes.
@@ -78,6 +77,10 @@ void Conv(hipStream_t s, const float* x, const float* state, const float* w,
           float scale);
 void ConvStateUpdate(hipStream_t s, const float* x, float* state, int t_count,
                      int channels);
+/// Same state advance as ConvStateUpdate, reading the pre-ubatch `old_state`
+/// and writing the state after `t_count` tokens into a separate `dst_state`.
+void ConvStateCapture(hipStream_t s, const float* x, const float* old_state,
+                      float* dst_state, int t_count, int channels);
 
 void Add(hipStream_t s, const float* a, const float* b, float* out, int n);
 void Copy(hipStream_t s, const float* a, float* out, int n);

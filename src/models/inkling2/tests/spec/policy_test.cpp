@@ -17,7 +17,7 @@ bool DraftsOne(const DsparkCalibration& cal, const DsparkCosts& costs,
   return ChooseDsparkWidth(&p, 1, cal, costs) == 1;
 }
 
-// Cycles at the top confidence bin with the true costs (2-row 26.2 ms, plain
+// Cycles at a confident draft (0.95) with the true costs (2-row 26.2 ms, plain
 // 20.2 ms scaled by `depth`) after one slow 2-row sample; returns how many
 // drafted.
 int TwoRowSteps(double slow_ms, double depth, int cycles) {
@@ -90,6 +90,32 @@ int main() {
     }
     std::printf("expensive: 2-row steps %d of 20000\n", drafted);
     if (drafted > 2000)
+      ++failures;
+  }
+  // Batched verification up to kMaxRows = 16: an 8-session batch with high
+  // draft confidence allocates drafts beyond 8 total rows.
+  {
+    DsparkCalibration cal;
+    const DsparkCosts costs = DsparkCosts::Batched();
+    constexpr int kB = 8;
+    float p_hi[kB][2];
+    const float* pp[kB];
+    int n[kB], w[kB];
+    const DsparkCalibration* cp[kB];
+    for (int i = 0; i < kB; ++i) {
+      p_hi[i][0] = 0.95f;
+      p_hi[i][1] = 0.95f;
+      pp[i] = p_hi[i];
+      n[i] = 2;
+      cp[i] = &cal;
+    }
+    ChooseDsparkBatchWidths(kB, pp, n, cp, costs, 3.0, w);
+    int total_drafts = 0;
+    for (int i = 0; i < kB; ++i)
+      total_drafts += w[i];
+    std::printf("batch B=8 high-conf: %d drafts (total rows %d)\n",
+                total_drafts, kB + total_drafts);
+    if (total_drafts == 0 || kB + total_drafts > DsparkCosts::kMaxRows)
       ++failures;
   }
   std::printf("%s\n", failures ? "FAIL" : "ok");

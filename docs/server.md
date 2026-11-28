@@ -91,7 +91,9 @@ after that many tokens; `--reasoning-budget` sets the server default.
 Reasoning comes back separately from the answer: as `reasoning_content` in
 Chat Completions, `reasoning` items in Responses and `thinking` blocks in
 Messages. Keep the effort the same across a conversation: it's part of the
-prompt, so changing it means processing the whole conversation again.
+prompt, so changing it means processing the whole conversation again. Models
+that think again after part of an answer return the thoughts and the answer
+text in order ([Inkling 2 Mini](models/inkling-2-mini.md#thinking)).
 
 ## Tools and structured output
 
@@ -192,9 +194,22 @@ a hung GPU, which fails nothing, into the same exit.
 
 `/metrics` exports llama-server's Prometheus counters: tokens processed and
 generated, cached prompt tokens, speeds, queue depth and speculative
-acceptance. `/slots` shows what each session is doing, `/props` which model,
-build and settings are running, and `POST /apply-template` the prompt a chat
-request becomes. [Troubleshooting](troubleshooting.md) covers the logs.
+acceptance. `gufo_request_queue_seconds` and
+`gufo_time_to_first_token_seconds` are histograms that start when the HTTP
+handler hands the request to the backend. Queue time stops when a session
+admits the request, after state wait and cache restore, and equals `queue_ms`
+in the request log. Time to first token stops at the first generated token.
+Requests that end before admission or before a token are not observed, and
+buckets run from 1 ms to 1,200 s. `/slots` shows what each session is doing,
+`/props` which model, build and settings are running, and
+`POST /apply-template` the prompt a chat request becomes.
+[Troubleshooting](troubleshooting.md) covers the logs.
+
+`gufo serve embedding` and `gufo serve asr` answer `/metrics` with
+`gufo_embedding_*` or `gufo_asr_*` families instead of the llama-server ones:
+outcomes, latency, requests in flight, tokens embedded or audio transcribed, and
+open realtime sessions. Only calls that reach the service count, and the ASR
+server has no `gufo_device_lost_total`. [Internals](internal/server.md) has all.
 
 ## llama-swap
 

@@ -58,6 +58,13 @@ struct TextPromptContext {
       std::size_t token_count) const {
     return PrefixInputIdentity(cache_identity, cache_prefixes, token_count);
   }
+  /// True when the context stays correct for any tokenization of the same
+  /// prompt text: no token positions, input rows or prepared handles. The
+  /// host may then rewrite a replayed answer to the tokens a live frontier
+  /// sampled for that text (#1154), as for a request without a context. A
+  /// context with cache inputs is never rewritten. The default keeps the
+  /// rendered tokens.
+  [[nodiscard]] virtual bool TokenizationIndependent() const { return false; }
   /// Moves a candidate prefill stop, a token count, to a position where
   /// prefill may end: the nearest legal one at or before `position`, or at or
   /// after it when `up`. A model whose input rows must be evaluated in one
@@ -449,6 +456,22 @@ struct ChatMessage {
   };
   std::vector<ImagePart> images;
 
+  /// The text and thought parts in the order the client sent them, when that
+  /// order says more than `thought` followed by `content`: several text parts
+  /// (each its own block in templates that render parts as blocks), or a
+  /// thought after text, as a turn written as blocks replays it. A text part
+  /// ends at `end` bytes of `content`, a thought part at `end` bytes of
+  /// `thought`; ends grow, and the last of each kind is that string's size.
+  /// Images keep their content offsets. Empty: the legacy order. `content`
+  /// and `thought` hold the parts joined, so a renderer may ignore this.
+  struct Part {
+    bool thought{false};
+    std::size_t end{0};
+
+    friend bool operator==(const Part&, const Part&) = default;
+  };
+  std::vector<Part> parts;
+
   struct ToolArgument {
     std::string name;
     std::string value;
@@ -715,6 +738,16 @@ public:
   [[nodiscard]] virtual std::vector<TextDecodeStep> DecodeBatch(
       std::span<const TextRunnerDecode> decodes) const;
   virtual void AdvanceBatch(std::span<const TextRunnerAdvance> advances) const;
+  /// Text the selections' pieces have held back so far (a runner that lets
+  /// later tokens decide what earlier ones mean, such as Inkling's block
+  /// headers), as of the advanced tokens plus `unadvanced`, a selected token
+  /// not advanced yet. Generation that ends on a stop token or the token
+  /// limit publishes it as the reply's last text.
+  [[nodiscard]] virtual std::string HeldText(
+      const TextRunnerState&, std::optional<TextRunnerToken> unadvanced) const {
+    (void)unadvanced;
+    return {};
+  }
   [[nodiscard]] virtual std::size_t CheckpointPosition(
       const TextRunnerState& state) const = 0;
   virtual void PrepareCancellation(TextRunnerState&) const {}
