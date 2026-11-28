@@ -62,6 +62,20 @@ void Buddyinfo() {
   assert(!gufo::mem::ParseBuddyinfoPageBlocks(""));
 }
 
+void Vmstat() {
+  using gufo::mem::ParseVmstatCounter;
+  const char* text =
+      "workingset_refault_anon 7\n"
+      "workingset_refault_file 1234\n"
+      "workingset_refault_file_x 9\n";
+  assert(*ParseVmstatCounter(text, "workingset_refault_file") == 1234);
+  assert(*ParseVmstatCounter(text, "workingset_refault_anon") == 7);
+  assert(!ParseVmstatCounter(text, "workingset_refault"));
+  assert(!ParseVmstatCounter("workingset_refault_file x\n",
+                             "workingset_refault_file"));
+  assert(!ParseVmstatCounter("", "workingset_refault_file"));
+}
+
 void Floor() {
   assert(BackgroundFloorBytes(0) == 4 * kGiB);
   assert(BackgroundFloorBytes(32 * kGiB) == 4 * kGiB);
@@ -236,6 +250,7 @@ int main() {
   CapAndAccounts();
   Lending();
   Buddyinfo();
+  Vmstat();
   Totals();
   Meminfo();
   Floor();

@@ -631,10 +631,13 @@ void Lending() {
   // below the free floor) and pages move only through this test's calls.
   pool->Stop();
   constexpr std::size_t kPages = 16;
-  // Lenders get pages only from free 2 MiB blocks above the free floor: a
-  // host below it lends nothing, by design.
-  if (!gufo::mem::CanCreatePagesWithoutReclaim(kPages * kPageBytes)) {
-    std::puts("mem_region_test: host below the free floor; lending skipped");
+  // Lenders get pages from free 2 MiB blocks above the free floor, else by
+  // reclaim above the background floor of MemAvailable: a host below both
+  // lends nothing, by design.
+  if (!gufo::mem::CanCreatePagesWithoutReclaim(kPages * kPageBytes) &&
+      gufo::mem::HostAvailableBytes() <
+          gufo::mem::HostFloorBytes() + kPages * kPageBytes) {
+    std::puts("mem_region_test: host below its floors; lending skipped");
     return;
   }
   auto& ledger = StateLedger::Process();

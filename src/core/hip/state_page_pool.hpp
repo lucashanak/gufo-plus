@@ -6,12 +6,14 @@
 #include <array>
 #include <atomic>
 #include <bitset>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -47,6 +49,10 @@ struct PagePoolStats {
   std::size_t created_ahead{0};
   /// Background creations skipped because the host was below its floor.
   std::size_t skipped_below_floor{0};
+  /// Pages created beyond the free 2 MiB blocks, by reclaim.
+  std::size_t created_by_reclaim{0};
+  /// Times reclaim stopped because the page cache it evicted was read back.
+  std::size_t reclaim_brakes{0};
   /// Pages the RAM cache lent to regions, and pages back with it.
   std::size_t lent{0};
   std::size_t returned{0};
@@ -69,7 +75,10 @@ struct PagePoolStats {
 /// background floor, and maps rows ahead of each region's frontier, so the
 /// scheduler normally finds its rows mapped and makes no HIP call. Below the
 /// floor it takes pages the RAM cache lends before it creates any: a new
-/// page then comes from reclaim and compaction. The pool
+/// page then comes from reclaim and compaction. Reclaim stops for a while
+/// once the cache it evicted is read back (workingset refaults): that cache
+/// held files in use, and the pool then gives back its pages beyond the high
+/// watermark. Cache no one reads again stays evicted. The pool
 /// never holds more free pages than regions have promised but not mapped:
 /// with demand mapping, the host never commits more than it did with all
 /// state allocated up front.
@@ -80,8 +89,13 @@ public:
   [[nodiscard]] static std::shared_ptr<PagePool> ForDevice(int device);
 
   /// `may_create(bytes)`: pages can be made from free 2 MiB blocks without
-  /// reclaim.
-  PagePool(int device, std::function<bool(std::uint64_t)> may_create);
+  /// reclaim. `host_available` reads MemAvailable. `refaulted` reads the
+  /// host's cumulative refaulted file bytes (mem::HostRefaultedFileBytes);
+  /// empty, or returning nothing, means no brake on reclaim.
+  PagePool(int device, std::function<bool(std::uint64_t)> may_create,
+           std::function<std::uint64_t()> host_available,
+           std::uint64_t floor_bytes,
+           std::function<std::optional<std::uint64_t>()> refaulted = {});
   ~PagePool();
   PagePool(const PagePool&) = delete;
   PagePool& operator=(const PagePool&) = delete;
@@ -112,8 +126,10 @@ public:
   /// (mem::HeapCoversHost), so the cache may borrow them.
   [[nodiscard]] bool exportable() const noexcept { return exportable_; }
   /// A new page for a lender, never one of the free pages (the regions'
-  /// working set). Made only from free 2 MiB blocks above the free floor;
-  /// `may_reclaim` (while loading) no longer makes them by reclaim.
+  /// working set). Made from free 2 MiB blocks above the free floor, or,
+  /// with `may_reclaim` (while loading, when a compaction stall costs
+  /// nothing), by reclaim while MemAvailable stays above the background
+  /// floor and reclaim is not paused by refaults.
   [[nodiscard]] bool AcquireForLender(hipMemGenericAllocationHandle_t* handle,
                                       bool may_reclaim);
   /// Takes back a page that is mapped nowhere (any more) and was not
@@ -202,6 +218,16 @@ public:
   static constexpr std::size_t kWarmCapBytes = std::size_t{8} << 30;
   /// Pages taken from lenders per pass: 128 MiB, a bounded eviction.
   static constexpr std::size_t kBorrowBatchPages = 64;
+  /// Refaults are checked this often while pages made by reclaim may still
+  /// be given back, for at most kRefaultWindow after the first of them.
+  static constexpr std::chrono::milliseconds kRefaultCheck{250};
+  static constexpr std::chrono::seconds kRefaultWindow{600};
+  /// Reclaim stops once the refaulted bytes reach a quarter of the bytes
+  /// reclaimed (at least kRefaultMinBytes, at most kRefaultCapBytes), for
+  /// kReclaimPause.
+  static constexpr std::uint64_t kRefaultMinBytes = std::uint64_t{32} << 20;
+  static constexpr std::uint64_t kRefaultCapBytes = std::uint64_t{512} << 20;
+  static constexpr std::chrono::seconds kReclaimPause{60};
 
 private:
   struct Job {
@@ -250,8 +276,23 @@ private:
   void FreeAliases(const std::bitset<kScratchPages>& unmapped,
                    std::vector<std::shared_ptr<void>>& sources);
 
+  using Clock = std::chrono::steady_clock;
+
+  /// Whether a page may be made by reclaim now: MemAvailable above the
+  /// floor and no refault pause. With mutex_ held.
+  [[nodiscard]] bool MayReclaim(Clock::time_point now);
+  /// Counts a page made by reclaim, opening a refault window. With mutex_.
+  void NoteReclaimed(Clock::time_point now);
+  /// Closes or brakes the refault window; returns the pages beyond the high
+  /// watermark to give back after a brake. With mutex_ held.
+  [[nodiscard]] std::vector<hipMemGenericAllocationHandle_t> CheckRefaults(
+      Clock::time_point now);
+
   int device_;
   std::function<bool(std::uint64_t)> may_create_;
+  std::function<std::uint64_t()> host_available_;
+  std::uint64_t floor_bytes_;
+  std::function<std::optional<std::uint64_t>()> refaulted_;
   hipMemAllocationProp prop_{};
   hipMemAccessDesc access_{};
 
@@ -293,6 +334,15 @@ private:
   std::size_t created_on_demand_{0};
   std::size_t created_ahead_{0};
   std::size_t skipped_below_floor_{0};
+  std::size_t created_by_reclaim_{0};
+  std::size_t reclaim_brakes_{0};
+  /// The open refault window: bytes reclaimed in it, the refault counter at
+  /// its start, when it opened and when it was last checked.
+  std::uint64_t window_reclaimed_{0};
+  std::uint64_t window_refault_base_{0};
+  Clock::time_point window_start_{};
+  Clock::time_point window_checked_{};
+  Clock::time_point reclaim_paused_until_{};
   bool refilling_{false};
   bool busy_{false};
   bool stop_{false};

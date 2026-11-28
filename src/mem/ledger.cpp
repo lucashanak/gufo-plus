@@ -1,9 +1,11 @@
 #include "src/mem/ledger.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <system_error>
 
 #include "src/core/platform/os_info.hpp"
 
@@ -103,6 +105,39 @@ bool CanCreatePagesWithoutReclaim(std::uint64_t bytes) {
   text << file.rdbuf();
   const auto blocks = ParseBuddyinfoPageBlocks(text.str());
   return !blocks || *blocks >= bytes + kMargin;
+}
+
+std::optional<std::uint64_t> ParseVmstatCounter(std::string_view vmstat,
+                                                std::string_view name) {
+  while (!vmstat.empty()) {
+    const auto end = vmstat.find('\n');
+    const auto line = vmstat.substr(0, end);
+    vmstat = end == std::string_view::npos ? std::string_view{}
+                                           : vmstat.substr(end + 1);
+    if (line.size() <= name.size() || !line.starts_with(name) ||
+        line[name.size()] != ' ')
+      continue;
+    std::uint64_t value = 0;
+    const auto digits = line.substr(name.size() + 1);
+    const auto [ptr, ec] =
+        std::from_chars(digits.data(), digits.data() + digits.size(), value);
+    if (ec != std::errc{} || ptr == digits.data())
+      return std::nullopt;
+    return value;
+  }
+  return std::nullopt;
+}
+
+std::optional<std::uint64_t> HostRefaultedFileBytes() {
+  std::ifstream file("/proc/vmstat");
+  if (!file)
+    return std::nullopt;
+  std::ostringstream text;
+  text << file.rdbuf();
+  const auto pages = ParseVmstatCounter(text.str(), "workingset_refault_file");
+  if (!pages)
+    return std::nullopt;
+  return *pages * platform::PageSizeBytes();
 }
 
 std::uint64_t HostAvailableBytes() {

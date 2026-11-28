@@ -223,6 +223,17 @@ private:
 /// platform's physical-available figure. Not reduced by outstanding state.
 [[nodiscard]] std::uint64_t HostAvailableBytes();
 
+/// The counter `name` from /proc/vmstat text, e.g. "workingset_refault_file".
+[[nodiscard]] std::optional<std::uint64_t> ParseVmstatCounter(
+    std::string_view vmstat, std::string_view name);
+
+/// Bytes of file pages the kernel read back soon after evicting them
+/// (workingset_refault_file times the page size), cumulative since boot.
+/// Reclaim that evicts page cache still in use shows up here within a
+/// second or two; cache no one reads again never does. Empty without
+/// /proc/vmstat.
+[[nodiscard]] std::optional<std::uint64_t> HostRefaultedFileBytes();
+
 /// Free host memory below which no 2 MiB page is created in the background.
 /// Creating order-9 pages with a few GiB free forces direct compaction, and
 /// every compaction pass that touches GPU-visible pages evicts all of the

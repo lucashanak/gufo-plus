@@ -111,16 +111,26 @@ std::shared_ptr<PagePool> PagePool::ForDevice(int device) {
     (*unsupported)[device] = true;
     return nullptr;
   }
-  auto pool = std::make_shared<PagePool>(device, [](std::uint64_t bytes) {
-    return CanCreatePagesWithoutReclaim(bytes);
-  });
+  const auto memory = platform::QueryHostMemory();
+  auto pool = std::make_shared<PagePool>(
+      device,
+      [](std::uint64_t bytes) { return CanCreatePagesWithoutReclaim(bytes); },
+      [] { return HostAvailableBytes(); },
+      BackgroundFloorBytes(memory ? memory->total_bytes : 0),
+      [] { return HostRefaultedFileBytes(); });
   (*pools)[device] = pool;
   return pool;
 }
 
-PagePool::PagePool(int device, std::function<bool(std::uint64_t)> may_create)
+PagePool::PagePool(int device, std::function<bool(std::uint64_t)> may_create,
+                   std::function<std::uint64_t()> host_available,
+                   std::uint64_t floor_bytes,
+                   std::function<std::optional<std::uint64_t>()> refaulted)
     : device_(device),
       may_create_(std::move(may_create)),
+      host_available_(std::move(host_available)),
+      floor_bytes_(floor_bytes),
+      refaulted_(std::move(refaulted)),
       prop_(DeviceProp(device)) {
   // Lend only where borrowed pages do not compete for a GPU heap smaller
   // than host memory; otherwise the cache keeps pinned host pages, as
@@ -237,14 +247,72 @@ bool PagePool::AcquireForLender(hipMemGenericAllocationHandle_t* handle,
   // Always a new page: the free pages are the regions' working set, and a
   // restore right after load that found them gone made its pages on the
   // scheduler thread (+40 ms for 3,143 Qwen 27B rows).
-  // Never from reclaim: MemAvailable counts the page cache, which on a
-  // near-full host holds the files the model reads every token (pages made
-  // past it at load evicted 18 GB of cache and stalled compaction 1,800
-  // times). `may_reclaim` no longer widens this.
-  (void)may_reclaim;
-  if (!may_create_(kPageBytes))
+  if (may_create_(kPageBytes))
+    return CreatePage(handle);
+  if (!may_reclaim)
     return false;
-  return CreatePage(handle);
+  {
+    std::lock_guard lock(mutex_);
+    if (!MayReclaim(Clock::now()))
+      return false;
+  }
+  if (!CreatePage(handle))
+    return false;
+  std::lock_guard lock(mutex_);
+  NoteReclaimed(Clock::now());
+  return true;
+}
+
+bool PagePool::MayReclaim(Clock::time_point now) {
+  return now >= reclaim_paused_until_ && host_available_ &&
+         host_available_() >= floor_bytes_ + kPageBytes;
+}
+
+void PagePool::NoteReclaimed(Clock::time_point now) {
+  ++created_by_reclaim_;
+  if (!refaulted_)
+    return;
+  if (window_reclaimed_ == 0) {
+    const auto base = refaulted_();
+    if (!base)
+      return;
+    window_refault_base_ = *base;
+    window_start_ = window_checked_ = now;
+  }
+  window_reclaimed_ += kPageBytes;
+}
+
+std::vector<hipMemGenericAllocationHandle_t> PagePool::CheckRefaults(
+    Clock::time_point now) {
+  std::vector<hipMemGenericAllocationHandle_t> surplus;
+  if (window_reclaimed_ == 0 || now - window_checked_ < kRefaultCheck)
+    return surplus;
+  window_checked_ = now;
+  const auto total = refaulted_();
+  const std::uint64_t refaulted = total && *total > window_refault_base_
+                                      ? *total - window_refault_base_
+                                      : 0;
+  if (refaulted <
+      std::clamp(window_reclaimed_ / 4, kRefaultMinBytes, kRefaultCapBytes)) {
+    // Cache not read back within the window was cold: its pages stay.
+    if (!total || now - window_start_ >= kRefaultWindow)
+      window_reclaimed_ = 0;
+    return surplus;
+  }
+  // The evicted cache held files in use: stop evicting more, and give back
+  // the pages made from it beyond the high watermark so they can return.
+  ++reclaim_brakes_;
+  reclaim_paused_until_ = now + kReclaimPause;
+  warm_bytes_ = 0;
+  for (std::size_t pages = window_reclaimed_ / kPageBytes;
+       pages > 0 && free_.size() + recycled_.size() > kHighPages; --pages) {
+    auto& list = recycled_.empty() ? free_ : recycled_;
+    surplus.push_back(list.back());
+    list.pop_back();
+    StateLedger::Process().RemovePooled(kPageBytes);
+  }
+  window_reclaimed_ = 0;
+  return surplus;
 }
 
 void PagePool::Recycle(hipMemGenericAllocationHandle_t handle) {
@@ -694,6 +762,8 @@ PagePoolStats PagePool::Stats() const {
   stats.created_on_demand = created_on_demand_;
   stats.created_ahead = created_ahead_;
   stats.skipped_below_floor = skipped_below_floor_;
+  stats.created_by_reclaim = created_by_reclaim_;
+  stats.reclaim_brakes = reclaim_brakes_;
   stats.lent = lent_;
   stats.returned = returned_;
   return stats;
@@ -703,6 +773,14 @@ void PagePool::Run() {
   (void)hipSetDevice(device_);
   std::unique_lock lock(mutex_);
   while (!stop_) {
+    if (auto surplus = CheckRefaults(Clock::now()); !surplus.empty()) {
+      lock.unlock();
+      for (const auto handle : surplus)
+        if (!ReturnHome(handle))
+          (void)hipMemRelease(handle);
+      lock.lock();
+      continue;
+    }
     if (!jobs_.empty()) {
       auto job = std::move(jobs_.begin()->second);
       jobs_.erase(jobs_.begin());
@@ -753,8 +831,14 @@ void PagePool::Run() {
         if (borrowed || free_.size() + recycled_.size() > free)
           continue;
       }
-      // Never pages from reclaim (see AcquireForLender): writers that find
-      // the pool empty make their own, as without a pool.
+      // Pages from reclaim (possibly compaction) only for the warm-up at
+      // load, or when writers would otherwise make them on their own
+      // threads, never below the floor of MemAvailable, and not while the
+      // cache evicted last is being read back (CheckRefaults).
+      bool by_reclaim = false;
+      if (!create && (warm_bytes_ > 0 || free < kLowPages) &&
+          MayReclaim(Clock::now()))
+        create = by_reclaim = true;
       if (!create) {
         // Writers take pooled or on-demand pages. Look again once memory
         // may have freed.
@@ -783,6 +867,8 @@ void PagePool::Run() {
       free_.push_back(handle);
       StateLedger::Process().AddPooled(kPageBytes);
       ++created_ahead_;
+      if (by_reclaim)
+        NoteReclaimed(Clock::now());
       warm_bytes_ = warm_bytes_ > kPageBytes ? warm_bytes_ - kPageBytes : 0;
       continue;
     }
